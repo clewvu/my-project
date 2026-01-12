@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "Claude Code",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "features": {
