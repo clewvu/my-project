@@ -216,6 +216,31 @@ def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_dump(_: Settings, args: argparse.Namespace) -> int:
+    """Print the latest row of each recorded table, with raw JSON expanded."""
+    with MarketDataStore(args.db) as store:
+        latest = store.latest_rows()
+        counts = store.trade_counts()
+    for table, row in latest.items():
+        print(f"== {table}")
+        if row is None:
+            print("  (empty)")
+            continue
+        raw = row.pop("raw", None)
+        for key, value in row.items():
+            if key in ("yes_levels", "no_levels") and value:
+                value = json.loads(value)
+            print(f"  {key:16} {value}")
+        if raw:
+            print("  raw:")
+            for line in json.dumps(json.loads(raw), indent=2, default=str).splitlines():
+                print("    " + line)
+    print("== trades per ticker")
+    for ticker, n in counts:
+        print(f"  {ticker:34} {n}")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -278,6 +303,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--db", default=DEFAULT_DB)
     s.set_defaults(func=cmd_record_stats)
 
+    s = sub.add_parser("record-dump", help=cmd_record_dump.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.set_defaults(func=cmd_record_dump)
+
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
     s.add_argument("--ticker", default=None)
     s.set_defaults(func=cmd_cancel_all)
@@ -294,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     if env_override and env_override != settings.env:
         settings = dataclasses.replace(settings, env=env_override)
     _setup_logging(settings.log_level)
-    if args.command not in ("check", "markets", "record-stats"):
+    if args.command not in ("check", "markets", "record-stats", "record-dump"):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
         return args.func(settings, args)

@@ -86,3 +86,17 @@ def test_spot_and_stats_span(tmp_path):
         st = store.stats()
     assert st["spot"] == 1 and st["first_ts"] == 5.0 and st["last_ts"] == 9.0
     assert (tmp_path / "x" / "md.sqlite").exists()
+
+
+def test_latest_rows_and_trade_counts():
+    store = MarketDataStore()
+    assert all(v is None for v in store.latest_rows().values())
+    store.upsert_market(mk(), now=1.0)
+    store.insert_trades("PASSED", [{"trade_id": "x", "ticker": "OWN"}, {"trade_id": "y"}])
+    latest = store.latest_rows()
+    assert latest["markets"]["ticker"] == "KXBTC15M-1" and latest["snapshots"] is None
+    assert sorted(store.trade_counts()) == [("OWN", 1), ("PASSED", 1)]
+
+
+def test_series_derived_from_ticker():
+    assert Market.from_dict({"ticker": "KXDOGE15M-26SEP041200-00"}).series_ticker == "KXDOGE15M"

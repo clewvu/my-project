@@ -72,10 +72,11 @@ class Market:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Market:
+        ticker = d["ticker"]
         return cls(
-            ticker=d["ticker"],
+            ticker=ticker,
             event_ticker=d.get("event_ticker"),
-            series_ticker=d.get("series_ticker"),
+            series_ticker=d.get("series_ticker") or ticker.split("-", 1)[0],
             title=d.get("title") or "",
             status=d.get("status") or "",
             yes_bid=_price(d, "yes_bid"),

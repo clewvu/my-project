@@ -227,7 +227,7 @@ class MarketDataStore:
             rows.append(
                 (
                     str(trade_id),
-                    ticker,
+                    t.get("ticker") or ticker,
                     _parse_ts(t.get("created_time")),
                     _int_or_none(t.get("yes_price")),
                     _int_or_none(t.get("no_price")),
@@ -258,6 +258,32 @@ class MarketDataStore:
                 "INSERT INTO spot (ts, source, symbol, price) VALUES (?, ?, ?, ?)",
                 (now, source, symbol, price),
             )
+
+    # ------------------------------------------------------------ inspection
+
+    def latest_rows(self) -> dict[str, dict[str, Any] | None]:
+        """Most recent row from each table, for eyeballing real API shapes."""
+        out: dict[str, dict[str, Any] | None] = {}
+        with self._lock:
+            for table, order in (
+                ("markets", "last_seen_ts"),
+                ("snapshots", "ts"),
+                ("trades", "ts"),
+                ("spot", "ts"),
+            ):
+                row = self._conn.execute(
+                    f"SELECT * FROM {table} ORDER BY {order} DESC LIMIT 1"
+                ).fetchone()
+                out[table] = dict(row) if row else None
+        return out
+
+    def trade_counts(self, limit: int = 10) -> list[tuple[str, int]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ticker, COUNT(*) AS n FROM trades GROUP BY ticker ORDER BY n DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(r["ticker"], r["n"]) for r in rows]
 
     # ------------------------------------------------------------ stats
 
