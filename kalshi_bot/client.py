@@ -25,7 +25,7 @@ import httpx
 
 from .auth import Signer
 from .config import DEMO_BASE_URL, Settings
-from .models import Balance, Candle, Fill, Market, Order, Orderbook, Position
+from .models import TICK, Balance, Candle, Fill, Market, Order, Orderbook, Position, Trade
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,18 @@ class KalshiAPIError(KalshiError):
 
 class LiveTradingBlocked(KalshiError):
     """Raised when an order would hit production without ``allow_live=True``."""
+
+
+def validate_price(price: float) -> float:
+    """Check a dollar price is on Kalshi's 0.001 grid strictly between 0 and 1."""
+    if isinstance(price, bool) or not isinstance(price, int | float):
+        raise ValueError("price must be a number of dollars, e.g. 0.45")
+    ticks = round(price / TICK)
+    if abs(ticks * TICK - price) > 1e-9:
+        raise ValueError(f"price {price} is not a multiple of {TICK}")
+    if not 1 <= ticks <= 999:
+        raise ValueError("price must be between 0.001 and 0.999")
+    return round(ticks * TICK, 4)
 
 
 class DryRunOrder(dict):
@@ -264,15 +276,20 @@ class KalshiClient:
         return [Candle.from_dict(c) for c in data.get("candlesticks", [])]
 
     def get_trades(
-        self, ticker: str, *, limit: int = 100, min_ts: int | None = None, max_ts: int | None = None
-    ) -> list[dict[str, Any]]:
+        self,
+        ticker: str,
+        *,
+        limit: int = 100,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+    ) -> list[Trade]:
         data = self._request(
             "GET",
             "/markets/trades",
             params={"ticker": ticker, "limit": limit, "min_ts": min_ts, "max_ts": max_ts},
             auth=False,
         )
-        return list(data.get("trades", []))
+        return [Trade.from_dict(t) for t in data.get("trades", [])]
 
     # ------------------------------------------------------------------ portfolio
 
@@ -339,15 +356,16 @@ class KalshiClient:
         side: str,
         action: str,
         count: int,
-        price: int | None = None,
+        price: float | None = None,
         order_type: str = "limit",
         client_order_id: str | None = None,
         expiration_ts: int | None = None,
-        buy_max_cost: int | None = None,
     ) -> Order | DryRunOrder:
         """Place an order.
 
-        ``price`` is the limit price in cents on the chosen ``side`` (1..99).
+        ``price`` is the limit price in **dollars** on the chosen ``side``, between
+        0.001 and 0.999 on a 0.001 grid (Kalshi's finest tick). It is sent as the
+        fixed-point ``yes_price_dollars`` / ``no_price_dollars`` string field.
         Limit orders require a price; market orders must not carry one.
         In dry-run mode nothing is sent and the would-be request is returned.
         """
@@ -357,11 +375,12 @@ class KalshiClient:
             raise ValueError(f"action must be one of {sorted(VALID_ACTIONS)}")
         if order_type not in VALID_ORDER_TYPES:
             raise ValueError(f"order_type must be one of {sorted(VALID_ORDER_TYPES)}")
-        if not isinstance(count, int) or count < 1:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("count must be a positive integer number of contracts")
         if order_type == "limit":
-            if price is None or not isinstance(price, int) or not 1 <= price <= 99:
-                raise ValueError("limit orders need an integer price in cents between 1 and 99")
+            if price is None:
+                raise ValueError("limit orders need a price")
+            price = validate_price(price)
         elif price is not None:
             raise ValueError("market orders must not specify a price")
 
@@ -374,11 +393,9 @@ class KalshiClient:
             "type": order_type,
         }
         if price is not None:
-            body["yes_price" if side == "yes" else "no_price"] = price
+            body[f"{side}_price_dollars"] = f"{price:.4f}"
         if expiration_ts is not None:
             body["expiration_ts"] = expiration_ts
-        if buy_max_cost is not None:
-            body["buy_max_cost"] = buy_max_cost
 
         if self.dry_run:
             log.info("DRY RUN create_order %s", body)

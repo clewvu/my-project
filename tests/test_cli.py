@@ -63,4 +63,4 @@ def test_markets_raw_prints_json(monkeypatch, capsys):
     assert '"yes_bid_dollars": "0.21"' in out and "ticker" in out
     args = cli.build_parser().parse_args(["markets"])
     cli.cmd_markets(settings, args)
-    assert "  21 " in capsys.readouterr().out
+    assert "21.0c" in capsys.readouterr().out

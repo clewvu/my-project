@@ -113,6 +113,12 @@ class Recorder:
         except KalshiError as exc:
             result.errors.append(f"{market.ticker}: orderbook: {exc}")
             log.warning("%s: orderbook failed: %s", market.ticker, exc)
+        if book is not None and book.is_empty:
+            log.warning(
+                "%s: orderbook parsed empty; raw keys=%s (stored in book_raw)",
+                market.ticker,
+                sorted(book.raw)[:8],
+            )
         self.store.insert_snapshot(now, market, book)
         result.snapshots += 1
 

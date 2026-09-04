@@ -15,7 +15,7 @@ from .client import KalshiClient, KalshiError
 from .config import BASE_URLS, Settings
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
 from .spot import SpotFeed
-from .storage import MarketDataStore
+from .storage import MarketDataStore, SchemaMismatch
 
 DEFAULT_DB = "state/market_data.sqlite"
 
@@ -36,6 +36,11 @@ def _client(settings: Settings, *, need_auth: bool) -> KalshiClient:
             "(see .env.example)"
         )
     return KalshiClient.from_settings(settings)
+
+
+def _px(price: float | None) -> str:
+    """Format a dollar price as cents with one decimal, e.g. 17.5c."""
+    return "-" if price is None else f"{price * 100:.1f}c"
 
 
 def _fmt_time(dt: datetime | None) -> str:
@@ -77,20 +82,20 @@ def cmd_status(settings: Settings, _: argparse.Namespace) -> int:
             f"exchange_active={status.get('exchange_active')}"
         )
         bal = client.get_balance()
-        print(f"balance:    ${bal.dollars:,.2f}")
+        print(f"balance:    ${bal.balance:,.2f}")
         positions = [p for p in client.get_positions() if p.position != 0]
         print(f"positions:  {len(positions)}")
         for p in positions:
             print(
-                f"  {p.ticker:32} {p.side:>3} x{abs(p.position):<5} cost=${p.total_cost / 100:.2f} "
-                f"realized=${p.realized_pnl / 100:.2f}"
+                f"  {p.ticker:32} {p.side:>3} x{abs(p.position):<7g} cost=${p.total_cost:.2f} "
+                f"realized=${p.realized_pnl:.2f}"
             )
         orders = client.get_orders(status="resting")
         print(f"resting orders: {len(orders)}")
         for o in orders:
-            px = o.yes_price if o.side == "yes" else o.no_price
             print(
-                f"  {o.ticker:32} {o.action} {o.side} x{o.remaining_count} @ {px}c  id={o.order_id}"
+                f"  {o.ticker:32} {o.action} {o.side} x{o.remaining_count:g} @ {_px(o.price)}"
+                f"  id={o.order_id}"
             )
     return 0
 
@@ -106,11 +111,15 @@ def cmd_markets(settings: Settings, args: argparse.Namespace) -> int:
             print(json.dumps(m.raw, indent=2, default=str))
         return 0
     markets.sort(key=lambda m: m.close_time or datetime.max.replace(tzinfo=UTC))
-    print(f"{'ticker':34} {'status':8} {'bid':>4} {'ask':>4} {'last':>4} {'vol':>7}  close (UTC)")
+    print(
+        f"{'ticker':30} {'status':8} {'bid':>6} {'ask':>6} {'last':>6} {'volume':>10} "
+        f"{'strike':>10}  close (UTC)"
+    )
     for m in markets[: args.limit]:
+        strike = f"{m.strike:,.2f}" if m.strike is not None else "-"
         print(
-            f"{m.ticker:34} {m.status:8} {m.yes_bid or '-':>4} {m.yes_ask or '-':>4} "
-            f"{m.last_price or '-':>4} {m.volume:>7}  {_fmt_time(m.close_time)}"
+            f"{m.ticker:30} {m.status:8} {_px(m.yes_bid):>6} {_px(m.yes_ask):>6} "
+            f"{_px(m.last_price):>6} {m.volume:>10,.0f} {strike:>10}  {_fmt_time(m.close_time)}"
         )
     if not markets:
         print("(no markets returned)")
@@ -130,15 +139,20 @@ def cmd_orderbook(settings: Settings, args: argparse.Namespace) -> int:
         )
         return 0
     print(f"{m.ticker}  {m.title}")
+    strike = f"{m.strike:,.2f}" if m.strike is not None else "-"
     print(
-        f"status={m.status}  closes {_fmt_time(m.close_time)}  "
-        f"yes bid/ask={book.best_yes_bid}/{book.best_yes_ask}  mid={book.yes_mid}"
+        f"status={m.status}  closes {_fmt_time(m.close_time)}  strike={strike}  "
+        f"yes bid/ask={_px(book.best_yes_bid)}/{_px(book.best_yes_ask)}  mid={_px(book.yes_mid)}"
     )
-    print(f"{'YES bids':>16}    {'NO bids':>16}")
+    if book.is_empty:
+        print("(orderbook parsed empty; raw response follows)")
+        print(json.dumps(book.raw, indent=2, default=str))
+        return 0
+    print(f"{'YES bids':>20}    {'NO bids':>20}")
     for i in range(max(len(book.yes), len(book.no))):
-        y = f"{book.yes[i].price:>3}c x{book.yes[i].count:<6}" if i < len(book.yes) else " " * 12
-        n = f"{book.no[i].price:>3}c x{book.no[i].count:<6}" if i < len(book.no) else ""
-        print(f"{y:>16}    {n:>16}")
+        y = f"{_px(book.yes[i].price):>6} x{book.yes[i].count:<10.2f}" if i < len(book.yes) else ""
+        n = f"{_px(book.no[i].price):>6} x{book.no[i].count:<10.2f}" if i < len(book.no) else ""
+        print(f"{y:>20}    {n:>20}")
     return 0
 
 
@@ -150,12 +164,12 @@ def cmd_candles(settings: Settings, args: argparse.Namespace) -> int:
         candles = client.get_candlesticks(
             args.series, args.ticker, start_ts=start, end_ts=end, period_interval=args.interval
         )
-    print(f"{'start (UTC)':20} {'open':>4} {'high':>4} {'low':>4} {'close':>5} {'vol':>6}")
+    print(f"{'start (UTC)':20} {'open':>6} {'high':>6} {'low':>6} {'close':>6} {'vol':>8}")
     for c in candles:
         ts = datetime.fromtimestamp(c.start_ts, tz=UTC).strftime("%Y-%m-%d %H:%M")
         print(
-            f"{ts:20} {c.open or '-':>4} {c.high or '-':>4} {c.low or '-':>4} "
-            f"{c.close or '-':>5} {c.volume:>6}"
+            f"{ts:20} {_px(c.open):>6} {_px(c.high):>6} {_px(c.low):>6} "
+            f"{_px(c.close):>6} {c.volume:>8,.0f}"
         )
     if not candles:
         print("(no candles returned)")
@@ -203,6 +217,8 @@ def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
         span = f"{_fmt_time(first)} -> {_fmt_time(last)} ({hours:.1f}h)"
     print(f"db:         {args.db}")
     print(f"snapshots:  {st['snapshots']:,}  {span}")
+    if st["empty_books"]:
+        print(f"            {st['empty_books']:,} with an empty/unparsed orderbook")
     print(f"trades:     {st['trades']:,}")
     print(f"spot:       {st['spot']:,}")
     print(f"markets:    {st['markets']:,} seen, {st['settled']:,} settled")
@@ -228,7 +244,7 @@ def cmd_record_dump(_: Settings, args: argparse.Namespace) -> int:
             continue
         raw = row.pop("raw", None)
         for key, value in row.items():
-            if key in ("yes_levels", "no_levels") and value:
+            if key in ("yes_levels", "no_levels", "book_raw") and value:
                 value = json.loads(value)
             print(f"  {key:16} {value}")
         if raw:
@@ -327,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
         return args.func(settings, args)
-    except KalshiError as exc:
+    except (KalshiError, SchemaMismatch) as exc:
         sys.exit(f"error: {exc}")
 
 

@@ -62,7 +62,7 @@ def test_pagination_follows_cursor(signer):
 
 def test_private_endpoint_signed_with_full_path(signer, rsa_key):
     client, rec = make_client(signer, [(200, {"balance": 12345})])
-    assert client.get_balance().balance == 12345
+    assert client.get_balance().balance == 123.45
     req = rec.requests[0]
     assert req.headers[HEADER_KEY] == "test-key-id"
     ts = req.headers[HEADER_TIMESTAMP]
@@ -91,7 +91,7 @@ def test_private_endpoint_without_signer_errors():
 def test_retries_on_429_then_succeeds(signer, monkeypatch):
     monkeypatch.setattr("kalshi_bot.client.time.sleep", lambda s: None)
     client, rec = make_client(signer, [(429, {"error": "rate"}), (200, {"balance": 1})])
-    assert client.get_balance().balance == 1
+    assert client.get_balance().balance == 0.01
     assert len(rec.requests) == 2
 
 
@@ -112,9 +112,9 @@ def test_4xx_is_not_retried(signer):
 
 def test_dry_run_never_sends_orders(signer):
     client, rec = make_client(signer, [], dry_run=True)
-    result = client.create_order("KXBTC15M-X", side="yes", action="buy", count=2, price=45)
+    result = client.create_order("KXBTC15M-X", side="yes", action="buy", count=2, price=0.45)
     assert isinstance(result, DryRunOrder)
-    assert result["yes_price"] == 45 and "no_price" not in result
+    assert result["yes_price_dollars"] == "0.4500" and "no_price_dollars" not in result
     assert result["client_order_id"]
     assert client.cancel_order("abc") is None
     assert rec.requests == []
@@ -144,9 +144,9 @@ def test_live_order_body_and_response(signer):
         dry_run=False,
     )
     order = client.create_order(
-        "T", side="no", action="buy", count=3, price=60, client_order_id="cid"
+        "T", side="no", action="buy", count=3, price=0.091, client_order_id="cid"
     )
-    assert order.order_id == "o1" and order.no_price == 60
+    assert order.order_id == "o1" and order.no_price == 0.60
     sent = json.loads(rec.requests[0].content)
     assert sent == {
         "ticker": "T",
@@ -155,7 +155,7 @@ def test_live_order_body_and_response(signer):
         "action": "buy",
         "count": 3,
         "type": "limit",
-        "no_price": 60,
+        "no_price_dollars": "0.0910",
     }
     assert rec.requests[0].headers[HEADER_KEY] == "test-key-id"
 
@@ -163,7 +163,7 @@ def test_live_order_body_and_response(signer):
 def test_prod_orders_blocked_without_allow_live(signer):
     client, rec = make_client(signer, [], base_url=PROD_BASE_URL, dry_run=False)
     with pytest.raises(LiveTradingBlocked):
-        client.create_order("T", side="yes", action="buy", count=1, price=50)
+        client.create_order("T", side="yes", action="buy", count=1, price=0.5)
     assert rec.requests == []
     # public reads on prod are still fine
     client2, _ = make_client(signer, [(200, {"trading_active": True})], base_url=PROD_BASE_URL)
@@ -173,14 +173,17 @@ def test_prod_orders_blocked_without_allow_live(signer):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(side="maybe", action="buy", count=1, price=50),
-        dict(side="yes", action="hold", count=1, price=50),
-        dict(side="yes", action="buy", count=0, price=50),
-        dict(side="yes", action="buy", count=1, price=0),
-        dict(side="yes", action="buy", count=1, price=100),
-        dict(side="yes", action="buy", count=1, price=None),
-        dict(side="yes", action="buy", count=1, price=50, order_type="market"),
-        dict(side="yes", action="buy", count=1.5, price=50),
+        {"side": "maybe", "action": "buy", "count": 1, "price": 0.5},
+        {"side": "yes", "action": "hold", "count": 1, "price": 0.5},
+        {"side": "yes", "action": "buy", "count": 0, "price": 0.5},
+        {"side": "yes", "action": "buy", "count": 1, "price": 0.0},
+        {"side": "yes", "action": "buy", "count": 1, "price": 1.0},
+        {"side": "yes", "action": "buy", "count": 1, "price": 0.4505},  # off the 0.001 grid
+        {"side": "yes", "action": "buy", "count": 1, "price": 45},  # cents, not dollars
+        {"side": "yes", "action": "buy", "count": 1, "price": None},
+        {"side": "yes", "action": "buy", "count": 1, "price": 0.5, "order_type": "market"},
+        {"side": "yes", "action": "buy", "count": 1.5, "price": 0.5},
+        {"side": "yes", "action": "buy", "count": True, "price": 0.5},
     ],
 )
 def test_order_validation(signer, kwargs):
@@ -216,3 +219,38 @@ def test_cancel_all(signer):
 def test_positions_accepts_both_keys(signer):
     client, _ = make_client(signer, [(200, {"market_positions": [{"ticker": "T", "position": 2}]})])
     assert client.get_positions()[0].position == 2
+
+
+def test_validate_price_grid():
+    from kalshi_bot.client import validate_price
+
+    assert validate_price(0.091) == 0.091
+    assert validate_price(0.1) == 0.1
+    assert validate_price(0.999) == 0.999
+    for bad in (0.0, 1.0, 0.0005, 0.4505, 45, -0.1):
+        with pytest.raises(ValueError):
+            validate_price(bad)
+
+
+def test_get_trades_returns_trade_objects(signer):
+    client, rec = make_client(
+        signer,
+        [
+            (
+                200,
+                {
+                    "trades": [
+                        {
+                            "trade_id": "t",
+                            "ticker": "X",
+                            "yes_price_dollars": "0.0910",
+                            "count_fp": "2.5",
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    trades = client.get_trades("X", min_ts=5)
+    assert trades[0].yes_price == 0.091 and trades[0].count == 2.5
+    assert rec.requests[0].url.params["min_ts"] == "5"

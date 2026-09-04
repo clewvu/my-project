@@ -1,7 +1,7 @@
 import httpx
 
 from kalshi_bot.client import KalshiAPIError
-from kalshi_bot.models import Market, Orderbook
+from kalshi_bot.models import Market, Orderbook, Trade
 from kalshi_bot.recorder import Recorder
 from kalshi_bot.spot import SpotFeed
 from kalshi_bot.storage import MarketDataStore
@@ -43,19 +43,24 @@ class FakeClient:
         self.calls.append(("book", ticker))
         if ticker in self.fail_orderbook_for:
             raise KalshiAPIError(500, "GET", f"/markets/{ticker}/orderbook", "boom")
-        return Orderbook.from_dict(ticker, {"orderbook": {"yes": [[45, 10]], "no": [[45, 10]]}})
+        return Orderbook.from_dict(
+            ticker, {"orderbook_fp": {"yes": [["0.45", "10"]], "no": [["0.45", "10"]]}}
+        )
 
     def get_trades(self, ticker, *, limit, min_ts):
         self.calls.append(("trades", ticker, min_ts))
         return [
-            {
-                "trade_id": f"{ticker}-t1",
-                "created_time": "2026-09-04T15:05:00Z",
-                "yes_price": 50,
-                "no_price": 50,
-                "count": 1,
-                "taker_side": "yes",
-            }
+            Trade.from_dict(
+                {
+                    "trade_id": f"{ticker}-t1",
+                    "ticker": ticker,
+                    "created_time": "2026-09-04T15:05:00Z",
+                    "yes_price_dollars": "0.50",
+                    "no_price_dollars": "0.50",
+                    "count_fp": "1.00",
+                    "taker_side": "yes",
+                }
+            )
         ]
 
     def get_market(self, ticker):

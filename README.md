@@ -61,8 +61,16 @@ kalshi_bot/
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
 
-Prices are integer cents (1-99), sizes are contract counts. The client only
-uses the cent fields, ignoring the newer `*_dollars` strings the API also returns.
+Prices are **dollars per contract** as floats on a 0.001 grid (Kalshi's
+15-minute markets use tenth-of-a-cent ticks below $0.10 and above $0.90).
+Contract counts are floats because the API reports fractional counts. The
+parsers read the API's fixed-point string fields (`*_dollars`, `*_fp`) first
+and fall back to the legacy integer-cent fields.
+
+Each 15-minute market carries its reference price in `floor_strike`: the
+average of the CF Benchmarks real-time index over the last minute before the
+window opened. It settles YES if the same average over the last minute before
+close is at least that value.
 
 ## Recording market data (phase 2)
 
@@ -92,7 +100,12 @@ single failing request is logged and skipped, and the loop backs off when the
 exchange is unreachable. Ctrl-C stops it cleanly.
 
 Tables: `markets`, `snapshots`, `trades`, `spot`. Timestamps are unix seconds,
-prices are cents. Open it with any SQLite tool or pandas:
+prices are dollars, counts are contracts. Every snapshot also keeps the raw
+orderbook JSON in `book_raw`, so nothing is lost if the parser misses a field.
+A database created by an older schema version is refused with a message
+telling you to delete it or pass `--db` with a new path.
+
+Open it with any SQLite tool or pandas:
 
 ```python
 import pandas as pd, sqlite3

@@ -3,11 +3,12 @@
 Tables
 ------
 markets    one row per market ever seen; updated with status/result on settlement
-snapshots  top-of-book + depth every tick, per open market
+snapshots  top-of-book + depth every tick, per open market, plus the raw book JSON
 trades     public trade prints (deduplicated by trade id)
 spot       external spot prices (e.g. Coinbase BTC-USD) for research
 
-All timestamps are unix epoch seconds (REAL). Prices are integer cents.
+Timestamps are unix epoch seconds (REAL). Prices are dollars (REAL, 0.001
+resolution). Counts are contracts (REAL, may be fractional).
 """
 
 from __future__ import annotations
@@ -19,14 +20,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .models import Market, Orderbook
+from .models import Market, Orderbook, Trade
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 CREATE TABLE IF NOT EXISTS markets (
     ticker          TEXT PRIMARY KEY,
     series_ticker   TEXT,
     event_ticker    TEXT,
     title           TEXT,
+    strike          REAL,
+    strike_type     TEXT,
     open_ts         REAL,
     close_ts        REAL,
     expiration_ts   REAL,
@@ -44,16 +54,20 @@ CREATE TABLE IF NOT EXISTS snapshots (
     ts              REAL NOT NULL,
     ticker          TEXT NOT NULL,
     secs_to_close   REAL,
-    yes_bid         INTEGER,
-    yes_ask         INTEGER,
-    no_bid          INTEGER,
-    no_ask          INTEGER,
-    last_price      INTEGER,
-    volume          INTEGER,
-    yes_depth       INTEGER,
-    no_depth        INTEGER,
+    yes_bid         REAL,
+    yes_ask         REAL,
+    no_bid          REAL,
+    no_ask          REAL,
+    yes_bid_size    REAL,
+    yes_ask_size    REAL,
+    last_price      REAL,
+    volume          REAL,
+    open_interest   REAL,
+    yes_depth       REAL,
+    no_depth        REAL,
     yes_levels      TEXT,
-    no_levels       TEXT
+    no_levels       TEXT,
+    book_raw        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_ts ON snapshots(ticker, ts);
 
@@ -61,9 +75,9 @@ CREATE TABLE IF NOT EXISTS trades (
     trade_id        TEXT PRIMARY KEY,
     ticker          TEXT NOT NULL,
     ts              REAL,
-    yes_price       INTEGER,
-    no_price        INTEGER,
-    count           INTEGER,
+    yes_price       REAL,
+    no_price        REAL,
+    count           REAL,
     taker_side      TEXT,
     raw             TEXT
 );
@@ -78,6 +92,10 @@ CREATE TABLE IF NOT EXISTS spot (
 );
 CREATE INDEX IF NOT EXISTS idx_spot_symbol_ts ON spot(symbol, ts);
 """
+
+
+class SchemaMismatch(Exception):
+    pass
 
 
 def _epoch(dt: datetime | None) -> float | None:
@@ -96,11 +114,34 @@ class MarketDataStore:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self._init_schema()
+
+    def _init_schema(self) -> None:
         with self._conn:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            existing = {
+                r[0]
+                for r in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if existing and "meta" not in existing:
+                raise SchemaMismatch(
+                    f"{self.path} was created by an older kalshi-bot with integer-cent prices. "
+                    "Delete it (or pass --db with a new path) and record again."
+                )
             self._conn.executescript(SCHEMA)
+            row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            elif int(row[0]) != SCHEMA_VERSION:
+                raise SchemaMismatch(
+                    f"{self.path} has schema version {row[0]}, this code expects "
+                    f"{SCHEMA_VERSION}. Delete it or pass --db with a new path."
+                )
 
     def close(self) -> None:
         self._conn.close()
@@ -118,12 +159,14 @@ class MarketDataStore:
             self._conn.execute(
                 """
                 INSERT INTO markets
-                    (ticker, series_ticker, event_ticker, title, open_ts, close_ts,
-                     expiration_ts, status, result, first_seen_ts, last_seen_ts, raw)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, series_ticker, event_ticker, title, strike, strike_type,
+                     open_ts, close_ts, expiration_ts, status, result,
+                     first_seen_ts, last_seen_ts, raw)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     status = excluded.status,
                     result = COALESCE(excluded.result, markets.result),
+                    strike = COALESCE(excluded.strike, markets.strike),
                     close_ts = COALESCE(excluded.close_ts, markets.close_ts),
                     last_seen_ts = excluded.last_seen_ts,
                     raw = excluded.raw
@@ -133,6 +176,8 @@ class MarketDataStore:
                     market.series_ticker,
                     market.event_ticker,
                     market.title,
+                    market.strike,
+                    market.strike_type,
                     _epoch(market.open_time),
                     _epoch(market.close_time),
                     _epoch(market.expiration_time),
@@ -176,35 +221,37 @@ class MarketDataStore:
     # ------------------------------------------------------------ snapshots
 
     def insert_snapshot(self, now: float, market: Market, book: Orderbook | None) -> None:
-        secs = (
-            market.seconds_to_close(datetime.fromtimestamp(now, tz=UTC))
-            if market.close_time
-            else None
-        )
-        yes_levels = [(lv.price, lv.count) for lv in book.yes] if book else None
-        no_levels = [(lv.price, lv.count) for lv in book.no] if book else None
+        secs = market.seconds_to_close(datetime.fromtimestamp(now, tz=UTC))
+        has_book = book is not None and not book.is_empty
+        yes_levels = [(lv.price, lv.count) for lv in book.yes] if has_book else None
+        no_levels = [(lv.price, lv.count) for lv in book.no] if has_book else None
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO snapshots
                     (ts, ticker, secs_to_close, yes_bid, yes_ask, no_bid, no_ask,
-                     last_price, volume, yes_depth, no_depth, yes_levels, no_levels)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     yes_bid_size, yes_ask_size, last_price, volume, open_interest,
+                     yes_depth, no_depth, yes_levels, no_levels, book_raw)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
                     market.ticker,
                     secs,
-                    book.best_yes_bid if book else market.yes_bid,
-                    book.best_yes_ask if book else market.yes_ask,
-                    book.best_no_bid if book else market.no_bid,
-                    book.best_no_ask if book else market.no_ask,
+                    book.best_yes_bid if has_book else market.yes_bid,
+                    book.best_yes_ask if has_book else market.yes_ask,
+                    book.best_no_bid if has_book else market.no_bid,
+                    book.best_no_ask if has_book else market.no_ask,
+                    market.yes_bid_size,
+                    market.yes_ask_size,
                     market.last_price,
                     market.volume,
-                    book.depth("yes") if book else None,
-                    book.depth("no") if book else None,
+                    market.open_interest,
+                    book.depth("yes") if has_book else None,
+                    book.depth("no") if has_book else None,
                     _json(yes_levels) if yes_levels is not None else None,
                     _json(no_levels) if no_levels is not None else None,
+                    _json(book.raw) if book is not None else None,
                 ),
             )
 
@@ -217,25 +264,22 @@ class MarketDataStore:
             ).fetchone()
         return row["ts"] if row and row["ts"] is not None else None
 
-    def insert_trades(self, ticker: str, trades: list[dict[str, Any]]) -> int:
+    def insert_trades(self, ticker: str, trades: list[Trade]) -> int:
         """Insert public trades; returns how many were new."""
-        rows = []
-        for t in trades:
-            trade_id = t.get("trade_id") or t.get("id")
-            if not trade_id:
-                continue
-            rows.append(
-                (
-                    str(trade_id),
-                    t.get("ticker") or ticker,
-                    _parse_ts(t.get("created_time")),
-                    _int_or_none(t.get("yes_price")),
-                    _int_or_none(t.get("no_price")),
-                    _int_or_none(t.get("count")),
-                    t.get("taker_side"),
-                    _json(t),
-                )
+        rows = [
+            (
+                t.trade_id,
+                t.ticker or ticker,
+                _epoch(t.created_time),
+                t.yes_price,
+                t.no_price,
+                t.count,
+                t.taker_side,
+                _json(t.raw),
             )
+            for t in trades
+            if t.trade_id
+        ]
         if not rows:
             return 0
         with self._lock, self._conn:
@@ -296,6 +340,9 @@ class MarketDataStore:
                     "SELECT COUNT(*) FROM markets WHERE result IS NOT NULL"
                 ).fetchone()[0],
                 "snapshots": c.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0],
+                "empty_books": c.execute(
+                    "SELECT COUNT(*) FROM snapshots WHERE yes_levels IS NULL"
+                ).fetchone()[0],
                 "trades": c.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
                 "spot": c.execute("SELECT COUNT(*) FROM spot").fetchone()[0],
                 "first_ts": c.execute("SELECT MIN(ts) FROM snapshots").fetchone()[0],
@@ -312,40 +359,3 @@ class MarketDataStore:
             ):
                 out["by_series"].append(dict(row))
         return out
-
-
-def _parse_ts(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value)
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.timestamp()
-
-
-def _cents_or_none(cents: Any, dollars: Any = None) -> int | None:
-    if cents is not None:
-        return _int_or_none(cents)
-    if dollars in (None, ""):
-        return None
-    try:
-        return round(float(dollars) * 100)
-    except (TypeError, ValueError):
-        return None
-
-
-def _int_or_none(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(round(float(value)))
-    except (TypeError, ValueError):
-        return None

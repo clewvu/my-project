@@ -1,8 +1,16 @@
 """Typed views over Kalshi API JSON.
 
-All prices are integer cents (1..99). All sizes are integer contract counts.
-The API also returns ``*_dollars`` string fields in newer versions; we ignore
-those and read the cent fields, which remain present.
+Units
+-----
+Prices are **dollars per contract** as floats with 0.001 resolution
+(0.001 .. 0.999). Kalshi's 15-minute markets use a "tapered deci-cent" price
+structure: tenth-of-a-cent steps below $0.10 and above $0.90, whole cents in
+between, so integer cents would lose precision exactly where these markets
+spend their final minutes. Contract counts are floats because the API reports
+fractional counts (``count_fp``).
+
+The API sends most numbers as fixed-point strings (``*_dollars``, ``*_fp``).
+Older responses used integer cents and integer counts; both are accepted.
 """
 
 from __future__ import annotations
@@ -11,11 +19,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+PRICE_DECIMALS = 4
+TICK = 0.001
+
 
 def _parse_time(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return datetime.fromtimestamp(value, tz=UTC)
     text = str(value)
     if text.endswith("Z"):
@@ -24,46 +35,58 @@ def _parse_time(value: Any) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def _cents(value: Any) -> int | None:
-    """Integer cents from a cents number, or from a dollars string such as "0.45"."""
+def dollars(value: Any) -> float | None:
+    """Price in dollars from a dollars string ("0.0910") or a legacy cents number (9)."""
     if value is None or value == "":
         return None
     if isinstance(value, str):
-        return round(float(value) * 100)
-    return round(float(value))
+        return round(float(value), PRICE_DECIMALS)
+    return round(float(value) / 100, PRICE_DECIMALS)
 
 
-def _count(value: Any) -> int:
-    """Contract counts arrive as ints, floats, or numeric strings; treat missing as 0."""
-    if value in (None, ""):
-        return 0
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return 0
+def _price(d: dict[str, Any], name: str) -> float | None:
+    """Read ``name_dollars`` (string) first, then legacy ``name`` (integer cents)."""
+    value = d.get(f"{name}_dollars")
+    if value is None or value == "":
+        value = d.get(name)
+    return dollars(value)
 
 
-def _price(d: dict[str, Any], name: str) -> int | None:
-    """Read ``name`` in cents, falling back to ``name_dollars`` (a dollars string)."""
-    value = d.get(name)
-    if value is None:
-        value = d.get(f"{name}_dollars")
-    return _cents(value)
+def _num(d: dict[str, Any], name: str, default: float | None = None) -> float | None:
+    """Read a count-like number from ``name_fp`` (string) or ``name`` (number)."""
+    for key in (f"{name}_fp", name):
+        value = d.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _money(d: dict[str, Any], name: str) -> float | None:
+    """Dollar amount from ``name_dollars`` (string) or legacy ``name`` (integer cents)."""
+    return _price(d, name)
 
 
 @dataclass(frozen=True)
 class Market:
     ticker: str
     event_ticker: str | None
-    series_ticker: str | None
+    series_ticker: str
     title: str
     status: str
-    yes_bid: int | None
-    yes_ask: int | None
-    no_bid: int | None
-    no_ask: int | None
-    last_price: int | None
-    volume: int
+    yes_bid: float | None
+    yes_ask: float | None
+    no_bid: float | None
+    no_ask: float | None
+    yes_bid_size: float | None
+    yes_ask_size: float | None
+    last_price: float | None
+    volume: float
+    open_interest: float | None
+    strike: float | None  # reference price the market settles against
+    strike_type: str | None  # e.g. greater_or_equal
     open_time: datetime | None
     close_time: datetime | None
     expiration_time: datetime | None
@@ -73,6 +96,9 @@ class Market:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Market:
         ticker = d["ticker"]
+        strike = d.get("floor_strike")
+        if strike is None:
+            strike = d.get("cap_strike")
         return cls(
             ticker=ticker,
             event_ticker=d.get("event_ticker"),
@@ -83,8 +109,13 @@ class Market:
             yes_ask=_price(d, "yes_ask"),
             no_bid=_price(d, "no_bid"),
             no_ask=_price(d, "no_ask"),
+            yes_bid_size=_num(d, "yes_bid_size"),
+            yes_ask_size=_num(d, "yes_ask_size"),
             last_price=_price(d, "last_price"),
-            volume=_count(d.get("volume", d.get("volume_fp"))),
+            volume=_num(d, "volume", 0.0) or 0.0,
+            open_interest=_num(d, "open_interest"),
+            strike=float(strike) if strike not in (None, "") else None,
+            strike_type=d.get("strike_type") or None,
             open_time=_parse_time(d.get("open_time")),
             close_time=_parse_time(d.get("close_time")),
             expiration_time=_parse_time(d.get("expiration_time")),
@@ -96,13 +127,13 @@ class Market:
     def yes_mid(self) -> float | None:
         if self.yes_bid is None or self.yes_ask is None:
             return None
-        return (self.yes_bid + self.yes_ask) / 2
+        return round((self.yes_bid + self.yes_ask) / 2, PRICE_DECIMALS)
 
     @property
-    def spread(self) -> int | None:
+    def spread(self) -> float | None:
         if self.yes_bid is None or self.yes_ask is None:
             return None
-        return self.yes_ask - self.yes_bid
+        return round(self.yes_ask - self.yes_bid, PRICE_DECIMALS)
 
     def seconds_to_close(self, now: datetime | None = None) -> float | None:
         if self.close_time is None:
@@ -113,8 +144,8 @@ class Market:
 
 @dataclass(frozen=True)
 class Level:
-    price: int  # cents
-    count: int  # contracts resting at this price
+    price: float  # dollars
+    count: float  # contracts resting at this price
 
 
 @dataclass(frozen=True)
@@ -122,62 +153,84 @@ class Orderbook:
     """Resting bids on each side.
 
     ``yes`` are bids to buy YES at ``price``; ``no`` are bids to buy NO.
-    A YES bid at p is equivalent to a NO ask at 100-p, and vice versa.
+    A YES bid at p is equivalent to a NO ask at 1-p, and vice versa.
     Levels are sorted best-first (highest bid first).
     """
 
     ticker: str
     yes: list[Level]
     no: list[Level]
+    raw: dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
+
+    _BOOK_KEYS = ("orderbook_fp", "orderbook")
+    _YES_KEYS = ("yes_dollars", "yes_fp", "yes", "true")
+    _NO_KEYS = ("no_dollars", "no_fp", "no", "false")
 
     @classmethod
     def from_dict(cls, ticker: str, d: dict[str, Any]) -> Orderbook:
-        book = d.get("orderbook", d) or {}
-        yes = book.get("yes")
-        if yes is None:
-            yes = book.get("yes_dollars", book.get("true"))
-        no = book.get("no")
-        if no is None:
-            no = book.get("no_dollars", book.get("false"))
-        return cls(ticker=ticker, yes=cls._levels(yes), no=cls._levels(no))
+        book: Any = d
+        for key in cls._BOOK_KEYS:
+            if isinstance(d.get(key), dict):
+                book = d[key]
+                break
+        book = book or {}
+        return cls(
+            ticker=ticker,
+            yes=cls._levels(cls._first(book, cls._YES_KEYS)),
+            no=cls._levels(cls._first(book, cls._NO_KEYS)),
+            raw=d,
+        )
+
+    @staticmethod
+    def _first(book: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            if book.get(key) is not None:
+                return book[key]
+        return None
 
     @staticmethod
     def _levels(raw: Any) -> list[Level]:
         levels: list[Level] = []
         for item in raw or []:
             if isinstance(item, dict):
-                price, count = item.get("price"), item.get("count")
+                price = item.get("price_dollars", item.get("price"))
+                count = item.get("count_fp", item.get("count"))
             else:
                 price, count = item[0], item[1]
-            if price is None or count is None:
+            p = dollars(price)
+            if p is None or count in (None, ""):
                 continue
-            levels.append(Level(price=_cents(price) or 0, count=int(count)))
+            levels.append(Level(price=p, count=float(count)))
         levels.sort(key=lambda lv: lv.price, reverse=True)
         return levels
 
     @property
-    def best_yes_bid(self) -> int | None:
+    def is_empty(self) -> bool:
+        return not self.yes and not self.no
+
+    @property
+    def best_yes_bid(self) -> float | None:
         return self.yes[0].price if self.yes else None
 
     @property
-    def best_no_bid(self) -> int | None:
+    def best_no_bid(self) -> float | None:
         return self.no[0].price if self.no else None
 
     @property
-    def best_yes_ask(self) -> int | None:
-        return 100 - self.best_no_bid if self.best_no_bid is not None else None
+    def best_yes_ask(self) -> float | None:
+        return round(1 - self.best_no_bid, PRICE_DECIMALS) if self.no else None
 
     @property
-    def best_no_ask(self) -> int | None:
-        return 100 - self.best_yes_bid if self.best_yes_bid is not None else None
+    def best_no_ask(self) -> float | None:
+        return round(1 - self.best_yes_bid, PRICE_DECIMALS) if self.yes else None
 
     @property
     def yes_mid(self) -> float | None:
         if self.best_yes_bid is None or self.best_yes_ask is None:
             return None
-        return (self.best_yes_bid + self.best_yes_ask) / 2
+        return round((self.best_yes_bid + self.best_yes_ask) / 2, PRICE_DECIMALS)
 
-    def depth(self, side: str, max_levels: int | None = None) -> int:
+    def depth(self, side: str, max_levels: int | None = None) -> float:
         levels = self.yes if side == "yes" else self.no
         if max_levels is not None:
             levels = levels[:max_levels]
@@ -186,44 +239,41 @@ class Orderbook:
 
 @dataclass(frozen=True)
 class Balance:
-    balance: int  # cents available
-    portfolio_value: int | None = None  # cents, if the API reports it
+    balance: float  # dollars available
+    portfolio_value: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Balance:
         return cls(
-            balance=int(d.get("balance") or 0),
-            portfolio_value=(
-                int(d["portfolio_value"]) if d.get("portfolio_value") is not None else None
-            ),
+            balance=_money(d, "balance") or 0.0,
+            portfolio_value=_money(d, "portfolio_value"),
         )
-
-    @property
-    def dollars(self) -> float:
-        return self.balance / 100
 
 
 @dataclass(frozen=True)
 class Position:
     ticker: str
     event_ticker: str | None
-    position: int  # >0 long YES, <0 long NO
-    total_cost: int  # cents
-    realized_pnl: int  # cents
-    fees_paid: int  # cents
-    resting_order_count: int
+    position: float  # >0 long YES, <0 long NO (contracts)
+    total_cost: float  # dollars
+    realized_pnl: float  # dollars
+    fees_paid: float  # dollars
+    resting_order_count: float
     market_result: str | None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Position:
+        total_cost = _money(d, "total_traded")
+        if total_cost is None:
+            total_cost = _money(d, "total_cost")
         return cls(
             ticker=d["ticker"],
             event_ticker=d.get("event_ticker"),
-            position=int(d.get("position") or 0),
-            total_cost=int(d.get("total_cost") or d.get("total_traded") or 0),
-            realized_pnl=int(d.get("realized_pnl") or 0),
-            fees_paid=int(d.get("fees_paid") or 0),
-            resting_order_count=int(d.get("resting_order_count") or 0),
+            position=_num(d, "position", 0.0) or 0.0,
+            total_cost=total_cost or 0.0,
+            realized_pnl=_money(d, "realized_pnl") or 0.0,
+            fees_paid=_money(d, "fees_paid") or 0.0,
+            resting_order_count=_num(d, "resting_order_count", 0.0) or 0.0,
             market_result=d.get("market_result") or None,
         )
 
@@ -245,14 +295,17 @@ class Order:
     action: str  # buy | sell
     type: str  # limit | market
     status: str  # resting | canceled | executed | pending
-    yes_price: int | None
-    no_price: int | None
-    count: int
-    remaining_count: int
+    yes_price: float | None
+    no_price: float | None
+    count: float
+    remaining_count: float
     created_time: datetime | None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Order:
+        count = _num(d, "count")
+        if count is None:
+            count = _num(d, "initial_count", 0.0)
         return cls(
             order_id=d.get("order_id") or "",
             client_order_id=d.get("client_order_id"),
@@ -263,10 +316,14 @@ class Order:
             status=d.get("status") or "",
             yes_price=_price(d, "yes_price"),
             no_price=_price(d, "no_price"),
-            count=int(d.get("count") or d.get("initial_count") or 0),
-            remaining_count=int(d.get("remaining_count") or 0),
+            count=count or 0.0,
+            remaining_count=_num(d, "remaining_count", 0.0) or 0.0,
             created_time=_parse_time(d.get("created_time")),
         )
+
+    @property
+    def price(self) -> float | None:
+        return self.yes_price if self.side == "yes" else self.no_price
 
 
 @dataclass(frozen=True)
@@ -276,15 +333,15 @@ class Fill:
     ticker: str
     side: str
     action: str
-    count: int
-    price: int  # cents, on the fill's side
+    count: float
+    price: float  # dollars, on the fill's side
     is_taker: bool
     created_time: datetime | None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Fill:
         side = d.get("side") or ""
-        price = d.get("price")
+        price = _price(d, "price")
         if price is None:
             price = _price(d, "yes_price") if side == "yes" else _price(d, "no_price")
         return cls(
@@ -293,10 +350,37 @@ class Fill:
             ticker=d.get("ticker") or "",
             side=side,
             action=d.get("action") or "",
-            count=int(d.get("count") or 0),
-            price=_cents(price) or 0,
+            count=_num(d, "count", 0.0) or 0.0,
+            price=price or 0.0,
             is_taker=bool(d.get("is_taker", False)),
             created_time=_parse_time(d.get("created_time")),
+        )
+
+
+@dataclass(frozen=True)
+class Trade:
+    """A public trade print."""
+
+    trade_id: str
+    ticker: str
+    yes_price: float | None
+    no_price: float | None
+    count: float
+    taker_side: str | None
+    created_time: datetime | None
+    raw: dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Trade:
+        return cls(
+            trade_id=str(d.get("trade_id") or d.get("id") or ""),
+            ticker=d.get("ticker") or "",
+            yes_price=_price(d, "yes_price"),
+            no_price=_price(d, "no_price"),
+            count=_num(d, "count", 0.0) or 0.0,
+            taker_side=d.get("taker_side") or d.get("taker_outcome_side") or None,
+            created_time=_parse_time(d.get("created_time")),
+            raw=d,
         )
 
 
@@ -304,11 +388,11 @@ class Fill:
 class Candle:
     start_ts: int
     end_ts: int
-    open: int | None
-    high: int | None
-    low: int | None
-    close: int | None
-    volume: int
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float | None
+    volume: float
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Candle:
@@ -318,9 +402,9 @@ class Candle:
         return cls(
             start_ts=int(d.get("start_ts") or 0),
             end_ts=int(d.get("end_period_ts") or d.get("end_ts") or 0),
-            open=_cents(price.get("open")),
-            high=_cents(price.get("high")),
-            low=_cents(price.get("low")),
-            close=_cents(price.get("close")),
-            volume=int(d.get("volume") or 0),
+            open=_price(price, "open"),
+            high=_price(price, "high"),
+            low=_price(price, "low"),
+            close=_price(price, "close"),
+            volume=_num(d, "volume", 0.0) or 0.0,
         )
