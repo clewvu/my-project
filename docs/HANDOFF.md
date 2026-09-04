@@ -154,6 +154,20 @@ repo; `.gitignore` covers `*.pem`, `.env`, and `state/`.
   and, on fills, `fee_cost`. Source: Kalshi's `kalshi-typescript` SDK 3.29.0
   on npm (docs.kalshi.com is blocked from the sandbox; the SDK tarball is
   the way to read the current spec).
+- Exchange shards (verified 2026-09-04): Kalshi runs several exchange
+  instances, each with its own balance. `GET /exchange/status` lists them in
+  `exchange_index_statuses`: 0 Default, 1 Combos, 2 Crypto, 3 Tennis &
+  Baseball. `GET /portfolio/balance` gives the total plus `balance_breakdown`
+  per shard; each market carries `exchange_index` (the 15-minute crypto
+  markets are on shard 2). An order draws only on its market's shard, so a
+  funded account gets `insufficient_balance` until money is moved with
+  `POST /portfolio/intra_exchange_instance_transfer` (`source` and
+  `destination` both `event_contract`, `amount` in centicents,
+  `source_exchange_shard`, `destination_exchange_shard`). The transfer
+  lookup endpoint answered 404 for a transfer that went through; poll the
+  destination balance instead. `status` prints the breakdown, `transfer`
+  moves funds, and `live-trade` funds the markets' shard before starting
+  (`client.transfer_between_shards`, `cli.shard_plan`).
 
 ## 5. Database (state/market_data.sqlite, schema v3)
 
