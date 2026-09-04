@@ -122,6 +122,34 @@ def test_shard_plan():
     assert shard_plan(partial, {"KXBTC15M": 1}, needed=45.0) == (5.0, 0, 1)
 
 
+def test_move_funds_waits_on_balance_not_transfer_lookup(capsys):
+    from kalshi_bot.cli import _move_funds
+    from kalshi_bot.models import Balance
+
+    class C:
+        calls = 0
+
+        def transfer_between_shards(self, amount, *, source_shard, destination_shard):
+            return "tr1"
+
+        def get_transfer(self, transfer_id):
+            raise AssertionError("must not rely on the transfer lookup")
+
+        def get_balance(self):
+            self.calls += 1
+            moved = self.calls >= 3
+            return Balance(
+                balance=49.72, breakdown={0: 4.73 if moved else 49.72, 2: 44.99 if moved else 0.0}
+            )
+
+    import kalshi_bot.cli as cli
+
+    cli.time.sleep = lambda s: None
+    _move_funds(C(), 44.99, 0, 2)
+    out = capsys.readouterr().out
+    assert "transfer tr1" in out and "shard 2: $44.99" in out and "not shown up" not in out
+
+
 def test_market_shards_uses_first_open_market():
     from kalshi_bot.cli import market_shards
     from kalshi_bot.models import Market

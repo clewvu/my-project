@@ -513,6 +513,8 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
         print("Markets trade on: " + ", ".join(f"{k}: shard {v}" for k, v in shards.items()))
     if plan is not None:
         amount, src, dst = plan
+        if amount > bal.on_shard(src):
+            sys.exit(f"shard {src} holds ${bal.on_shard(src):,.2f}, less than ${amount:,.2f}")
         print(
             f"The markets' shard {dst} holds ${bal.on_shard(dst):,.2f} and orders draw on it, "
             f"so ${amount:,.2f} will be moved from shard {src} to shard {dst} when you continue."
@@ -579,11 +581,19 @@ def _move_funds(client: KalshiClient, amount: float, src: int, dst: int) -> None
     print(f"moving ${amount:,.2f} from shard {src} to shard {dst}: transfer {transfer_id}")
     if transfer_id is None:
         return
+    # The status lookup can answer 404 for a transfer that did go through, so the
+    # balance on the destination shard is the source of truth.
+    before = client.get_balance().on_shard(dst)
+    bal = None
     for _ in range(30):
-        if client.get_transfer(transfer_id).get("status") == "complete":
+        bal = client.get_balance()
+        if bal.on_shard(dst) >= before + amount - 0.01:
             break
         time.sleep(1.0)
-    print("balance by shard now: " + _shards_text(client.get_balance()))
+    if bal is not None:
+        print("balance by shard now: " + _shards_text(bal))
+        if bal.on_shard(dst) < before + amount - 0.01:
+            print("the transfer has not shown up on the destination shard yet; continuing")
 
 
 def cmd_transfer(settings: Settings, args: argparse.Namespace) -> int:
