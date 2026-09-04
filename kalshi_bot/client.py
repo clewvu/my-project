@@ -279,17 +279,35 @@ class KalshiClient:
         self,
         ticker: str,
         *,
-        limit: int = 100,
+        limit: int = 1000,
         min_ts: int | None = None,
         max_ts: int | None = None,
+        max_pages: int = 5,
     ) -> list[Trade]:
-        data = self._request(
-            "GET",
-            "/markets/trades",
-            params={"ticker": ticker, "limit": limit, "min_ts": min_ts, "max_ts": max_ts},
-            auth=False,
-        )
-        return [Trade.from_dict(t) for t in data.get("trades", [])]
+        """Public trade prints, following the cursor so bursts are not truncated."""
+        trades: list[Trade] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            data = self._request(
+                "GET",
+                "/markets/trades",
+                params={
+                    "ticker": ticker,
+                    "limit": limit,
+                    "min_ts": min_ts,
+                    "max_ts": max_ts,
+                    "cursor": cursor,
+                },
+                auth=False,
+            )
+            page = data.get("trades", [])
+            trades.extend(Trade.from_dict(t) for t in page)
+            cursor = data.get("cursor") or None
+            if not cursor or len(page) < limit:
+                break
+        else:
+            log.warning("%s: trades still paginating after %d pages", ticker, max_pages)
+        return trades
 
     # ------------------------------------------------------------------ portfolio
 

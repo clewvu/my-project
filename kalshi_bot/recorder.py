@@ -124,9 +124,7 @@ class Recorder:
 
         try:
             since = self.store.last_trade_ts(market.ticker)
-            trades = self.client.get_trades(
-                market.ticker, limit=100, min_ts=int(since) if since else None
-            )
+            trades = self.client.get_trades(market.ticker, min_ts=int(since) if since else None)
             result.new_trades += self.store.insert_trades(market.ticker, trades)
         except KalshiError as exc:
             result.errors.append(f"{market.ticker}: trades: {exc}")

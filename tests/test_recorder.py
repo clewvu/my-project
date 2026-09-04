@@ -47,7 +47,7 @@ class FakeClient:
             ticker, {"orderbook_fp": {"yes": [["0.45", "10"]], "no": [["0.45", "10"]]}}
         )
 
-    def get_trades(self, ticker, *, limit, min_ts):
+    def get_trades(self, ticker, *, min_ts):
         self.calls.append(("trades", ticker, min_ts))
         return [
             Trade.from_dict(

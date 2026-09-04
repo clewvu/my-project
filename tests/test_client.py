@@ -254,3 +254,17 @@ def test_get_trades_returns_trade_objects(signer):
     trades = client.get_trades("X", min_ts=5)
     assert trades[0].yes_price == 0.091 and trades[0].count == 2.5
     assert rec.requests[0].url.params["min_ts"] == "5"
+
+
+def test_get_trades_follows_cursor_on_full_pages(signer):
+    full = [{"trade_id": str(i), "ticker": "X"} for i in range(2)]
+    client, rec = make_client(
+        signer,
+        [
+            (200, {"trades": full, "cursor": "c1"}),
+            (200, {"trades": [{"trade_id": "9", "ticker": "X"}], "cursor": "c2"}),  # short page
+        ],
+    )
+    trades = client.get_trades("X", limit=2)
+    assert [t.trade_id for t in trades] == ["0", "1", "9"]
+    assert len(rec.requests) == 2 and rec.requests[1].url.params["cursor"] == "c1"
