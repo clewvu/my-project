@@ -74,3 +74,34 @@ def test_markets_raw_prints_json(monkeypatch, capsys):
     args = cli.build_parser().parse_args(["markets"])
     cli.cmd_markets(settings, args)
     assert "21.0c" in capsys.readouterr().out
+
+
+def test_setup_writes_env_from_messy_key_file(rsa_key, tmp_path, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+
+    import kalshi_bot.cli as cli
+
+    pem = rsa_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    key_file = tmp_path / "Ham Recipe.txt"
+    key_file.write_bytes(b"key id 12345678-abcd-4ef0-9876-0123456789ab\n" + pem)
+    env_out = tmp_path / ".env"
+    args = cli.build_parser().parse_args(
+        ["setup", "--key-file", str(key_file), "--live", "--env-out", str(env_out)]
+    )
+    assert cli.cmd_setup(None, args) == 0
+    text = env_out.read_text()
+    assert "KALSHI_ENV=prod" in text and "KALSHI_DRY_RUN=false" in text
+    assert "KALSHI_API_KEY_ID=12345678-abcd-4ef0-9876-0123456789ab" in text
+    # the written .env round-trips through Settings, spaces in the path included
+    for var in ("KALSHI_ENV", "KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY_PATH", "KALSHI_DRY_RUN"):
+        monkeypatch.delenv(var, raising=False)
+    settings = cli.Settings.from_env(env_out)
+    assert settings.env == "prod" and settings.dry_run is False
+    assert settings.private_key_path == key_file
+    assert cli.cmd_check(settings, None) == 0
+    # re-running backs up the previous file
+    assert cli.cmd_setup(None, args) == 0 and (tmp_path / ".env.bak").exists()

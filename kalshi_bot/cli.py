@@ -74,6 +74,55 @@ def cmd_check(settings: Settings, _: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(_: Settings, args: argparse.Namespace) -> int:
+    """Write .env from a key file (as downloaded or pasted into a text file) and verify it."""
+    from pathlib import Path
+
+    from .auth import Signer, find_key_id
+
+    key_file = Path(args.key_file).expanduser()
+    if not key_file.exists():
+        sys.exit(f"key file not found: {key_file}")
+    raw = key_file.read_bytes()
+    key_id = args.key_id or find_key_id(raw)
+    if not key_id:
+        key_id = input("Key id (shown on Kalshi's API keys page, looks like 8-4-4-4-12 hex): ")
+    key_id = key_id.strip()
+    try:
+        Signer.from_pem(key_id, raw)
+    except ValueError as exc:
+        sys.exit(f"cannot use {key_file}: {exc}")
+    env_path = Path(args.env_out)
+    if env_path.exists():
+        backup = env_path.with_suffix(env_path.suffix + ".bak")
+        backup.write_bytes(env_path.read_bytes())
+        print(f"backed up existing {env_path} to {backup}")
+    live = bool(args.live)
+    env_path.write_text(
+        "# written by kalshi-bot setup\n"
+        f"KALSHI_ENV={'prod' if live else 'demo'}\n"
+        f"KALSHI_API_KEY_ID={key_id}\n"
+        f"KALSHI_PRIVATE_KEY_PATH='{key_file}'\n"
+        f"KALSHI_DRY_RUN={'false' if live else 'true'}\n"
+        "KALSHI_MIN_REQUEST_INTERVAL=0.15\n"
+        "KALSHI_LOG_LEVEL=INFO\n"
+    )
+    print(f"wrote {env_path}: env={'prod' if live else 'demo'} key id={key_id}")
+    print(f"private key loads OK from {key_file}")
+    if live:
+        print("\nNext, in this window:            kalshi-bot --env prod status")
+        print(
+            "Then start the dashboard here:   kalshi-bot demo-ui --state-file state/live_loop.json"
+        )
+        print(
+            "And in a second window:          "
+            "kalshi-bot --env prod live-trade --dollars 2 --loss-cap 40 --real-money"
+        )
+    else:
+        print("\nNext: kalshi-bot status")
+    return 0
+
+
 def cmd_status(settings: Settings, _: argparse.Namespace) -> int:
     """Exchange status, balance and open positions."""
     with _client(settings, need_auth=True) as client:
@@ -488,6 +537,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("check", help=cmd_check.__doc__).set_defaults(func=cmd_check)
+
+    s = sub.add_parser("setup", help=cmd_setup.__doc__)
+    s.add_argument("--key-file", required=True, help="path to the downloaded key or a text file")
+    s.add_argument("--key-id", default=None, help="Kalshi key id; found in the file if omitted")
+    s.add_argument(
+        "--live",
+        action="store_true",
+        help="configure for production with real orders (else demo, dry run)",
+    )
+    s.add_argument("--env-out", default=".env", help="where to write the settings")
+    s.set_defaults(func=cmd_setup)
     sub.add_parser("status", help=cmd_status.__doc__).set_defaults(func=cmd_status)
 
     s = sub.add_parser("markets", help=cmd_markets.__doc__)
@@ -659,6 +719,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(settings.log_level)
     if args.command not in (
         "check",
+        "setup",
         "markets",
         "record-stats",
         "record-dump",

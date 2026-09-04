@@ -40,3 +40,30 @@ def test_from_pem_roundtrip(rsa_key, tmp_path):
     s = Signer.from_pem_path("abc", path)
     assert s.key_id == "abc"
     assert "BEGIN PUBLIC KEY" in s.public_key_pem()
+
+
+def test_extract_pem_tolerates_notes_and_crlf(rsa_key, tmp_path):
+    from kalshi_bot.auth import extract_pem, find_key_id
+
+    pem = rsa_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+    messy = (
+        b"my kalshi key\r\nid: 12345678-abcd-4ef0-9876-0123456789ab\r\n"
+        + pem.replace(b"\n", b"\r\n")
+        + b"\r\nremember to delete this\r\n"
+    )
+    assert extract_pem(messy).startswith(b"-----BEGIN RSA PRIVATE KEY-----\n")
+    assert b"\r" not in extract_pem(messy)
+    assert find_key_id(messy) == "12345678-abcd-4ef0-9876-0123456789ab"
+    assert find_key_id(pem) is None
+    path = tmp_path / "notes.txt"
+    path.write_bytes(messy)
+    s = Signer.from_pem_path("abc", path)
+    assert "BEGIN PUBLIC KEY" in s.public_key_pem()
+    import pytest
+
+    with pytest.raises(ValueError):
+        extract_pem(b"nothing here")

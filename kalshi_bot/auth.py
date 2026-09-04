@@ -13,6 +13,7 @@ excluding any query string.
 from __future__ import annotations
 
 import base64
+import re
 import time
 from pathlib import Path
 
@@ -22,6 +23,33 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 HEADER_KEY = "KALSHI-ACCESS-KEY"
 HEADER_TIMESTAMP = "KALSHI-ACCESS-TIMESTAMP"
 HEADER_SIGNATURE = "KALSHI-ACCESS-SIGNATURE"
+
+
+PEM_BLOCK = re.compile(
+    rb"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL
+)
+KEY_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def extract_pem(text: bytes | str) -> bytes:
+    """The private-key block inside ``text``, whatever else the file contains.
+
+    Kalshi's download is a clean PEM, but people paste keys into notes files
+    with the key id and other text around them. Line endings are normalised.
+    """
+    data = text.encode("utf-8") if isinstance(text, str) else text
+    match = PEM_BLOCK.search(data)
+    if not match:
+        raise ValueError("no '-----BEGIN ... PRIVATE KEY-----' block found in the key file")
+    return match.group(0).replace(b"\r\n", b"\n").replace(b"\r", b"\n") + b"\n"
+
+
+def find_key_id(text: bytes | str) -> str | None:
+    """A Kalshi key id (a UUID) appearing in ``text`` outside the PEM block, if any."""
+    data = text.decode("utf-8", "replace") if isinstance(text, bytes) else text
+    outside = PEM_BLOCK.sub(b"", data.encode("utf-8")).decode("utf-8", "replace")
+    match = KEY_ID.search(outside)
+    return match.group(0) if match else None
 
 
 class Signer:
@@ -40,9 +68,7 @@ class Signer:
 
     @classmethod
     def from_pem(cls, key_id: str, pem: bytes | str) -> Signer:
-        if isinstance(pem, str):
-            pem = pem.encode("utf-8")
-        key = serialization.load_pem_private_key(pem, password=None)
+        key = serialization.load_pem_private_key(extract_pem(pem), password=None)
         if not isinstance(key, rsa.RSAPrivateKey):
             raise ValueError("Kalshi private key must be an RSA key")
         return cls(key_id, key)
