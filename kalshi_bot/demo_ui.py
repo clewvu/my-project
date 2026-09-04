@@ -103,10 +103,12 @@ async function refresh() {
   const series = Array.isArray(c.series) ? c.series.join(', ') : (c.series || '');
   const size = c.dollars ? `$${fmt(c.dollars, 2)} per trade` : `${c.contracts || '?'} contract(s) per trade`;
   document.getElementById('cfg').textContent = d.state
-    ? `${c.env || ''} · ${series} · ${size} · max price ${fmt(c.max_price, 2)} · loss cap $${fmt(c.loss_cap, 2)} · profit target $${fmt(c.profit_target, 2)}`
+    ? `${c.env || ''} · ${series} · ${size} · max price ${fmt(c.max_price, 2)} · loss cap $${fmt(c.loss_cap, 2)} · ${c.profit_target ? 'profit target $' + fmt(c.profit_target, 2) : 'no profit cap'} · reading ${d.state_file}`
     : `no state file yet at ${d.state_file}; start the loop with: kalshi-bot demo-trade`;
   const st = document.getElementById('status'), note = document.getElementById('statusnote');
   st.className = 'big';
+  document.title = (c.env === 'LIVE' ? 'LIVE · ' : '') + 'Kalshi loop';
+  document.querySelector('h1').textContent = c.env === 'LIVE' ? 'Kalshi loop · REAL MONEY' : 'Kalshi demo loop';
   if (s.halted) { st.textContent = 'halted'; st.classList.add('warn'); note.textContent = s.halted; }
   else if (d.alive) { st.innerHTML = '<span class="dot" style="background:var(--good)"></span>running'; st.classList.add('good'); note.textContent = 'last tick ' + ts(s.last_tick_ts); }
   else { st.textContent = 'not running'; st.classList.add('bad'); note.textContent = s.stopped ? ('stopped: ' + s.stopped) : (s.last_tick_ts ? 'last tick ' + ts(s.last_tick_ts) : ''); }
@@ -139,18 +141,31 @@ refresh(); setInterval(refresh, 2000);
 
 
 class Dashboard:
-    """State that the HTTP handler reads; one per server."""
+    """State that the HTTP handler reads; one per server.
 
-    def __init__(self, state_file: Path, stop_file: Path) -> None:
-        self.state_file = Path(state_file)
+    ``state_files`` may list several candidates (the live and the demo loop
+    write different files); each poll shows the most recently modified one.
+    """
+
+    def __init__(self, state_file: Path | list[Path], stop_file: Path) -> None:
+        files = state_file if isinstance(state_file, list) else [state_file]
+        self.state_files = [Path(f) for f in files]
         self.stop_file = Path(stop_file)
+
+    @property
+    def state_file(self) -> Path:
+        existing = [f for f in self.state_files if f.exists()]
+        if not existing:
+            return self.state_files[0]
+        return max(existing, key=lambda f: f.stat().st_mtime)
 
     def snapshot(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
         state: dict[str, Any] | None = None
-        if self.state_file.exists():
+        state_file = self.state_file
+        if state_file.exists():
             try:
-                state = json.loads(self.state_file.read_text())
+                state = json.loads(state_file.read_text())
             except ValueError:
                 state = None  # mid-write; the next poll will get it
         last = (state or {}).get("last_tick_ts")
@@ -158,7 +173,7 @@ class Dashboard:
         return {
             "now": now,
             "state": state,
-            "state_file": str(self.state_file),
+            "state_file": str(state_file),
             "stop_file": str(self.stop_file),
             "stop_file_present": self.stop_file.exists(),
             "alive": alive and not (state or {}).get("halted"),
@@ -211,7 +226,7 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
 
 
 def serve(
-    state_file: Path, stop_file: Path, host: str = "127.0.0.1", port: int = 8765
+    state_file: Path | list[Path], stop_file: Path, host: str = "127.0.0.1", port: int = 8765
 ) -> ThreadingHTTPServer:
     """Bind and return the server; call ``serve_forever`` on it."""
     server = ThreadingHTTPServer((host, port), make_handler(Dashboard(state_file, stop_file)))

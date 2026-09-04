@@ -514,8 +514,14 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
 
     from .demo_ui import serve
 
-    server = serve(Path(args.state_file), Path(args.stop_file), host=args.host, port=args.port)
+    files = (
+        [Path(args.state_file)]
+        if args.state_file
+        else [Path("state/live_loop.json"), Path("state/demo_loop.json")]
+    )
+    server = serve(files, Path(args.stop_file), host=args.host, port=args.port)
     print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
+    print("showing whichever of these was updated most recently: " + ", ".join(map(str, files)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -655,7 +661,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("demo-ui", help=cmd_demo_ui.__doc__)
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
-    s.add_argument("--state-file", default="state/demo_loop.json")
+    s.add_argument(
+        "--state-file",
+        default=None,
+        help="loop state to show (default: the fresher of state/live_loop.json and "
+        "state/demo_loop.json)",
+    )
     s.add_argument("--stop-file", default="state/STOP")
     s.set_defaults(func=cmd_demo_ui)
 

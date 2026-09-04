@@ -422,3 +422,19 @@ def test_live_trade_cli_gates(monkeypatch, capsys):
         cli.cmd_live_trade(prod, args)
     assert "at most" in str(exc.value)
     assert cli.build_parser().parse_args(["demo-trade"]).func is cli.cmd_demo_trade
+
+
+def test_dashboard_prefers_freshest_state_file(tmp_path):
+    import os
+
+    live, demo = tmp_path / "live.json", tmp_path / "demo.json"
+    dash = demo_ui.Dashboard([live, demo], tmp_path / "STOP")
+    assert dash.snapshot(now=T0)["state_file"] == str(live)  # neither exists: first candidate
+    LoopState(trades=1).save(demo)
+    assert dash.snapshot(now=T0)["state"]["trades"] == 1
+    LoopState(trades=7).save(live)
+    os.utime(demo, (T0, T0))
+    os.utime(live, (T0 + 10, T0 + 10))
+    assert dash.snapshot(now=T0)["state"]["trades"] == 7
+    os.utime(demo, (T0 + 20, T0 + 20))
+    assert dash.snapshot(now=T0)["state"]["trades"] == 1
