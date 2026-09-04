@@ -140,3 +140,24 @@ def test_report_with_nothing_settled(tmp_path):
     store.close()
     text = analysis.report(analysis.load(str(tmp_path / "empty.sqlite")))
     assert "keep recording" in text and "== brier" not in text
+
+
+def test_prefer_websocket_spot():
+    spot = pd.DataFrame(
+        {
+            "ts": [1.0, 5.0, 10.0, 6.0, 7.0, 15.0, 1.0],
+            "source": ["coinbase"] * 3 + ["coinbase_ws"] * 2 + ["coinbase", "coinbase"],
+            "symbol": ["BTC-USD"] * 6 + ["DOGE-USD"],
+            "price": [1, 2, 3, 4, 5, 6, 7],
+        }
+    )
+    out = analysis.prefer_websocket_spot(spot)
+    btc = out[out["symbol"] == "BTC-USD"]
+    # REST rows inside the websocket span (ts 6..7) are dropped: none here, but ts=5 and 10 kept
+    assert sorted(btc["ts"].tolist()) == [1.0, 5.0, 6.0, 7.0, 10.0, 15.0]
+    assert out[out["symbol"] == "DOGE-USD"]["price"].tolist() == [7]
+    inside = pd.DataFrame(
+        {"ts": [6.5], "source": ["coinbase"], "symbol": ["BTC-USD"], "price": [9]}
+    )
+    out2 = analysis.prefer_websocket_spot(pd.concat([spot, inside]))
+    assert 9 not in out2["price"].tolist()

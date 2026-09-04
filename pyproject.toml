@@ -12,6 +12,7 @@ dependencies = [
     "cryptography>=42",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]

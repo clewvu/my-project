@@ -136,3 +136,61 @@ def test_schema_version_is_enforced(tmp_path):
     con.close()
     with pytest.raises(SchemaMismatch, match="older kalshi-bot"):
         MarketDataStore(legacy)
+
+
+def test_migration_from_v2_adds_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "v2.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO meta VALUES ('schema_version', '2');
+        CREATE TABLE markets (ticker TEXT PRIMARY KEY, series_ticker TEXT, event_ticker TEXT,
+            title TEXT, strike REAL, strike_type TEXT, open_ts REAL, close_ts REAL,
+            expiration_ts REAL, status TEXT, result TEXT, first_seen_ts REAL NOT NULL,
+            last_seen_ts REAL NOT NULL, settled_ts REAL, raw TEXT);
+        CREATE TABLE spot (id INTEGER PRIMARY KEY, ts REAL NOT NULL, source TEXT NOT NULL,
+            symbol TEXT NOT NULL, price REAL NOT NULL);
+        INSERT INTO spot (ts, source, symbol, price) VALUES (1.0, 'coinbase', 'BTC-USD', 5.0);
+    """)
+    con.commit()
+    con.close()
+    with MarketDataStore(path) as store:
+        version = store._conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        assert version == str(SCHEMA_VERSION)
+        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(markets)")}
+        assert "expiration_value" in cols
+        assert store.stats()["spot"] == 1  # old rows survive
+        store.insert_spot(2.0, "coinbase_ws", "BTC-USD", 6.0, exchange_ts=1.9)
+
+
+def test_newer_schema_refused(tmp_path):
+    path = tmp_path / "future.sqlite"
+    with MarketDataStore(path) as store:
+        store._conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        store._conn.commit()
+    with pytest.raises(SchemaMismatch, match="newer"):
+        MarketDataStore(path)
+
+
+def test_expiration_value_and_pending_values():
+    store = MarketDataStore()
+    close = "2026-09-04T15:15:00Z"
+    m = mk(close=close)
+    close_ts = m.close_time.timestamp()
+    store.upsert_market(m, now=close_ts - 600)
+    # settled without a value yet
+    store.mark_settled(mk(close=close, status="settled", result="no"), now=close_ts + 90)
+    assert store.pending_values(close_ts + 100) == ["KXBTC15M-1"]
+    assert store.pending_values(close_ts + 100 + 7200) == []  # gave up after an hour
+    store.mark_settled(
+        mk(close=close, status="settled", result="no", expiration_value="79,001.23"),
+        now=close_ts + 150,
+    )
+    assert store.pending_values(close_ts + 200) == []
+    row = store.get_market_row("KXBTC15M-1")
+    assert row["expiration_value"] == 79001.23 and row["result"] == "no"
+    assert store.stats()["with_value"] == 1

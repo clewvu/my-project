@@ -138,3 +138,39 @@ def test_dead_markets_are_skipped():
     client.open["KXBTC15M"].append(market("OLD", "KXBTC15M", status="closed"))
     res = Recorder(client, store, series=["KXBTC15M"]).tick(now=now - 10)
     assert res.markets == 1 and store.get_market_row("OLD") is None
+
+
+def test_settlement_value_is_fetched_later():
+    client, store = FakeClient(), MarketDataStore()
+    rec = Recorder(client, store, series=["KXBTC15M"], interval=1, settle_interval=60)
+    close_ts = market("BTC-1", "KXBTC15M").close_time.timestamp()
+    rec.tick(now=close_ts - 300)
+    client.open["KXBTC15M"] = []
+    client.settled["BTC-1"] = market("BTC-1", "KXBTC15M", status="settled", result="no")
+    res = rec.tick(now=close_ts + 100)
+    assert res.settled == 1 and res.values == 0
+    assert store.get_market_row("BTC-1")["expiration_value"] is None
+    # value appears on a later fetch
+    client.settled["BTC-1"] = Market.from_dict(
+        {
+            "ticker": "BTC-1",
+            "status": "settled",
+            "result": "no",
+            "close_time": "2026-09-04T15:15:00Z",
+            "expiration_value": "79400.10",
+        }
+    )
+    res = rec.tick(now=close_ts + 200)
+    assert res.values == 1
+    assert store.get_market_row("BTC-1")["expiration_value"] == 79400.10
+
+
+def test_spot_ws_is_flushed_each_tick():
+    from kalshi_bot.spot_ws import SpotWebSocket, Tick
+
+    client, store = FakeClient(), MarketDataStore()
+    ws = SpotWebSocket(store, ["BTC-USD"], min_interval=0)
+    ws.buffer.push(Tick("BTC-USD", 5.0, None, 1.0))
+    rec = Recorder(client, store, series=["KXBTC15M"], spot_ws=ws)
+    assert rec.tick(now=1.0).spot_ws == 1
+    assert store.stats()["spot_by_source"] == {"coinbase_ws": 1}

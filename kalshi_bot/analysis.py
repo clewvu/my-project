@@ -67,9 +67,10 @@ def load(
             """,
             con,
         )
-        spot = pd.read_sql("SELECT ts, symbol, price FROM spot", con)
+        spot = pd.read_sql("SELECT ts, source, symbol, price FROM spot", con)
     finally:
         con.close()
+    spot = prefer_websocket_spot(spot)
 
     if series:
         markets = markets[markets["series_ticker"].isin(series)]
@@ -89,6 +90,26 @@ def load(
     snaps.loc[snaps["spot"].isna(), "spot_above"] = float("nan")
     snaps = snaps.sort_values(["ticker", "ts"]).reset_index(drop=True)
     return Dataset(markets=markets, snapshots=snaps, spot=spot, horizons=horizons)
+
+
+def prefer_websocket_spot(spot: pd.DataFrame) -> pd.DataFrame:
+    """Per symbol, use WebSocket ticks where they exist and REST polls elsewhere.
+
+    The two sources overlap in time once the WebSocket is running; keeping both
+    would let a 5-second REST value shadow a fresher tick in merge_asof.
+    """
+    if spot.empty or "source" not in spot.columns:
+        return spot
+    parts = []
+    for _, g in spot.groupby("symbol"):
+        ws = g[g["source"] == "coinbase_ws"]
+        if ws.empty:
+            parts.append(g)
+            continue
+        rest = g[g["source"] != "coinbase_ws"]
+        rest = rest[(rest["ts"] < ws["ts"].min()) | (rest["ts"] > ws["ts"].max())]
+        parts.append(pd.concat([ws, rest]))
+    return pd.concat(parts).sort_values("ts").reset_index(drop=True)
 
 
 def _attach_spot(snaps: pd.DataFrame, spot: pd.DataFrame) -> pd.DataFrame:

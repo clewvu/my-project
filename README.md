@@ -56,7 +56,8 @@ kalshi_bot/
   models.py   Market, Orderbook, Balance, Position, Order, Fill, Candle
   storage.py  SQLite store for recorded market data
   recorder.py polling loop: books, trades, settlements, spot
-  spot.py     Coinbase public spot price feed
+  spot.py     Coinbase REST spot price poll
+  spot_ws.py  Coinbase WebSocket spot feed (background thread)
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
   cli.py      kalshi-bot command line
@@ -92,10 +93,23 @@ production for reading with `--env prod`, for example
 `kalshi-bot --env prod markets --series KXBTC15M`.
 
 Per tick it stores, for every open market in each series: a top-of-book
-snapshot with the resting levels, any new public trades, and (unless
-`--no-spot`) the Coinbase spot price for BTC-USD and DOGE-USD. Markets that
-have closed are re-fetched about once a minute until their settlement result is
-known. No credentials are needed; every endpoint used is public.
+snapshot with the resting levels, any new public trades (cursor-paginated so
+bursts are not truncated), and (unless `--no-spot`) the Coinbase spot price
+for BTC-USD and DOGE-USD. Markets that have closed are re-fetched about once a
+minute until their settlement result and settlement index value
+(`expiration_value`) are known. No credentials are needed; every endpoint used
+is public.
+
+Alongside the 5-second poll, a WebSocket client subscribes to Coinbase's
+public ticker channel and writes sub-second price changes to the same `spot`
+table with source `coinbase_ws` (rate-limited to five rows per second per
+symbol, with the exchange timestamp kept for latency measurement). It
+reconnects with backoff and treats 30 seconds of silence as a dead
+connection. Disable it with `--no-spot-ws`, or switch feeds with
+`--spot-feed exchange` if the default Advanced Trade feed misbehaves. Test the
+feed on its own with `kalshi-bot spot-ws --seconds 15`.
+
+The database schema is versioned; older files are migrated in place on open.
 
 Leave it running for a few days (a `tmux` or `screen` session is enough). A
 single failing request is logged and skipped, and the loop backs off when the

@@ -22,7 +22,7 @@ from typing import Any
 
 from .models import Market, Orderbook, Trade
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS markets (
     title           TEXT,
     strike          REAL,
     strike_type     TEXT,
+    expiration_value REAL,
     open_ts         REAL,
     close_ts        REAL,
     expiration_ts   REAL,
@@ -88,10 +89,19 @@ CREATE TABLE IF NOT EXISTS spot (
     ts              REAL NOT NULL,
     source          TEXT NOT NULL,
     symbol          TEXT NOT NULL,
-    price           REAL NOT NULL
+    price           REAL NOT NULL,
+    exchange_ts     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_spot_symbol_ts ON spot(symbol, ts);
 """
+
+# Applied in order to bring an older database up to SCHEMA_VERSION.
+MIGRATIONS: dict[int, list[str]] = {
+    3: [
+        "ALTER TABLE markets ADD COLUMN expiration_value REAL",
+        "ALTER TABLE spot ADD COLUMN exchange_ts REAL",
+    ],
+}
 
 
 class SchemaMismatch(Exception):
@@ -130,18 +140,24 @@ class MarketDataStore:
                     f"{self.path} was created by an older kalshi-bot with integer-cent prices. "
                     "Delete it (or pass --db with a new path) and record again."
                 )
+            if "meta" in existing:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                version = int(row[0]) if row else 0
+                if version > SCHEMA_VERSION:
+                    raise SchemaMismatch(
+                        f"{self.path} has schema version {version}, newer than this code "
+                        f"({SCHEMA_VERSION}). Update kalshi-bot."
+                    )
+                for target in range(version + 1, SCHEMA_VERSION + 1):
+                    for statement in MIGRATIONS.get(target, []):
+                        self._conn.execute(statement)
             self._conn.executescript(SCHEMA)
-            row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            elif int(row[0]) != SCHEMA_VERSION:
-                raise SchemaMismatch(
-                    f"{self.path} has schema version {row[0]}, this code expects "
-                    f"{SCHEMA_VERSION}. Delete it or pass --db with a new path."
-                )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -160,13 +176,15 @@ class MarketDataStore:
                 """
                 INSERT INTO markets
                     (ticker, series_ticker, event_ticker, title, strike, strike_type,
-                     open_ts, close_ts, expiration_ts, status, result,
+                     expiration_value, open_ts, close_ts, expiration_ts, status, result,
                      first_seen_ts, last_seen_ts, raw)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     status = excluded.status,
                     result = COALESCE(excluded.result, markets.result),
                     strike = COALESCE(excluded.strike, markets.strike),
+                    expiration_value = COALESCE(excluded.expiration_value,
+                                                markets.expiration_value),
                     close_ts = COALESCE(excluded.close_ts, markets.close_ts),
                     last_seen_ts = excluded.last_seen_ts,
                     raw = excluded.raw
@@ -178,6 +196,7 @@ class MarketDataStore:
                     market.title,
                     market.strike,
                     market.strike_type,
+                    market.expiration_value,
                     _epoch(market.open_time),
                     _epoch(market.close_time),
                     _epoch(market.expiration_time),
@@ -193,10 +212,20 @@ class MarketDataStore:
         with self._lock, self._conn:
             self._conn.execute(
                 """
-                UPDATE markets SET status = ?, result = ?, settled_ts = ?, last_seen_ts = ?, raw = ?
+                UPDATE markets
+                SET status = ?, result = ?, expiration_value = ?, settled_ts = ?,
+                    last_seen_ts = ?, raw = ?
                 WHERE ticker = ?
                 """,
-                (market.status, market.result, now, now, _json(market.raw), market.ticker),
+                (
+                    market.status,
+                    market.result,
+                    market.expiration_value,
+                    now,
+                    now,
+                    _json(market.raw),
+                    market.ticker,
+                ),
             )
 
     def pending_settlements(self, now: float, grace_seconds: float = 30.0) -> list[str]:
@@ -209,6 +238,20 @@ class MarketDataStore:
                 ORDER BY close_ts
                 """,
                 (grace_seconds, now),
+            ).fetchall()
+        return [r["ticker"] for r in rows]
+
+    def pending_values(self, now: float, max_age: float = 3600.0) -> list[str]:
+        """Settled tickers still missing the settlement index value (retried for an hour)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT ticker FROM markets
+                WHERE result IS NOT NULL AND expiration_value IS NULL
+                  AND settled_ts IS NOT NULL AND settled_ts >= ?
+                ORDER BY settled_ts
+                """,
+                (now - max_age,),
             ).fetchall()
         return [r["ticker"] for r in rows]
 
@@ -296,11 +339,19 @@ class MarketDataStore:
 
     # ------------------------------------------------------------ spot
 
-    def insert_spot(self, now: float, source: str, symbol: str, price: float) -> None:
+    def insert_spot(
+        self, now: float, source: str, symbol: str, price: float, exchange_ts: float | None = None
+    ) -> None:
+        self.insert_spots([(now, source, symbol, price, exchange_ts)])
+
+    def insert_spots(self, rows: list[tuple[float, str, str, float, float | None]]) -> None:
+        """Batch insert of (ts, source, symbol, price, exchange_ts) rows."""
+        if not rows:
+            return
         with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO spot (ts, source, symbol, price) VALUES (?, ?, ?, ?)",
-                (now, source, symbol, price),
+            self._conn.executemany(
+                "INSERT INTO spot (ts, source, symbol, price, exchange_ts) VALUES (?, ?, ?, ?, ?)",
+                rows,
             )
 
     # ------------------------------------------------------------ inspection
@@ -345,6 +396,13 @@ class MarketDataStore:
                 ).fetchone()[0],
                 "trades": c.execute("SELECT COUNT(*) FROM trades").fetchone()[0],
                 "spot": c.execute("SELECT COUNT(*) FROM spot").fetchone()[0],
+                "spot_by_source": {
+                    r[0]: r[1]
+                    for r in c.execute("SELECT source, COUNT(*) FROM spot GROUP BY source")
+                },
+                "with_value": c.execute(
+                    "SELECT COUNT(*) FROM markets WHERE expiration_value IS NOT NULL"
+                ).fetchone()[0],
                 "first_ts": c.execute("SELECT MIN(ts) FROM snapshots").fetchone()[0],
                 "last_ts": c.execute("SELECT MAX(ts) FROM snapshots").fetchone()[0],
                 "by_series": [],

@@ -64,6 +64,15 @@ def _num(d: dict[str, Any], name: str, default: float | None = None) -> float | 
     return default
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def _money(d: dict[str, Any], name: str) -> float | None:
     """Dollar amount from ``name_dollars`` (string) or legacy ``name`` (integer cents)."""
     return _price(d, name)
@@ -87,6 +96,7 @@ class Market:
     open_interest: float | None
     strike: float | None  # reference price the market settles against
     strike_type: str | None  # e.g. greater_or_equal
+    expiration_value: float | None  # settlement index value, set once settled
     open_time: datetime | None
     close_time: datetime | None
     expiration_time: datetime | None
@@ -116,6 +126,7 @@ class Market:
             open_interest=_num(d, "open_interest"),
             strike=float(strike) if strike not in (None, "") else None,
             strike_type=d.get("strike_type") or None,
+            expiration_value=_float_or_none(d.get("expiration_value")),
             open_time=_parse_time(d.get("open_time")),
             close_time=_parse_time(d.get("close_time")),
             expiration_time=_parse_time(d.get("expiration_time")),

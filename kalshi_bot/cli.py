@@ -15,6 +15,7 @@ from .client import KalshiClient, KalshiError
 from .config import BASE_URLS, Settings
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
 from .spot import SpotFeed
+from .spot_ws import FEEDS, SpotWebSocket
 from .storage import MarketDataStore, SchemaMismatch
 
 DEFAULT_DB = "state/market_data.sqlite"
@@ -187,8 +188,10 @@ def cmd_cancel_all(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_record(settings: Settings, args: argparse.Namespace) -> int:
     """Record orderbooks, trades, settlements and spot prices to SQLite (Ctrl-C to stop)."""
-    spot = None if args.no_spot else SpotFeed(args.spot_symbol or DEFAULT_SPOT_SYMBOLS)
+    symbols = args.spot_symbol or DEFAULT_SPOT_SYMBOLS
+    spot = None if args.no_spot else SpotFeed(symbols)
     with _client(settings, need_auth=False) as client, MarketDataStore(args.db) as store:
+        spot_ws = None if args.no_spot_ws else SpotWebSocket(store, symbols, feed=args.spot_feed)
         rec = Recorder(
             client,
             store,
@@ -196,12 +199,39 @@ def cmd_record(settings: Settings, args: argparse.Namespace) -> int:
             interval=args.interval,
             book_depth=args.depth,
             spot=spot,
+            spot_ws=spot_ws,
         )
         try:
             rec.run(max_ticks=args.ticks)
         finally:
             if spot is not None:
                 spot.close()
+    return 0
+
+
+def cmd_spot_ws(_: Settings, args: argparse.Namespace) -> int:
+    """Run only the WebSocket spot feed for a few seconds and print what arrives."""
+    symbols = args.spot_symbol or DEFAULT_SPOT_SYMBOLS
+    with MarketDataStore(args.db) as store:
+        ws = SpotWebSocket(store, symbols, feed=args.spot_feed)
+        ws.start()
+        deadline = time.time() + args.seconds
+        try:
+            while time.time() < deadline:
+                time.sleep(1.0)
+                parts = []
+                for sym in symbols:
+                    tick = ws.last_tick(sym)
+                    if tick is None:
+                        parts.append(f"{sym}=-")
+                    else:
+                        parts.append(f"{sym}={tick.price:,.4f} ({ws.age(sym):.1f}s old)")
+                print(f"msgs={ws.messages:<6} reconnects={ws.reconnects}  {'  '.join(parts)}")
+        finally:
+            ws.stop()
+    if ws.messages == 0:
+        print(f"no messages received; last error: {ws.last_error}")
+        return 1
     return 0
 
 
@@ -220,8 +250,12 @@ def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
     if st["empty_books"]:
         print(f"            {st['empty_books']:,} with an empty/unparsed orderbook")
     print(f"trades:     {st['trades']:,}")
-    print(f"spot:       {st['spot']:,}")
-    print(f"markets:    {st['markets']:,} seen, {st['settled']:,} settled")
+    sources = ", ".join(f"{k}={v:,}" for k, v in sorted(st["spot_by_source"].items()))
+    print(f"spot:       {st['spot']:,}  ({sources or 'none'})")
+    print(
+        f"markets:    {st['markets']:,} seen, {st['settled']:,} settled, "
+        f"{st['with_value']:,} with settlement value"
+    )
     for row in st["by_series"]:
         settled = row["settled"] or 0
         yes = row["yes_wins"] or 0
@@ -321,13 +355,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--ticks", type=int, default=None, help="stop after N ticks (default: run forever)"
     )
-    s.add_argument("--no-spot", action="store_true", help="skip the Coinbase spot price feed")
+    s.add_argument("--no-spot", action="store_true", help="skip the 5s REST spot poll")
+    s.add_argument("--no-spot-ws", action="store_true", help="skip the WebSocket spot feed")
+    s.add_argument(
+        "--spot-feed",
+        choices=sorted(FEEDS),
+        default="advanced",
+        help="which Coinbase WebSocket to use",
+    )
     s.add_argument(
         "--spot-symbol",
         action="append",
         help=f"spot symbol; repeatable (default: {' '.join(DEFAULT_SPOT_SYMBOLS)})",
     )
     s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("spot-ws", help=cmd_spot_ws.__doc__)
+    s.add_argument("--seconds", type=int, default=15)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--spot-feed", choices=sorted(FEEDS), default="advanced")
+    s.add_argument("--spot-symbol", action="append")
+    s.set_defaults(func=cmd_spot_ws)
 
     s = sub.add_parser("record-stats", help=cmd_record_stats.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)
@@ -358,7 +406,14 @@ def main(argv: list[str] | None = None) -> int:
     if env_override and env_override != settings.env:
         settings = dataclasses.replace(settings, env=env_override)
     _setup_logging(settings.log_level)
-    if args.command not in ("check", "markets", "record-stats", "record-dump", "analyze"):
+    if args.command not in (
+        "check",
+        "markets",
+        "record-stats",
+        "record-dump",
+        "analyze",
+        "spot-ws",
+    ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
         return args.func(settings, args)

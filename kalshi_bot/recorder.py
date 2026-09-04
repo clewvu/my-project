@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from .client import KalshiClient, KalshiError
 from .models import Market
 from .spot import SpotFeed
+from .spot_ws import SpotWebSocket
 from .storage import MarketDataStore
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,9 @@ class TickResult:
     snapshots: int = 0
     new_trades: int = 0
     settled: int = 0
+    values: int = 0
     spot: int = 0
+    spot_ws: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -63,6 +66,7 @@ class Recorder:
         book_depth: int = 10,
         settle_interval: float = 60.0,
         spot: SpotFeed | None = None,
+        spot_ws: SpotWebSocket | None = None,
     ) -> None:
         self.client = client
         self.store = store
@@ -71,6 +75,7 @@ class Recorder:
         self.book_depth = book_depth
         self.settle_interval = settle_interval
         self.spot = spot
+        self.spot_ws = spot_ws
         self._last_settle_check = 0.0
         self._stop = threading.Event()
 
@@ -97,11 +102,15 @@ class Recorder:
         if now - self._last_settle_check >= self.settle_interval:
             self._last_settle_check = now
             result.settled = self._check_settlements(now, result)
+            result.values = self._check_values(now, result)
 
         if self.spot is not None:
             for symbol, price in self.spot.fetch().items():
                 self.store.insert_spot(now, self.spot.source, symbol, price)
                 result.spot += 1
+
+        if self.spot_ws is not None:
+            result.spot_ws = self.spot_ws.flush()
 
         return result
 
@@ -148,6 +157,22 @@ class Recorder:
                 self.store.upsert_market(market, now)
         return settled
 
+    def _check_values(self, now: float, result: TickResult) -> int:
+        """Settled markets sometimes publish the settlement index value a little later."""
+        filled = 0
+        for ticker in self.store.pending_values(now):
+            try:
+                market = self.client.get_market(ticker)
+            except KalshiError as exc:
+                result.errors.append(f"{ticker}: value: {exc}")
+                log.warning("%s: settlement value fetch failed: %s", ticker, exc)
+                continue
+            if market.expiration_value is not None:
+                self.store.mark_settled(market, now)
+                filled += 1
+                log.info("%s settlement value %s", ticker, market.expiration_value)
+        return filled
+
     # ------------------------------------------------------------ loop
 
     def stop(self) -> None:
@@ -161,6 +186,8 @@ class Recorder:
         log.info(
             "recording %s every %.0fs -> %s", ",".join(self.series), self.interval, self.store.path
         )
+        if self.spot_ws is not None:
+            self.spot_ws.start()
         ticks = 0
         consecutive_failures = 0
         while not self._stop.is_set():
@@ -169,12 +196,15 @@ class Recorder:
                 res = self.tick(started)
                 consecutive_failures = 0 if not res.errors else consecutive_failures + 1
                 log.info(
-                    "tick markets=%d snapshots=%d trades+%d settled=%d spot=%d errors=%d",
+                    "tick markets=%d snapshots=%d trades+%d settled=%d values=%d "
+                    "spot=%d ws=%d errors=%d",
                     res.markets,
                     res.snapshots,
                     res.new_trades,
                     res.settled,
+                    res.values,
                     res.spot,
+                    res.spot_ws,
                     len(res.errors),
                 )
             except Exception:  # noqa: BLE001 - keep the loop alive
@@ -191,5 +221,7 @@ class Recorder:
             )
             elapsed = time.time() - started
             self._stop.wait(max(0.0, delay - elapsed))
+        if self.spot_ws is not None:
+            self.spot_ws.stop()
         log.info("recorder stopped after %d ticks", ticks)
         return ticks
