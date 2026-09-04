@@ -321,7 +321,7 @@ class Order:
             order_id=d.get("order_id") or "",
             client_order_id=d.get("client_order_id"),
             ticker=d.get("ticker") or "",
-            side=d.get("side") or "",
+            side=d.get("side") or d.get("outcome_side") or "",
             action=d.get("action") or "",
             type=d.get("type") or "",
             status=d.get("status") or "",
@@ -348,10 +348,11 @@ class Fill:
     price: float  # dollars, on the fill's side
     is_taker: bool
     created_time: datetime | None
+    fee: float | None = None  # dollars charged on this fill, when the API reports it
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Fill:
-        side = d.get("side") or ""
+        side = d.get("side") or d.get("outcome_side") or ""
         price = _price(d, "price")
         if price is None:
             price = _price(d, "yes_price") if side == "yes" else _price(d, "no_price")
@@ -365,6 +366,7 @@ class Fill:
             price=price or 0.0,
             is_taker=bool(d.get("is_taker", False)),
             created_time=_parse_time(d.get("created_time")),
+            fee=dollars(d.get("fee_cost_dollars") or d.get("fee_cost")),
         )
 
 

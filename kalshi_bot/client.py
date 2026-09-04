@@ -52,6 +52,21 @@ class LiveTradingBlocked(KalshiError):
     """Raised when an order would hit production without ``allow_live=True``."""
 
 
+VALID_TIME_IN_FORCE = {"good_till_canceled", "immediate_or_cancel", "fill_or_kill"}
+
+
+def book_side_and_price(side: str, action: str, price: float) -> tuple[str, float]:
+    """Map an outcome-side order to the single YES book of the V2 endpoint.
+
+    buy YES at p  -> bid at p         sell YES at p -> ask at p
+    buy NO at q   -> ask at 1 - q     sell NO at q  -> bid at 1 - q
+    """
+    if side == "yes":
+        return ("bid" if action == "buy" else "ask"), price
+    yes_price = round(1.0 - price, 4)
+    return ("ask" if action == "buy" else "bid"), yes_price
+
+
 def validate_price(price: float) -> float:
     """Check a dollar price is on Kalshi's 0.001 grid strictly between 0 and 1."""
     if isinstance(price, bool) or not isinstance(price, int | float):
@@ -378,13 +393,16 @@ class KalshiClient:
         order_type: str = "limit",
         client_order_id: str | None = None,
         expiration_ts: int | None = None,
+        time_in_force: str = "good_till_canceled",
     ) -> Order | DryRunOrder:
-        """Place an order.
+        """Place a limit order through the V2 endpoint (``POST /portfolio/events/orders``).
 
-        ``price`` is the limit price in **dollars** on the chosen ``side``, between
-        0.001 and 0.999 on a 0.001 grid (Kalshi's finest tick). It is sent as the
-        fixed-point ``yes_price_dollars`` / ``no_price_dollars`` string field.
-        Limit orders require a price; market orders must not carry one.
+        The call keeps the outcome-side vocabulary (``side`` yes|no, ``action``
+        buy|sell, ``price`` in dollars on that side, 0.001 grid) and translates
+        it to the single YES-book shape the V2 endpoint wants: buying YES at p is
+        a ``bid`` at p, buying NO at q is an ``ask`` at 1 - q, and so on. The
+        legacy ``/portfolio/orders`` endpoint was retired by Kalshi in 2026 and
+        answers 410. Market orders are not supported; use a limit at the ask.
         In dry-run mode nothing is sent and the would-be request is returned.
         """
         if side not in VALID_SIDES:
@@ -395,49 +413,82 @@ class KalshiClient:
             raise ValueError(f"order_type must be one of {sorted(VALID_ORDER_TYPES)}")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError("count must be a positive integer number of contracts")
-        if order_type == "limit":
-            if price is None:
-                raise ValueError("limit orders need a price")
-            price = validate_price(price)
-        elif price is not None:
-            raise ValueError("market orders must not specify a price")
+        if order_type != "limit":
+            raise ValueError("only limit orders are supported by the V2 order endpoint")
+        if price is None:
+            raise ValueError("limit orders need a price")
+        if time_in_force not in VALID_TIME_IN_FORCE:
+            raise ValueError(f"time_in_force must be one of {sorted(VALID_TIME_IN_FORCE)}")
+        price = validate_price(price)
+        book_side, yes_price = book_side_and_price(side, action, price)
 
         body: dict[str, Any] = {
             "ticker": ticker,
             "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": side,
-            "action": action,
-            "count": count,
-            "type": order_type,
+            "side": book_side,
+            "count": str(count),
+            "price": f"{yes_price:.4f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        if price is not None:
-            body[f"{side}_price_dollars"] = f"{price:.4f}"
         if expiration_ts is not None:
-            body["expiration_ts"] = expiration_ts
+            body["expiration_time"] = int(expiration_ts)
 
         if self.dry_run:
             log.info("DRY RUN create_order %s", body)
             return DryRunOrder(body)
 
         self._guard_trading("place an order")
-        log.info("create_order %s", body)
-        data = self._request("POST", "/portfolio/orders", json=body)
-        return Order.from_dict(data.get("order", data))
+        log.info("create_order %s (%s %s @ %.4f)", body, action, side, price)
+        data = self._request("POST", "/portfolio/events/orders", json=body)
+        data = data.get("order", data)
+        filled = float(data.get("fill_count") or 0)
+        remaining = float(data.get("remaining_count") or 0)
+        return Order.from_dict(
+            {
+                "order_id": data.get("order_id"),
+                "client_order_id": data.get("client_order_id") or body["client_order_id"],
+                "ticker": ticker,
+                "side": side,
+                "action": action,
+                "type": "limit",
+                "status": "executed" if remaining <= 0 and filled > 0 else "resting",
+                f"{side}_price_dollars": f"{price:.4f}",
+                "count_fp": f"{filled + remaining:.2f}",
+                "remaining_count_fp": f"{remaining:.2f}",
+                "fill_count_fp": f"{filled:.2f}",
+                "created_time": (data["ts_ms"] / 1000) if data.get("ts_ms") else None,
+            }
+        )
 
-    def cancel_order(self, order_id: str) -> Order | None:
+    def cancel_order(self, order_id: str, *, ticker: str | None = None) -> Order | None:
+        """Cancel one order (V2 endpoint). ``ticker`` lets the exchange route the request."""
         if self.dry_run:
             log.info("DRY RUN cancel_order %s", order_id)
             return None
         self._guard_trading("cancel an order")
         log.info("cancel_order %s", order_id)
-        data = self._request("DELETE", f"/portfolio/orders/{order_id}")
-        return Order.from_dict(data.get("order", data)) if data else None
+        data = self._request(
+            "DELETE",
+            f"/portfolio/events/orders/{order_id}",
+            params={"market_ticker": ticker},
+        )
+        if not data:
+            return None
+        data = data.get("order", data)
+        return Order.from_dict(
+            {
+                **data,
+                "order_id": data.get("order_id") or order_id,
+                "status": data.get("status") or "canceled",
+            }
+        )
 
     def cancel_all_orders(self, *, ticker: str | None = None) -> list[str]:
         """Cancel every resting order (optionally only for one ticker). Returns order ids."""
         resting = self.get_orders(ticker=ticker, status="resting")
         cancelled: list[str] = []
         for order in resting:
-            self.cancel_order(order.order_id)
+            self.cancel_order(order.order_id, ticker=order.ticker or None)
             cancelled.append(order.order_id)
         return cancelled

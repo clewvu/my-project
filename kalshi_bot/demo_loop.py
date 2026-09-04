@@ -121,6 +121,7 @@ class OpenTrade:
     fill_price: float | None = None
     simulated: bool = False
     prev_side: str | None = None  # the series' last_side before this entry, for undo
+    fee_paid: float | None = None  # exchange-reported fees on the fills, when available
 
     @property
     def filled(self) -> bool:
@@ -403,6 +404,8 @@ class DemoLoop:
         if count > 0:
             trade.filled_count = count
             trade.fill_price = sum(f.count * f.price for f in fills) / count
+            if all(f.fee is not None for f in fills):
+                trade.fee_paid = float(sum(f.fee for f in fills if f.fee is not None))
 
     def _drop_unfilled(self, name: str, ss: SeriesState) -> None:
         # the alternation and the trade count only advance on a fill
@@ -419,7 +422,7 @@ class DemoLoop:
             return
         if trade.order_id is not None:
             try:
-                self.client.cancel_order(trade.order_id)
+                self.client.cancel_order(trade.order_id, ticker=trade.ticker)
             except Exception as exc:  # noqa: BLE001 - keep the loop alive; the order expires at close
                 log.warning("cancel %s failed: %s", trade.order_id, exc)
             self._refresh_fills(trade)
@@ -449,7 +452,7 @@ class DemoLoop:
         price = trade.fill_price if trade.fill_price is not None else trade.limit_price
         won = market.result == trade.side
         gross = trade.filled_count * ((1 - price) if won else -price)
-        fee = order_fee(price, trade.filled_count)
+        fee = trade.fee_paid if trade.fee_paid is not None else order_fee(price, trade.filled_count)
         net = gross - fee
         s = self.state
         s.realized_pnl += net

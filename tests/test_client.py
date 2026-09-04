@@ -114,7 +114,7 @@ def test_dry_run_never_sends_orders(signer):
     client, rec = make_client(signer, [], dry_run=True)
     result = client.create_order("KXBTC15M-X", side="yes", action="buy", count=2, price=0.45)
     assert isinstance(result, DryRunOrder)
-    assert result["yes_price_dollars"] == "0.4500" and "no_price_dollars" not in result
+    assert result["side"] == "bid" and result["price"] == "0.4500" and result["count"] == "2"
     assert result["client_order_id"]
     assert client.cancel_order("abc") is None
     assert rec.requests == []
@@ -127,17 +127,13 @@ def test_live_order_body_and_response(signer):
             (
                 201,
                 {
-                    "order": {
-                        "order_id": "o1",
-                        "ticker": "T",
-                        "status": "resting",
-                        "side": "no",
-                        "action": "buy",
-                        "type": "limit",
-                        "no_price": 60,
-                        "count": 3,
-                        "remaining_count": 3,
-                    }
+                    "order_id": "o1",
+                    "client_order_id": "cid",
+                    "fill_count": "3.00",
+                    "remaining_count": "0.00",
+                    "average_fill_price": "0.909000",
+                    "average_fee_paid": "0.010000",
+                    "ts_ms": 1700000000000,
                 },
             )
         ],
@@ -146,18 +142,49 @@ def test_live_order_body_and_response(signer):
     order = client.create_order(
         "T", side="no", action="buy", count=3, price=0.091, client_order_id="cid"
     )
-    assert order.order_id == "o1" and order.no_price == 0.60
+    assert order.order_id == "o1" and order.no_price == 0.091 and order.side == "no"
+    assert order.status == "executed" and order.count == 3 and order.remaining_count == 0
     sent = json.loads(rec.requests[0].content)
+    # buying NO at 0.091 is an ask on the YES book at 0.909
     assert sent == {
         "ticker": "T",
         "client_order_id": "cid",
-        "side": "no",
-        "action": "buy",
-        "count": 3,
-        "type": "limit",
-        "no_price_dollars": "0.0910",
+        "side": "ask",
+        "count": "3",
+        "price": "0.9090",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
     }
+    assert rec.requests[0].url.path == "/trade-api/v2/portfolio/events/orders"
     assert rec.requests[0].headers[HEADER_KEY] == "test-key-id"
+
+
+def test_resting_order_response(signer):
+    client, rec = make_client(
+        signer,
+        [(201, {"order_id": "o2", "fill_count": "0.00", "remaining_count": "2.00"})],
+        dry_run=False,
+    )
+    order = client.create_order("T", side="yes", action="buy", count=2, price=0.5, expiration_ts=99)
+    assert order.status == "resting" and order.remaining_count == 2 and order.yes_price == 0.5
+    sent = json.loads(rec.requests[0].content)
+    assert sent["side"] == "bid" and sent["price"] == "0.5000" and sent["expiration_time"] == 99
+
+
+@pytest.mark.parametrize(
+    "side,action,price,book_side,yes_price",
+    [
+        ("yes", "buy", 0.55, "bid", 0.55),
+        ("yes", "sell", 0.55, "ask", 0.55),
+        ("no", "buy", 0.47, "ask", 0.53),
+        ("no", "sell", 0.47, "bid", 0.53),
+        ("no", "buy", 0.091, "ask", 0.909),
+    ],
+)
+def test_book_side_mapping(side, action, price, book_side, yes_price):
+    from kalshi_bot.client import book_side_and_price
+
+    assert book_side_and_price(side, action, price) == (book_side, yes_price)
 
 
 def test_prod_orders_blocked_without_allow_live(signer):
@@ -182,6 +209,8 @@ def test_prod_orders_blocked_without_allow_live(signer):
         {"side": "yes", "action": "buy", "count": 1, "price": 45},  # cents, not dollars
         {"side": "yes", "action": "buy", "count": 1, "price": None},
         {"side": "yes", "action": "buy", "count": 1, "price": 0.5, "order_type": "market"},
+        {"side": "yes", "action": "buy", "count": 1, "price": None, "order_type": "market"},
+        {"side": "yes", "action": "buy", "count": 1, "price": 0.5, "time_in_force": "GTT"},
         {"side": "yes", "action": "buy", "count": 1.5, "price": 0.5},
         {"side": "yes", "action": "buy", "count": True, "price": 0.5},
     ],
@@ -206,14 +235,24 @@ def test_cancel_all(signer):
                     ]
                 },
             ),
-            (200, {"order": {"order_id": "a", "status": "canceled"}}),
-            (200, {"order": {"order_id": "b", "status": "canceled"}}),
+            (200, {"order_id": "a", "client_order_id": "x", "reduced_by": "1.00", "ts_ms": 1}),
+            (200, {"order_id": "b", "client_order_id": "y", "reduced_by": "1.00", "ts_ms": 2}),
         ],
         dry_run=False,
     )
     assert client.cancel_all_orders() == ["a", "b"]
     assert [r.method for r in rec.requests] == ["GET", "DELETE", "DELETE"]
-    assert rec.requests[1].url.path == "/trade-api/v2/portfolio/orders/a"
+    assert rec.requests[1].url.path == "/trade-api/v2/portfolio/events/orders/a"
+
+
+def test_cancel_order_routes_by_ticker(signer):
+    client, rec = make_client(
+        signer, [(200, {"order_id": "a", "reduced_by": "2.00", "ts_ms": 1})], dry_run=False
+    )
+    order = client.cancel_order("a", ticker="KXBTC15M-X")
+    assert order is not None and order.order_id == "a" and order.status == "canceled"
+    assert rec.requests[0].url.path == "/trade-api/v2/portfolio/events/orders/a"
+    assert rec.requests[0].url.params["market_ticker"] == "KXBTC15M-X"
 
 
 def test_positions_accepts_both_keys(signer):

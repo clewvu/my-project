@@ -106,7 +106,8 @@ class FakeClient:
                 ]
         return []
 
-    def cancel_order(self, order_id):
+    def cancel_order(self, order_id, *, ticker=None):
+        assert ticker, "the loop should pass the ticker so the exchange can route the cancel"
         self.cancelled.append(order_id)
         return None
 

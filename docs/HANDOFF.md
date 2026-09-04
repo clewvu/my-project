@@ -37,7 +37,7 @@ public endpoints. It started collecting clean data (schema v3) around
 - Local clone on Cameron's machine: `C:\Users\lewiscc2\kalshi-bot`, venv at
   `.venv`, activated with `.\.venv\Scripts\Activate.ps1`.
 - Python 3.11+ (Cameron has 3.14). Install: `pip install -e ".[dev]"`.
-- Tests: `pytest` (124 passing). Lint: `ruff check . && ruff format .`.
+- Tests: `pytest` (138 passing). Lint: `ruff check . && ruff format .`.
 - Commit convention: descriptive message, tests and lint clean before push,
   push with `git push -u origin <branch>`.
 
@@ -135,9 +135,25 @@ repo; `.gitignore` covers `*.pem`, `.env`, and `state/`.
   side, 1-cent spread on BTC.
 - Rate limits: token bucket, basic tier reportedly 200 reads/s; 429 has no
   Retry-After header. Client spaces requests 0.15 s apart and backs off.
-- Order creation (untested live): body has `ticker`, `client_order_id`,
-  `side`, `action`, `count`, `type`, and `yes_price_dollars` /
-  `no_price_dollars` as a 4-decimal string. Verify on demo before trusting.
+- Orders (verified against production 2026-09-04): the legacy
+  `POST /portfolio/orders` now answers 410 `deprecated_v1_order_endpoint`.
+  The V2 endpoint is `POST /portfolio/events/orders` with a single YES-book
+  shape: `ticker`, `client_order_id`, `side` = `bid` | `ask`, `count` as a
+  fixed-point string ("3"), `price` as a dollar string ("0.5300", the YES
+  price), `time_in_force` (`good_till_canceled` | `immediate_or_cancel` |
+  `fill_or_kill`, required), `self_trade_prevention_type`
+  (`taker_at_cross` | `maker`, required), optional `expiration_time`
+  (unix seconds), `post_only`, `reduce_only`. Mapping: buy YES at p = bid
+  at p; buy NO at q = ask at 1 - q; sell YES at p = ask at p; sell NO at q
+  = bid at 1 - q (`client.book_side_and_price`). Response: `order_id`,
+  `client_order_id`, `fill_count`, `remaining_count`, `average_fill_price`,
+  `average_fee_paid`, `ts_ms`. Cancel is `DELETE
+  /portfolio/events/orders/{id}?market_ticker=...`, returning `reduced_by`.
+  `GET /portfolio/orders` and `GET /portfolio/fills` still work; fills and
+  orders now carry `outcome_side`, `book_side`, `count_fp`, `*_price_dollars`
+  and, on fills, `fee_cost`. Source: Kalshi's `kalshi-typescript` SDK 3.29.0
+  on npm (docs.kalshi.com is blocked from the sandbox; the SDK tarball is
+  the way to read the current spec).
 
 ## 5. Database (state/market_data.sqlite, schema v3)
 

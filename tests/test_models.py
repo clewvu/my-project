@@ -117,3 +117,36 @@ def test_candle_nested_and_flat():
     flat = Candle.from_dict({"start_ts": 1, "end_ts": 61, "open_dollars": "0.40", "close": 50})
     assert nested.high == 0.55 and nested.end_ts == 61 and nested.volume == 3
     assert flat.open == 0.40 and flat.high is None and flat.close == 0.5
+
+
+def test_fill_reads_v2_shape():
+    from kalshi_bot.models import Fill, Order
+
+    f = Fill.from_dict(
+        {
+            "fill_id": "f1",
+            "order_id": "o1",
+            "ticker": "T",
+            "outcome_side": "no",
+            "book_side": "ask",
+            "count_fp": "3.00",
+            "yes_price_dollars": "0.550000",
+            "no_price_dollars": "0.450000",
+            "fee_cost": "0.02",
+            "is_taker": True,
+        }
+    )
+    assert f.side == "no" and f.price == 0.45 and f.count == 3 and f.fee == 0.02
+    o = Order.from_dict(
+        {
+            "order_id": "o1",
+            "ticker": "T",
+            "outcome_side": "yes",
+            "book_side": "bid",
+            "status": "resting",
+            "yes_price_dollars": "0.5000",
+            "initial_count_fp": "2.00",
+            "remaining_count_fp": "1.00",
+        }
+    )
+    assert o.side == "yes" and o.count == 2 and o.remaining_count == 1 and o.price == 0.5
