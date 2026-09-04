@@ -41,7 +41,7 @@ Three independent gates stand between the code and your money:
 | --- | --- | --- |
 | `KALSHI_ENV` | `demo` | Selects the paper-trading host. Production is opt-in. |
 | `KALSHI_DRY_RUN` | `true` | Orders are logged and returned, never sent. |
-| `allow_live` | `False` | Even with dry-run off, the client refuses to place or cancel orders on production unless constructed with `allow_live=True`. The CLI never sets it. |
+| `allow_live` | `False` | Even with dry-run off, the client refuses to place or cancel orders on production unless constructed with `allow_live=True`. Only one CLI command sets it: `live-trade`, and only after `--env prod`, `--real-money`, and a typed `TRADE` confirmation. |
 
 Reads (markets, orderbook, candles) are always allowed and are unsigned public
 endpoints. Account reads are signed but harmless.
@@ -207,11 +207,32 @@ the standard library on localhost only and polls the state file, so it shows
 live status, P&L against both caps, the open position with a countdown, and
 the settled trades.
 
-Safety: the loop refuses to run unless `KALSHI_ENV=demo`, never sets
+Safety: `demo-trade` refuses to run unless `KALSHI_ENV=demo`, never sets
 `allow_live`, and with `KALSHI_DRY_RUN=true` (the default) it simulates fills
 at the limit price without sending anything, which needs no API key at all.
 Note that the demo exchange lists few 15-minute crypto markets; when none is
 open the loop waits and logs it.
+
+### Real money: `live-trade`
+
+The same loop can run on production with real money. It has no edge: each
+trade is a coin flip that pays the taker fee (about 1.75 cents per contract
+near 50 cents) plus the spread, so its expected result is a slow loss until
+a cap stops it. It exists because the owner asked for it, not because the
+research supports it.
+
+```bash
+# .env: production API key, KALSHI_DRY_RUN=false
+kalshi-bot --env prod live-trade --dollars 2 --loss-cap 40 --real-money
+kalshi-bot demo-ui --state-file state/live_loop.json
+```
+
+Gates, all required: `--env prod` on the command line, `KALSHI_DRY_RUN=false`,
+`--real-money`, `--dollars` of at most $20 per trade, a loss cap of at most
+$50 (default $40), and typing `TRADE` at the prompt (`--yes` skips the prompt
+for unattended runs). The command prints your balance and the expected fee
+drag first. State goes to `state/live_loop.json`; the stop file and the
+dashboard button work the same way.
 
 ## Development
 

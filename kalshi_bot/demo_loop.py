@@ -32,10 +32,12 @@ caps. ``--reset`` clears it.
 
 Safety
 ------
-The loop refuses to run against production, full stop. It never sets
-``allow_live``. With ``KALSHI_DRY_RUN=true`` it still runs but simulates
-fills at the limit price instead of sending orders, which is the way to try
-it before configuring a demo key's real paper orders.
+The loop refuses to run against production unless constructed with
+``allow_production=True``, which only the ``live-trade`` command does, after
+its own confirmation step; ``demo-trade`` never does. With
+``KALSHI_DRY_RUN=true`` it still runs but simulates fills at the limit price
+instead of sending orders, which is the way to try it before configuring a
+key's real orders.
 """
 
 from __future__ import annotations
@@ -202,15 +204,17 @@ class DemoLoop:
         state: LoopState | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        allow_production: bool = False,
     ) -> None:
-        if client.is_prod:
+        if client.is_prod and not allow_production:
             raise RefusedProduction("the demo loop only runs against the demo exchange")
         config.validate()
         self.client = client
         self.cfg = config
+        self.live = bool(client.is_prod and not client.dry_run)
         self.state = state or LoopState.load(config.state_file)
         self.state.config = {
-            "env": "dry-run" if client.dry_run else "demo",
+            "env": "dry-run" if client.dry_run else ("LIVE" if client.is_prod else "demo"),
             "series": list(config.series),
             "contracts": config.contracts,
             "dollars": config.dollars,
@@ -336,7 +340,8 @@ class DemoLoop:
         self.state.trades += 1
         self.state.save(self.cfg.state_file)
         log.info(
-            "buy %s x%d %s at %.3f (~$%.2f, %s)",
+            "%sbuy %s x%d %s at %.3f (~$%.2f, %s)",
+            "REAL MONEY: " if self.live else "",
             side,
             count,
             market.ticker,

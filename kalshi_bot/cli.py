@@ -327,14 +327,11 @@ def cmd_fairvalue(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
-    """Demo-only alternating up/down trader with loss cap and profit target."""
+def _loop_config(args: argparse.Namespace):  # -> LoopConfig
     from pathlib import Path
 
-    from .demo_loop import DEFAULT_SERIES, DemoLoop, LoopConfig, LoopState
+    from .demo_loop import DEFAULT_SERIES, LoopConfig
 
-    if settings.env != "demo":
-        sys.exit("demo-trade only runs against the demo exchange: set KALSHI_ENV=demo")
     cfg = LoopConfig(
         series=tuple(args.series) if args.series else DEFAULT_SERIES,
         contracts=args.contracts,
@@ -353,6 +350,13 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
         cfg.validate()
     except ValueError as exc:
         sys.exit(f"error: {exc}")
+    return cfg
+
+
+def _loop_housekeeping(cfg, args: argparse.Namespace) -> bool:
+    """--reset and --status handling shared by demo-trade and live-trade. True = done."""
+    from .demo_loop import LoopState
+
     if args.reset:
         if cfg.state_file.exists():
             cfg.state_file.unlink()
@@ -361,7 +365,7 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
             cfg.stop_file.unlink()
             print(f"cleared {cfg.stop_file}")
         if args.status or not args.run_after_reset:
-            return 0
+            return True
     if args.status:
         state = LoopState.load(cfg.state_file)
         print(state.summary())
@@ -370,9 +374,21 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
                 f"  {h['ticker']:32} {h['side']:3} x{h['count']:.0f} @ {h['price']:.3f} "
                 f"{h['result']:3} {h['net']:+.2f}"
             )
-        return 0
+        return True
     if cfg.stop_file.exists():
         sys.exit(f"{cfg.stop_file} exists; delete it (or use --reset) to start")
+    return False
+
+
+def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """Demo-only alternating up/down trader with loss cap and profit target."""
+    from .demo_loop import DemoLoop
+
+    if settings.env != "demo":
+        sys.exit("demo-trade only runs against the demo exchange: set KALSHI_ENV=demo")
+    cfg = _loop_config(args)
+    if _loop_housekeeping(cfg, args):
+        return 0
     if settings.dry_run:
         print("KALSHI_DRY_RUN=true: orders are simulated at the limit price, nothing is sent.")
     else:
@@ -380,6 +396,60 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
     print(f"State: {cfg.state_file}   Stop file: {cfg.stop_file}   Dashboard: kalshi-bot demo-ui")
     with _client(settings, need_auth=not settings.dry_run) as client:
         loop = DemoLoop(client, cfg)
+        reason = loop.run()
+    print(f"stopped: {reason}")
+    print(loop.state.summary())
+    return 0
+
+
+LIVE_MAX_DOLLARS = 20.0
+LIVE_MAX_LOSS_CAP = 50.0
+
+
+def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """The same alternating trader on PRODUCTION with real money. Requires --real-money."""
+    from .demo_loop import DemoLoop
+    from .fees import fee_per_contract
+
+    if settings.env != "prod":
+        sys.exit(
+            "live-trade needs production selected explicitly: kalshi-bot --env prod live-trade"
+        )
+    if settings.dry_run:
+        sys.exit("live-trade needs KALSHI_DRY_RUN=false in .env (it is true, the safe default)")
+    cfg = _loop_config(args)
+    if _loop_housekeeping(cfg, args):
+        return 0
+    if not args.real_money:
+        sys.exit(
+            "live-trade places real orders from your Kalshi balance. Re-run with --real-money "
+            "if that is what you want."
+        )
+    if cfg.dollars is None or cfg.dollars > LIVE_MAX_DOLLARS:
+        sys.exit(f"live-trade requires --dollars, at most {LIVE_MAX_DOLLARS:.0f} per trade")
+    if cfg.loss_cap > LIVE_MAX_LOSS_CAP:
+        sys.exit(f"live-trade caps --loss-cap at {LIVE_MAX_LOSS_CAP:.0f}")
+    with _client(settings, need_auth=True) as probe:
+        balance = probe.get_balance().balance
+    fee = fee_per_contract(0.5)
+    per_trade = max(1, int(cfg.dollars / 0.5)) * fee
+    print("=" * 72)
+    print("REAL MONEY. This strategy alternates YES/NO with no edge; its expected")
+    print(f"result is minus the fee, about ${per_trade:.2f} per trade at 50c, before the spread.")
+    print(f"Balance ${balance:,.2f}. Per trade ~${cfg.dollars:.2f} on {', '.join(cfg.series)}.")
+    print(f"Stops at -${cfg.loss_cap:.2f} realised loss or +${cfg.profit_target:.2f} gain.")
+    print(f"Stop any time: Ctrl-C, the file {cfg.stop_file}, or the dashboard button.")
+    print("=" * 72)
+    if balance < cfg.loss_cap:
+        sys.exit(f"balance ${balance:,.2f} is below the loss cap; nothing to protect")
+    if not args.yes:
+        answer = input("Type TRADE to place real orders, anything else to abort: ")
+        if answer.strip() != "TRADE":
+            print("aborted")
+            return 1
+    client = KalshiClient.from_settings(settings, allow_live=True)
+    with client:
+        loop = DemoLoop(client, cfg, allow_production=True)
         reason = loop.run()
     print(f"stopped: {reason}")
     print(loop.state.summary())
@@ -506,6 +576,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_fairvalue)
 
     s = sub.add_parser("demo-trade", help=cmd_demo_trade.__doc__)
+    _add_loop_args(s, state_file="state/demo_loop.json")
+    s.set_defaults(func=cmd_demo_trade)
+
+    s = sub.add_parser("live-trade", help=cmd_live_trade.__doc__)
+    _add_loop_args(s, state_file="state/live_loop.json", loss_cap=40.0)
+    s.add_argument(
+        "--real-money",
+        action="store_true",
+        help="required: acknowledge that orders come from your real Kalshi balance",
+    )
+    s.add_argument("--yes", action="store_true", help="skip the typed TRADE confirmation")
+    s.set_defaults(func=cmd_live_trade)
+
+    s = sub.add_parser("demo-ui", help=cmd_demo_ui.__doc__)
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--state-file", default="state/demo_loop.json")
+    s.add_argument("--stop-file", default="state/STOP")
+    s.set_defaults(func=cmd_demo_ui)
+
+    s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
+    s.add_argument("--ticker", default=None)
+    s.set_defaults(func=cmd_cancel_all)
+    return p
+
+
+def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: float = 5.0) -> None:
     s.add_argument(
         "--series",
         action="append",
@@ -525,7 +622,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="never pay more than this per contract (dollars); caps the loss per trade",
     )
     s.add_argument(
-        "--loss-cap", type=float, default=5.0, help="stop when realised P&L falls to -X dollars"
+        "--loss-cap",
+        type=float,
+        default=loss_cap,
+        help=f"stop when realised P&L falls to -X dollars (default {loss_cap:.0f})",
     )
     s.add_argument(
         "--profit-target", type=float, default=10.0, help="stop when realised P&L reaches X dollars"
@@ -536,7 +636,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
     s.add_argument("--first-side", choices=["yes", "no"], default="yes")
-    s.add_argument("--state-file", default="state/demo_loop.json")
+    s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--status", action="store_true", help="print the saved state and exit")
     s.add_argument(
@@ -545,19 +645,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--run-after-reset", action="store_true", help="with --reset: start the loop afterwards"
     )
-    s.set_defaults(func=cmd_demo_trade)
-
-    s = sub.add_parser("demo-ui", help=cmd_demo_ui.__doc__)
-    s.add_argument("--host", default="127.0.0.1")
-    s.add_argument("--port", type=int, default=8765)
-    s.add_argument("--state-file", default="state/demo_loop.json")
-    s.add_argument("--stop-file", default="state/STOP")
-    s.set_defaults(func=cmd_demo_ui)
-
-    s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
-    s.add_argument("--ticker", default=None)
-    s.set_defaults(func=cmd_cancel_all)
-    return p
 
 
 def main(argv: list[str] | None = None) -> int:

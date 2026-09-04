@@ -37,7 +37,7 @@ public endpoints. It started collecting clean data (schema v3) around
 - Local clone on Cameron's machine: `C:\Users\lewiscc2\kalshi-bot`, venv at
   `.venv`, activated with `.\.venv\Scripts\Activate.ps1`.
 - Python 3.11+ (Cameron has 3.14). Install: `pip install -e ".[dev]"`.
-- Tests: `pytest` (120 passing). Lint: `ruff check . && ruff format .`.
+- Tests: `pytest` (124 passing). Lint: `ruff check . && ruff format .`.
 - Commit convention: descriptive message, tests and lint clean before push,
   push with `git push -u origin <branch>`.
 
@@ -87,7 +87,8 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | whale [--threshold 1000] | no | whale-follow test |
 | fairvalue [--min-ttc 120] [--show-trades N] | no | fair-value test |
 | demo-trade [--contracts N --max-price 0.60 --loss-cap 5 --profit-target 10 --max-trades N] | demo key unless dry run | alternating up/down paper trader; --status, --reset |
-| demo-ui [--port 8765] | no | dashboard at http://127.0.0.1:8765 with a Stop button |
+| live-trade --dollars 2 --real-money [--loss-cap 40] | prod key, dry run off | same loop on production with REAL MONEY; typed confirmation |
+| demo-ui [--port 8765] [--state-file state/live_loop.json] | no | dashboard at http://127.0.0.1:8765 with a Stop button |
 | cancel-all | yes | cancel resting orders (honours dry run) |
 
 ## 3. Safety model (do not weaken)
@@ -95,7 +96,11 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 Three independent gates: `KALSHI_ENV` defaults to demo; `KALSHI_DRY_RUN`
 defaults to true and returns the would-be order instead of sending it; and
 `KalshiClient(allow_live=True)` is required before any order or cancel on
-production. The CLI never sets `allow_live`. Private keys live outside the
+production. Exactly one CLI command sets `allow_live`: `live-trade`, added
+2026-09-04 at Cameron's explicit request, and only after `--env prod`,
+`KALSHI_DRY_RUN=false`, `--real-money`, a per-trade size of at most $20, a
+loss cap of at most $50, a balance check, and a typed `TRADE` confirmation.
+No other command can reach production orders. Private keys live outside the
 repo; `.gitignore` covers `*.pem`, `.env`, and `state/`.
 
 ## 4. Facts learned about Kalshi (verified against production)
@@ -263,3 +268,17 @@ verified against a real demo fill, so the first run with
 `KALSHI_DRY_RUN=false` should be watched and the `create_order` field names
 fixed if the API rejects them; P&L is computed locally from the fill price
 and the fee model rather than read back from the exchange.
+
+Live trading decision (2026-09-04, later): Cameron asked, after hearing the
+concern, to run the alternating loop with real money from his Kalshi
+balance: BTC and DOGE 15-minute markets, about $2 per trade, loss cap $40.
+Claude stated the expected loss (fee drag of roughly 2 cents per contract,
+so on the order of $5 to $10 a day at that cadence) and that the order
+format was untested. `live-trade` was built with the gates listed in
+section 3. It runs the same loop (`DemoLoop(..., allow_production=True)`,
+`self.live` marks orders "REAL MONEY" in the log). Loss cap for live
+defaults to $40; the command refuses more than $50 or more than $20 per
+trade. State file `state/live_loop.json`; the dashboard needs
+`--state-file state/live_loop.json`. If the first real order is rejected
+by the API, the fix is in `KalshiClient.create_order`'s body fields; ask
+Cameron to paste the error.

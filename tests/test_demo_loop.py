@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import threading
 import urllib.request
@@ -370,3 +371,40 @@ def test_dashboard_snapshot_handles_partial_write(tmp_path):
     assert dash.snapshot(now=T0)["alive"] is False  # stale heartbeat
     LoopState(last_tick_ts=T0 - 5, halted="loss cap").save(tmp_path / "s.json")
     assert dash.snapshot(now=T0)["alive"] is False  # halted
+
+
+# ---------------------------------------------------------------- live path
+
+
+def test_production_allowed_only_explicitly(tmp_path):
+    client = FakeClient({0: "yes"})
+    client.is_prod = True
+    cfg = LoopConfig(
+        series=("KXBTC15M",), state_file=tmp_path / "s.json", stop_file=tmp_path / "STOP"
+    )
+    with pytest.raises(RefusedProduction):
+        DemoLoop(client, cfg)
+    loop = DemoLoop(client, cfg, allow_production=True)
+    assert loop.live is True and loop.state.config["env"] == "LIVE"
+    client.dry_run = True
+    assert DemoLoop(client, cfg, allow_production=True).live is False
+
+
+def test_live_trade_cli_gates(monkeypatch, capsys):
+    import kalshi_bot.cli as cli
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["live-trade", "--dollars", "2"])
+    assert args.loss_cap == 40.0 and args.state_file == "state/live_loop.json"
+    demo = cli.Settings.from_env("/nonexistent")
+    with pytest.raises(SystemExit):
+        cli.cmd_live_trade(demo, args)  # env is demo
+    prod = dataclasses.replace(demo, env="prod", dry_run=False)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_live_trade(prod, args)  # no --real-money
+    assert "--real-money" in str(exc.value)
+    args = parser.parse_args(["live-trade", "--dollars", "500", "--real-money"])
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_live_trade(prod, args)
+    assert "at most" in str(exc.value)
+    assert cli.build_parser().parse_args(["demo-trade"]).func is cli.cmd_demo_trade
