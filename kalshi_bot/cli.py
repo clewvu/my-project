@@ -257,6 +257,20 @@ def cmd_record_dump(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze(_: Settings, args: argparse.Namespace) -> int:
+    """Research report over recorded data: calibration, spot signal, lead-lag, backtest."""
+    try:
+        from . import analysis
+    except ImportError:
+        sys.exit('analysis needs pandas: pip install -e ".[research]"')
+    try:
+        ds = analysis.load(args.db, series=args.series or None)
+    except SchemaMismatch as exc:
+        sys.exit(f"error: {exc}")
+    print(analysis.report(ds))
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -323,6 +337,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--db", default=DEFAULT_DB)
     s.set_defaults(func=cmd_record_dump)
 
+    s = sub.add_parser("analyze", help=cmd_analyze.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--series", action="append", help="restrict to a series; repeatable")
+    s.set_defaults(func=cmd_analyze)
+
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
     s.add_argument("--ticker", default=None)
     s.set_defaults(func=cmd_cancel_all)
@@ -339,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     if env_override and env_override != settings.env:
         settings = dataclasses.replace(settings, env=env_override)
     _setup_logging(settings.log_level)
-    if args.command not in ("check", "markets", "record-stats", "record-dump"):
+    if args.command not in ("check", "markets", "record-stats", "record-dump", "analyze"):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
         return args.func(settings, args)

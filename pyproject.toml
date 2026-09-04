@@ -15,9 +15,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+research = [
+    "pandas>=2.0",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.5",
+    "pandas>=2.0",
 ]
 
 [project.scripts]

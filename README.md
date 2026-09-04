@@ -57,6 +57,8 @@ kalshi_bot/
   storage.py  SQLite store for recorded market data
   recorder.py polling loop: books, trades, settlements, spot
   spot.py     Coinbase public spot price feed
+  fees.py     Kalshi fee model
+  analysis.py research report over the recorded data (needs pandas)
   cli.py      kalshi-bot command line
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
@@ -113,6 +115,27 @@ con = sqlite3.connect("state/market_data.sqlite")
 snaps = pd.read_sql("select * from snapshots", con, parse_dates={"ts": "s"})
 ```
 
+## Research (phase 3)
+
+Once the recorder has a day or more of settled markets:
+
+```bash
+pip install -e ".[research]"     # adds pandas
+kalshi-bot analyze               # or --db path --series KXBTC15M
+```
+
+The report covers: coverage and base rates; Brier score of the market's
+implied probability by horizon against a coin flip and a plain
+"spot above strike" rule; calibration tables (implied vs realised YES rate);
+accuracy of the spot-vs-strike signal bucketed by distance in basis points;
+lead-lag correlation between spot moves and subsequent book moves; and a
+fee-inclusive backtest of buying the spot-favoured side at the ask and
+holding to settlement, across horizons, price caps, and distance filters.
+
+`kalshi_bot/fees.py` holds the fee model (7% x price x (1 - price) per
+contract for takers, rounded up to the cent per order). Check it against
+Kalshi's current schedule for the series before relying on it.
+
 ## Development
 
 ```bash
@@ -123,7 +146,7 @@ ruff check . && ruff format .
 ## Roadmap
 
 - Phase 2 (done): market-data recorder for BTC/DOGE 15-minute markets.
-- Phase 3: research on the recorded data; decide whether an edge exists.
+- Phase 3 (tooling done): research on the recorded data; decide whether an edge exists.
 - Phase 4: risk engine (per-order, per-market and daily-loss limits, kill
   switch), execution layer, strategy interface.
 - Phase 5: run on demo with real (paper) orders.
