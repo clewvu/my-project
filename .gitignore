@@ -4,6 +4,8 @@
 .env
 .env.*
 !.env.example
+!deploy/.env.server
+secrets/
 
 # local state
 state/

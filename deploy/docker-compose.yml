@@ -1,0 +1,44 @@
+# Runs the live loop, the dashboard, and the market-data recorder on a server.
+#
+#   cp deploy/.env.server .env      # then fill in the key id
+#   mkdir -p secrets && cp /path/to/key.txt secrets/kalshi-key.txt
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Watch:   docker compose -f deploy/docker-compose.yml logs -f live
+# Stop:    docker compose -f deploy/docker-compose.yml stop live
+#          (or touch state/STOP; the loop exits and the container stays down)
+# Dashboard is bound to localhost only; reach it with an SSH tunnel:
+#   ssh -L 8765:127.0.0.1:8765 user@server   then open http://127.0.0.1:8765
+
+services:
+  live:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: kalshi-bot
+    env_file: ../.env
+    environment:
+      KALSHI_PRIVATE_KEY_PATH: /secrets/kalshi-key.txt
+    volumes:
+      - ../state:/app/state
+      - ../secrets:/secrets:ro
+    command: >
+      --env prod live-trade --dollars ${TRADE_DOLLARS:-2} --loss-cap ${LOSS_CAP:-40}
+      --profit-target ${PROFIT_TARGET:-0} --real-money --yes
+    restart: unless-stopped
+
+  dashboard:
+    image: kalshi-bot
+    volumes:
+      - ../state:/app/state
+    command: demo-ui --host 0.0.0.0 --port 8765
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
+
+  recorder:
+    image: kalshi-bot
+    volumes:
+      - ../state:/app/state
+    command: record
+    restart: unless-stopped

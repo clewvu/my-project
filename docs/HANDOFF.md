@@ -256,6 +256,12 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
   for exactly this.
 - After pulling, Cameron restarts the recorder (Ctrl-C, `kalshi-bot record`).
   The database migrates automatically.
+- `deploy/` holds a Dockerfile, a docker-compose file (services: `live`,
+  `dashboard`, `recorder`) and a step-by-step guide for running everything
+  on a $5 Linux server so the laptop can be off. Written 2026-09-04 without
+  a Docker daemon in the sandbox, so the image build is unverified; the
+  first server run may need a small fix. The `live` service passes `--yes`,
+  so it starts trading on boot without the typed confirmation.
 - Windows notes: activate the venv in every new window; execution policy may
   need `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 - Be frank about edge: these markets are near coin flips with a fee of
