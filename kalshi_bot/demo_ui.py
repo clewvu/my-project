@@ -225,10 +225,22 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # http.server sets allow_reuse_address, which on Windows lets a second
+    # dashboard bind a port an older one still serves; the browser then keeps
+    # talking to the stale process. Fail loudly instead.
+    allow_reuse_address = False
+    daemon_threads = True
+
+
 def serve(
     state_file: Path | list[Path], stop_file: Path, host: str = "127.0.0.1", port: int = 8765
 ) -> ThreadingHTTPServer:
     """Bind and return the server; call ``serve_forever`` on it."""
-    server = ThreadingHTTPServer((host, port), make_handler(Dashboard(state_file, stop_file)))
-    server.daemon_threads = True
-    return server
+    try:
+        return _Server((host, port), make_handler(Dashboard(state_file, stop_file)))
+    except OSError as exc:
+        raise OSError(
+            f"port {port} is already in use, probably by an earlier dashboard window; "
+            f"close it or pass --port with a different number ({exc})"
+        ) from exc

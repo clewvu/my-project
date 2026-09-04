@@ -424,6 +424,13 @@ def test_live_trade_cli_gates(monkeypatch, capsys):
     assert cli.build_parser().parse_args(["demo-trade"]).func is cli.cmd_demo_trade
 
 
+def test_dashboard_refuses_a_busy_port(dashboard):
+    server, tmp_path = dashboard
+    port = server.server_address[1]
+    with pytest.raises(OSError, match="already in use"):
+        demo_ui.serve(tmp_path / "x.json", tmp_path / "STOP", port=port)
+
+
 def test_dashboard_prefers_freshest_state_file(tmp_path):
     import os
 
