@@ -329,6 +329,36 @@ class KalshiClient:
     def get_balance(self) -> Balance:
         return Balance.from_dict(self._request("GET", "/portfolio/balance"))
 
+    def transfer_between_shards(
+        self, amount: float, *, source_shard: int, destination_shard: int
+    ) -> str | None:
+        """Move ``amount`` dollars between exchange shards of the same account.
+
+        Kalshi runs several exchange instances (shards); each market lives on one
+        and orders draw on that shard's balance. Returns the transfer id, or
+        None in dry-run mode.
+        """
+        if amount <= 0:
+            raise ValueError("amount must be positive dollars")
+        body = {
+            "source": "event_contract",
+            "destination": "event_contract",
+            "amount": int(round(amount * 10_000)),  # centicents
+            "source_exchange_shard": int(source_shard),
+            "destination_exchange_shard": int(destination_shard),
+        }
+        if self.dry_run:
+            log.info("DRY RUN transfer %s", body)
+            return None
+        self._guard_trading("move funds between shards")
+        log.info("transfer %s", body)
+        data = self._request("POST", "/portfolio/intra_exchange_instance_transfer", json=body)
+        return data.get("transfer_id")
+
+    def get_transfer(self, transfer_id: str) -> dict[str, Any]:
+        data = self._request("GET", f"/portfolio/intra_exchange_instance_transfers/{transfer_id}")
+        return data.get("transfer", data)
+
     def get_positions(
         self,
         *,

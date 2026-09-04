@@ -105,3 +105,31 @@ def test_setup_writes_env_from_messy_key_file(rsa_key, tmp_path, monkeypatch):
     assert cli.cmd_check(settings, None) == 0
     # re-running backs up the previous file
     assert cli.cmd_setup(None, args) == 0 and (tmp_path / ".env.bak").exists()
+
+
+def test_shard_plan():
+    from kalshi_bot.cli import shard_plan
+    from kalshi_bot.models import Balance
+
+    bal = Balance(balance=49.72, breakdown={0: 49.72, 1: 0.0})
+    assert shard_plan(bal, {"KXBTC15M": 1, "KXDOGE15M": 1}, needed=45.0) == (45.0, 0, 1)
+    assert shard_plan(bal, {"KXBTC15M": 1}, needed=60.0) == (49.72, 0, 1)
+    assert shard_plan(bal, {"KXBTC15M": 0}, needed=45.0) is None  # already funded
+    assert shard_plan(bal, {"KXBTC15M": 1, "KXDOGE15M": 2}, needed=45.0) is None
+    assert shard_plan(bal, {}, needed=45.0) is None
+    assert shard_plan(Balance(balance=49.72), {"KXBTC15M": 1}, needed=45.0) is None
+    partial = Balance(balance=50.0, breakdown={0: 10.0, 1: 40.0})
+    assert shard_plan(partial, {"KXBTC15M": 1}, needed=45.0) == (5.0, 0, 1)
+
+
+def test_market_shards_uses_first_open_market():
+    from kalshi_bot.cli import market_shards
+    from kalshi_bot.models import Market
+
+    class C:
+        def get_markets(self, *, series_ticker, status, max_pages):
+            if series_ticker == "KXBTC15M":
+                return [Market.from_dict({"ticker": "KXBTC15M-1", "exchange_index": 1})]
+            return [Market.from_dict({"ticker": "KXDOGE15M-1"})]
+
+    assert market_shards(C(), ("KXBTC15M", "KXDOGE15M")) == {"KXBTC15M": 1}

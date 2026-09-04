@@ -150,3 +150,24 @@ def test_fill_reads_v2_shape():
         }
     )
     assert o.side == "yes" and o.count == 2 and o.remaining_count == 1 and o.price == 0.5
+
+
+def test_balance_breakdown_and_market_shard():
+    from kalshi_bot.models import Balance, Market
+
+    b = Balance.from_dict(
+        {
+            "balance": 4972,
+            "balance_dollars": "49.72",
+            "portfolio_value": 4972,
+            "balance_breakdown": [
+                {"exchange_index": 0, "balance": "49.720000"},
+                {"exchange_index": 1, "balance": "0.000000"},
+            ],
+        }
+    )
+    assert b.balance == 49.72 and b.breakdown == {0: 49.72, 1: 0.0}
+    assert b.on_shard(1) == 0.0 and b.on_shard(0) == 49.72 and b.on_shard(None) == 49.72
+    assert Balance.from_dict({"balance": 100}).on_shard(3) == 1.0
+    assert Market.from_dict({"ticker": "KXBTC15M-1", "exchange_index": 1}).exchange_index == 1
+    assert Market.from_dict({"ticker": "X"}).exchange_index is None

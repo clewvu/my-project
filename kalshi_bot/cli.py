@@ -131,8 +131,15 @@ def cmd_status(settings: Settings, _: argparse.Namespace) -> int:
             f"exchange:   trading_active={status.get('trading_active')} "
             f"exchange_active={status.get('exchange_active')}"
         )
+        for idx in status.get("exchange_index_statuses") or []:
+            print(
+                f"  shard {idx.get('exchange_index')}: {idx.get('description', '')}  "
+                f"trading_active={idx.get('trading_active')}"
+            )
         bal = client.get_balance()
         print(f"balance:    ${bal.balance:,.2f}")
+        for idx, amount in sorted(bal.breakdown.items()):
+            print(f"  shard {idx}: ${amount:,.2f}")
         positions = [p for p in client.get_positions() if p.position != 0]
         print(f"positions:  {len(positions)}")
         for p in positions:
@@ -163,13 +170,15 @@ def cmd_markets(settings: Settings, args: argparse.Namespace) -> int:
     markets.sort(key=lambda m: m.close_time or datetime.max.replace(tzinfo=UTC))
     print(
         f"{'ticker':30} {'status':8} {'bid':>6} {'ask':>6} {'last':>6} {'volume':>10} "
-        f"{'strike':>10}  close (UTC)"
+        f"{'strike':>10} {'shard':>5}  close (UTC)"
     )
     for m in markets[: args.limit]:
         strike = f"{m.strike:,.2f}" if m.strike is not None else "-"
+        shard = "-" if m.exchange_index is None else str(m.exchange_index)
         print(
             f"{m.ticker:30} {m.status:8} {_px(m.yes_bid):>6} {_px(m.yes_ask):>6} "
-            f"{_px(m.last_price):>6} {m.volume:>10,.0f} {strike:>10}  {_fmt_time(m.close_time)}"
+            f"{_px(m.last_price):>6} {m.volume:>10,.0f} {strike:>10} {shard:>5}  "
+            f"{_fmt_time(m.close_time)}"
         )
     if not markets:
         print("(no markets returned)")
@@ -479,7 +488,12 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     if cfg.loss_cap > LIVE_MAX_LOSS_CAP:
         sys.exit(f"live-trade caps --loss-cap at {LIVE_MAX_LOSS_CAP:.0f}")
     with _client(settings, need_auth=True) as probe:
-        balance = probe.get_balance().balance
+        bal = probe.get_balance()
+        shards = market_shards(probe, cfg.series)
+    balance = bal.balance
+    plan = shard_plan(bal, shards, needed=min(balance, cfg.loss_cap + 5.0))
+    if plan is not None and args.move_funds is not None:
+        plan = (args.move_funds, plan[1], plan[2])
     fee = fee_per_contract(0.5)
     per_trade = max(1, int(cfg.dollars / 0.5)) * fee
     print("=" * 72)
@@ -494,6 +508,15 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     print("=" * 72)
     if balance < cfg.loss_cap:
         sys.exit(f"balance ${balance:,.2f} is below the loss cap; nothing to protect")
+    if bal.breakdown:
+        print("Balance by exchange shard: " + _shards_text(bal))
+        print("Markets trade on: " + ", ".join(f"{k}: shard {v}" for k, v in shards.items()))
+    if plan is not None:
+        amount, src, dst = plan
+        print(
+            f"The markets' shard {dst} holds ${bal.on_shard(dst):,.2f} and orders draw on it, "
+            f"so ${amount:,.2f} will be moved from shard {src} to shard {dst} when you continue."
+        )
     if not args.yes:
         answer = input("Type TRADE to place real orders, anything else to abort: ")
         if answer.strip() != "TRADE":
@@ -501,10 +524,88 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
             return 1
     client = KalshiClient.from_settings(settings, allow_live=True)
     with client:
+        if plan is not None:
+            _move_funds(client, *plan)
         loop = DemoLoop(client, cfg, allow_production=True)
         reason = loop.run()
     print(f"stopped: {reason}")
     print(loop.state.summary())
+    return 0
+
+
+def market_shards(client: KalshiClient, series: tuple[str, ...]) -> dict[str, int]:
+    """Exchange shard of the open market in each series, where the API reports one."""
+    out: dict[str, int] = {}
+    for name in series:
+        for m in client.get_markets(series_ticker=name, status="open", max_pages=1):
+            if m.exchange_index is not None:
+                out[name] = m.exchange_index
+                break
+    return out
+
+
+def shard_plan(bal, shards: dict[str, int], needed: float) -> tuple[float, int, int] | None:
+    """(amount, source shard, destination shard) to fund the markets' shard, or None.
+
+    None when the API reports no breakdown, the markets report no shard, the
+    markets sit on different shards, or the destination already holds
+    ``needed`` dollars. Kalshi runs several exchange shards and an order
+    draws only on the balance of the shard its market lives on.
+    """
+    if not bal.breakdown or not shards:
+        return None
+    targets = set(shards.values())
+    if len(targets) != 1:
+        return None
+    dst = targets.pop()
+    have = bal.breakdown.get(dst, 0.0)
+    if have >= needed:
+        return None
+    others = [(i, v) for i, v in bal.breakdown.items() if i != dst]
+    if not others:
+        return None
+    src, src_amount = max(others, key=lambda t: t[1])
+    if src_amount <= 0.01:
+        return None
+    return (round(min(needed - have, src_amount), 2), src, dst)
+
+
+def _shards_text(bal) -> str:
+    return ", ".join(f"shard {i}: ${v:,.2f}" for i, v in sorted(bal.breakdown.items()))
+
+
+def _move_funds(client: KalshiClient, amount: float, src: int, dst: int) -> None:
+    transfer_id = client.transfer_between_shards(amount, source_shard=src, destination_shard=dst)
+    print(f"moving ${amount:,.2f} from shard {src} to shard {dst}: transfer {transfer_id}")
+    if transfer_id is None:
+        return
+    for _ in range(30):
+        if client.get_transfer(transfer_id).get("status") == "complete":
+            break
+        time.sleep(1.0)
+    print("balance by shard now: " + _shards_text(client.get_balance()))
+
+
+def cmd_transfer(settings: Settings, args: argparse.Namespace) -> int:
+    """Move funds between Kalshi exchange shards within your own account."""
+    if settings.dry_run:
+        sys.exit("transfer needs KALSHI_DRY_RUN=false")
+    with _client(settings, need_auth=True) as probe:
+        bal = probe.get_balance()
+    print(
+        "balance by shard: " + (_shards_text(bal) or f"${bal.balance:,.2f} (no breakdown reported)")
+    )
+    if bal.on_shard(args.source) < args.amount:
+        sys.exit(f"shard {args.source} holds ${bal.on_shard(args.source):,.2f}, less than asked")
+    if not args.yes:
+        answer = input(
+            f"Move ${args.amount:,.2f} from shard {args.source} to shard {args.to}? Type MOVE: "
+        )
+        if answer.strip() != "MOVE":
+            print("aborted")
+            return 1
+    with KalshiClient.from_settings(settings, allow_live=settings.is_prod) as client:
+        _move_funds(client, args.amount, args.source, args.to)
     return 0
 
 
@@ -656,7 +757,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="required: acknowledge that orders come from your real Kalshi balance",
     )
     s.add_argument("--yes", action="store_true", help="skip the typed TRADE confirmation")
+    s.add_argument(
+        "--move-funds",
+        type=float,
+        default=None,
+        help="dollars to move to the markets' exchange shard first (default: loss cap + 5)",
+    )
     s.set_defaults(func=cmd_live_trade)
+
+    s = sub.add_parser("transfer", help=cmd_transfer.__doc__)
+    s.add_argument("--amount", type=float, required=True, help="dollars to move")
+    s.add_argument("--source", type=int, default=0, help="source shard index (default 0)")
+    s.add_argument("--to", type=int, required=True, help="destination shard index")
+    s.add_argument("--yes", action="store_true", help="skip the typed MOVE confirmation")
+    s.set_defaults(func=cmd_transfer)
 
     s = sub.add_parser("demo-ui", help=cmd_demo_ui.__doc__)
     s.add_argument("--host", default="127.0.0.1")

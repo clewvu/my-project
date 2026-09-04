@@ -73,6 +73,13 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _money(d: dict[str, Any], name: str) -> float | None:
     """Dollar amount from ``name_dollars`` (string) or legacy ``name`` (integer cents)."""
     return _price(d, name)
@@ -102,6 +109,7 @@ class Market:
     expiration_time: datetime | None
     result: str | None
     raw: dict[str, Any] = field(repr=False, compare=False, default_factory=dict)
+    exchange_index: int | None = None  # Kalshi exchange shard the market trades on
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Market:
@@ -132,6 +140,7 @@ class Market:
             expiration_time=_parse_time(d.get("expiration_time")),
             result=d.get("result") or None,
             raw=d,
+            exchange_index=_int_or_none(d.get("exchange_index")),
         )
 
     @property
@@ -250,15 +259,29 @@ class Orderbook:
 
 @dataclass(frozen=True)
 class Balance:
-    balance: float  # dollars available
+    balance: float  # dollars available, all exchange shards together
     portfolio_value: float | None = None
+    breakdown: dict[int, float] = field(default_factory=dict)  # shard index -> dollars
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Balance:
+        breakdown: dict[int, float] = {}
+        for item in d.get("balance_breakdown") or []:
+            idx = _int_or_none(item.get("exchange_index"))
+            amount = dollars(item.get("balance_dollars") or item.get("balance"))
+            if idx is not None and amount is not None:
+                breakdown[idx] = amount
         return cls(
             balance=_money(d, "balance") or 0.0,
             portfolio_value=_money(d, "portfolio_value"),
+            breakdown=breakdown,
         )
+
+    def on_shard(self, index: int | None) -> float:
+        """Dollars available on one shard; the total when no breakdown was reported."""
+        if index is None or not self.breakdown:
+            return self.balance
+        return self.breakdown.get(index, 0.0)
 
 
 @dataclass(frozen=True)

@@ -307,3 +307,30 @@ def test_get_trades_follows_cursor_on_full_pages(signer):
     trades = client.get_trades("X", limit=2)
     assert [t.trade_id for t in trades] == ["0", "1", "9"]
     assert len(rec.requests) == 2 and rec.requests[1].url.params["cursor"] == "c1"
+
+
+def test_transfer_between_shards(signer):
+    client, rec = make_client(
+        signer,
+        [
+            (200, {"transfer_id": "tr1"}),
+            (200, {"transfer": {"transfer_id": "tr1", "status": "complete"}}),
+        ],
+        dry_run=False,
+    )
+    assert client.transfer_between_shards(45.5, source_shard=0, destination_shard=1) == "tr1"
+    sent = json.loads(rec.requests[0].content)
+    assert sent == {
+        "source": "event_contract",
+        "destination": "event_contract",
+        "amount": 455000,
+        "source_exchange_shard": 0,
+        "destination_exchange_shard": 1,
+    }
+    assert rec.requests[0].url.path == "/trade-api/v2/portfolio/intra_exchange_instance_transfer"
+    assert client.get_transfer("tr1")["status"] == "complete"
+    dry, rec2 = make_client(signer, [], dry_run=True)
+    assert dry.transfer_between_shards(1.0, source_shard=0, destination_shard=1) is None
+    assert rec2.requests == []
+    with pytest.raises(ValueError):
+        client.transfer_between_shards(0, source_shard=0, destination_shard=1)
