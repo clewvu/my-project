@@ -60,6 +60,7 @@ kalshi_bot/
   spot_ws.py  Coinbase WebSocket spot feed (background thread)
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
+  whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
   cli.py      kalshi-bot command line
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
@@ -145,6 +146,14 @@ accuracy of the spot-vs-strike signal bucketed by distance in basis points;
 lead-lag correlation between spot moves and subsequent book moves; and a
 fee-inclusive backtest of buying the spot-favoured side at the ask and
 holding to settlement, across horizons, price caps, and distance filters.
+
+`kalshi-bot whale` runs the whale-follow test from `docs/research-brief.md`:
+prints are aggregated into sweeps, each sweep is scored against the market's
+implied probability at that moment, and the report gives the pre-registered
+verdict with confidence intervals bootstrapped over markets, copy P&L as taker
+and maker after fees, spot conditioning, a time-ordered validation split, and
+splits by threshold, time to close, series, and aggressor side. Under 200
+whale sweeps it reports "inconclusive" by construction.
 
 `kalshi_bot/fees.py` holds the fee model (7% x price x (1 - price) per
 contract for takers, rounded up to the cent per order). Check it against

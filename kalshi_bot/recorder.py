@@ -76,6 +76,7 @@ class Recorder:
         self.settle_interval = settle_interval
         self.spot = spot
         self.spot_ws = spot_ws
+        self._ws_written = 0
         self._last_settle_check = 0.0
         self._stop = threading.Event()
 
@@ -110,7 +111,9 @@ class Recorder:
                 result.spot += 1
 
         if self.spot_ws is not None:
-            result.spot_ws = self.spot_ws.flush()
+            self.spot_ws.flush()
+            result.spot_ws = self.spot_ws.written - self._ws_written
+            self._ws_written = self.spot_ws.written
 
         return result
 

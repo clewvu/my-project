@@ -305,6 +305,17 @@ def cmd_analyze(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whale(_: Settings, args: argparse.Namespace) -> int:
+    """Test whether large prints predict settlement beyond the market price."""
+    try:
+        from . import whale
+    except ImportError:
+        sys.exit('whale needs pandas: pip install -e ".[research]"')
+    data = whale.load(args.db, series=args.series or None)
+    print(whale.report(data, threshold=args.threshold))
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -390,6 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--series", action="append", help="restrict to a series; repeatable")
     s.set_defaults(func=cmd_analyze)
 
+    s = sub.add_parser("whale", help=cmd_whale.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--series", action="append", help="restrict to a series; repeatable")
+    s.add_argument("--threshold", type=float, default=1000.0, help="whale notional in dollars")
+    s.set_defaults(func=cmd_whale)
+
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
     s.add_argument("--ticker", default=None)
     s.set_defaults(func=cmd_cancel_all)
@@ -413,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         "record-dump",
         "analyze",
         "spot-ws",
+        "whale",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:

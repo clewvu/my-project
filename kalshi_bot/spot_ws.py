@@ -156,6 +156,7 @@ class SpotWebSocket:
         self.flush_interval = flush_interval
         self.silence_timeout = silence_timeout
         self.messages = 0
+        self.written = 0
         self.reconnects = 0
         self.last_error: str | None = None
         self._stop = threading.Event()
@@ -181,6 +182,7 @@ class SpotWebSocket:
             self.store.insert_spots(
                 [(t.local_ts, SOURCE, t.symbol, t.price, t.exchange_ts) for t in ticks]
             )
+            self.written += len(ticks)
         return len(ticks)
 
     def last_tick(self, symbol: str) -> Tick | None:
