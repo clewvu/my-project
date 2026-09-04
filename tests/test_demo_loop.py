@@ -212,6 +212,19 @@ def test_profit_target_halts(tmp_path):
     assert loop.state.realized_pnl >= 1.0
 
 
+def test_no_profit_cap(tmp_path):
+    client = FakeClient({i: ("yes" if i % 2 == 0 else "no") for i in range(10)})
+    loop, _ = make(tmp_path, client, loss_cap=100, profit_target=None, max_trades=4)
+    assert loop.run().startswith("max trades")
+    assert loop.state.realized_pnl > 1.0  # would have tripped a $1 target
+    with pytest.raises(ValueError):
+        LoopConfig(profit_target=0).validate()
+    import kalshi_bot.cli as cli
+
+    args = cli.build_parser().parse_args(["demo-trade", "--profit-target", "0"])
+    assert cli._loop_config(args).profit_target is None
+
+
 def test_max_trades(tmp_path):
     client = FakeClient({i: "yes" for i in range(5)})
     loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100, max_trades=2)

@@ -387,7 +387,7 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         dollars=args.dollars,
         max_price=args.max_price,
         loss_cap=args.loss_cap,
-        profit_target=args.profit_target,
+        profit_target=args.profit_target if args.profit_target > 0 else None,
         max_trades=args.max_trades,
         min_ttc=args.min_ttc,
         interval=args.interval,
@@ -486,7 +486,10 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     print("REAL MONEY. This strategy alternates YES/NO with no edge; its expected")
     print(f"result is minus the fee, about ${per_trade:.2f} per trade at 50c, before the spread.")
     print(f"Balance ${balance:,.2f}. Per trade ~${cfg.dollars:.2f} on {', '.join(cfg.series)}.")
-    print(f"Stops at -${cfg.loss_cap:.2f} realised loss or +${cfg.profit_target:.2f} gain.")
+    gain = "(no profit cap)"
+    if cfg.profit_target is not None:
+        gain = f"or +${cfg.profit_target:.2f} gain"
+    print(f"Stops at -${cfg.loss_cap:.2f} realised loss {gain}.")
     print(f"Stop any time: Ctrl-C, the file {cfg.stop_file}, or the dashboard button.")
     print("=" * 72)
     if balance < cfg.loss_cap:
@@ -688,7 +691,10 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         help=f"stop when realised P&L falls to -X dollars (default {loss_cap:.0f})",
     )
     s.add_argument(
-        "--profit-target", type=float, default=10.0, help="stop when realised P&L reaches X dollars"
+        "--profit-target",
+        type=float,
+        default=10.0,
+        help="stop when realised P&L reaches X dollars; 0 means no profit cap",
     )
     s.add_argument("--max-trades", type=int, default=None, help="stop after N trades")
     s.add_argument(

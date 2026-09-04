@@ -15,7 +15,8 @@ Sizing and bounds
 * ``max_price``: never pay more than this per contract, which caps the loss
   on any single trade at what was spent plus the fee.
 * ``loss_cap``: stop once cumulative realised P&L (after fees) falls to
-  ``-loss_cap`` dollars. ``profit_target``: stop once it reaches this.
+  ``-loss_cap`` dollars. ``profit_target``: stop once it reaches this
+  (``None``: no profit cap).
 * ``max_trades``: stop after this many trades across all series.
 * ``min_ttc``: no entries, and any unfilled order cancelled, inside this
   many seconds of close.
@@ -75,7 +76,7 @@ class LoopConfig:
     dollars: float | None = None
     max_price: float = 0.60
     loss_cap: float = 5.0
-    profit_target: float = 10.0
+    profit_target: float | None = 10.0  # None = run until stopped or the loss cap
     max_trades: int | None = None
     min_ttc: float = 120.0
     interval: float = 5.0
@@ -92,8 +93,10 @@ class LoopConfig:
             raise ValueError("dollars must be positive")
         if not 0 < self.max_price < 1:
             raise ValueError("max_price must be between 0 and 1 dollars")
-        if self.loss_cap <= 0 or self.profit_target <= 0:
-            raise ValueError("loss_cap and profit_target must be positive dollars")
+        if self.loss_cap <= 0:
+            raise ValueError("loss_cap must be positive dollars")
+        if self.profit_target is not None and self.profit_target <= 0:
+            raise ValueError("profit_target must be positive dollars, or None for no cap")
         if self.first_side not in SIDES:
             raise ValueError("first_side must be yes or no")
         if self.min_ttc < 0 or self.interval <= 0:
@@ -289,7 +292,7 @@ class DemoLoop:
         s = self.state
         if s.realized_pnl <= -self.cfg.loss_cap:
             return f"loss cap reached ({s.realized_pnl:+.2f} <= -{self.cfg.loss_cap:.2f})"
-        if s.realized_pnl >= self.cfg.profit_target:
+        if self.cfg.profit_target is not None and s.realized_pnl >= self.cfg.profit_target:
             return f"profit target reached ({s.realized_pnl:+.2f} >= {self.cfg.profit_target:.2f})"
         if self.cfg.max_trades is not None and s.trades >= self.cfg.max_trades:
             return f"max trades reached ({s.trades})"
