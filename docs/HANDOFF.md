@@ -37,7 +37,7 @@ public endpoints. It started collecting clean data (schema v3) around
 - Local clone on Cameron's machine: `C:\Users\lewiscc2\kalshi-bot`, venv at
   `.venv`, activated with `.\.venv\Scripts\Activate.ps1`.
 - Python 3.11+ (Cameron has 3.14). Install: `pip install -e ".[dev]"`.
-- Tests: `pytest` (104 passing). Lint: `ruff check . && ruff format .`.
+- Tests: `pytest` (120 passing). Lint: `ruff check . && ruff format .`.
 - Commit convention: descriptive message, tests and lint clean before push,
   push with `git push -u origin <branch>`.
 
@@ -62,6 +62,8 @@ kalshi_bot/
   analysis.py  research report (pandas)
   whale.py     whale-follow hypothesis test (pandas)
   fairvalue.py fair-value model, backtest, verdict, basis measurement (pandas)
+  demo_loop.py demo-only alternating YES/NO trader, caps, stop file, JSON state
+  demo_ui.py   localhost dashboard for the demo loop (stdlib, polls the state file)
   cli.py       kalshi-bot command line
 docs/
   research-brief.md  revised, pre-registered research plan (read this)
@@ -84,6 +86,8 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | analyze | no | research report over the database |
 | whale [--threshold 1000] | no | whale-follow test |
 | fairvalue [--min-ttc 120] [--show-trades N] | no | fair-value test |
+| demo-trade [--contracts N --max-price 0.60 --loss-cap 5 --profit-target 10 --max-trades N] | demo key unless dry run | alternating up/down paper trader; --status, --reset |
+| demo-ui [--port 8765] | no | dashboard at http://127.0.0.1:8765 with a Stop button |
 | cancel-all | yes | cancel resting orders (honours dry run) |
 
 ## 3. Safety model (do not weaken)
@@ -243,9 +247,19 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    store, strategy interface), then demo, then live at minimum size.
 5. Fold the section 6 review into docs/research-brief.md when phase 4 starts.
 
-Note on demo trading: Kalshi's demo environment (`demo.kalshi.co`, paper
-money, separate API key) works with `KALSHI_ENV=demo`, and the client can
-place orders there once `KALSHI_DRY_RUN=false`. But there is no strategy
-loop yet (phase 4), and the demo lists almost no 15-minute crypto markets,
-so a demo trial of this bot is not meaningful before phase 5. `status`,
-`markets`, and `cancel-all` against demo are a safe way to test a key.
+Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
+from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across
+successive 15-minute markets on the demo exchange, one entry per market,
+fill at the ask, hold to settlement. Bounds: max price per contract, loss
+cap, profit target, max trades, no-entry window. Refuses production; dry run
+simulates fills so it runs without a key. State in `state/demo_loop.json`
+(P&L, counts, last side, open trade, heartbeat, run config); stop via
+Ctrl-C, `state/STOP`, or the dashboard button. `kalshi_bot/demo_ui.py`
+serves the dashboard on localhost. It is plumbing practice with no edge
+claim; it does not touch the recorder, the research modules, or the safety
+gates. Known limits: the demo exchange lists few 15-minute crypto markets
+(the loop waits when none is open); the order body has not yet been
+verified against a real demo fill, so the first run with
+`KALSHI_DRY_RUN=false` should be watched and the `create_order` field names
+fixed if the API rejects them; P&L is computed locally from the fill price
+and the fee model rather than read back from the exchange.

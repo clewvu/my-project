@@ -62,6 +62,8 @@ kalshi_bot/
   analysis.py research report over the recorded data (needs pandas)
   whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
   fairvalue.py realised-vol fair-value model and backtest (needs pandas)
+  demo_loop.py demo-only alternating trader with loss cap and profit target
+  demo_ui.py   local dashboard for the demo loop (stdlib http.server)
   cli.py      kalshi-bot command line
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
@@ -173,6 +175,43 @@ threshold as the whale test. `--show-trades N` prints the last N trades.
 `kalshi_bot/fees.py` holds the fee model (7% x price x (1 - price) per
 contract for takers, rounded up to the cent per order). Check it against
 Kalshi's current schedule for the series before relying on it.
+
+## Demo trading loop (paper money)
+
+`kalshi-bot demo-trade` is a deliberately simple trader for exercising the
+order path on Kalshi's demo exchange: in each successive 15-minute market it
+buys one side, alternating YES (up) and NO (down), holds to settlement and
+books the result. It is plumbing practice, not a strategy; the research
+commands decide whether anything has an edge.
+
+```bash
+# .env: KALSHI_ENV=demo, a demo API key, and KALSHI_DRY_RUN=false to send paper orders
+kalshi-bot demo-trade                       # defaults: 1 contract, max price 60c,
+                                            # loss cap $5, profit target $10
+kalshi-bot demo-trade --contracts 2 --max-price 0.55 --loss-cap 3 --profit-target 6
+kalshi-bot demo-trade --status              # saved state and last trades
+kalshi-bot demo-trade --reset               # clear state and the stop file
+kalshi-bot demo-ui                          # dashboard at http://127.0.0.1:8765
+```
+
+Bounds: `--max-price` caps what it pays per contract and so the loss per
+trade; `--loss-cap` and `--profit-target` stop the loop on cumulative realised
+P&L after fees; `--max-trades` stops after N trades; nothing is entered under
+`--min-ttc` seconds to close and an unfilled order is cancelled there. State
+lives in `state/demo_loop.json`, so a restart cannot reset the caps.
+
+Stop it any time with Ctrl-C, by creating `state/STOP`, or with the Stop
+button on the dashboard. A resting order is cancelled; a filled position is
+held to settlement and booked on the next run. The dashboard is served from
+the standard library on localhost only and polls the state file, so it shows
+live status, P&L against both caps, the open position with a countdown, and
+the settled trades.
+
+Safety: the loop refuses to run unless `KALSHI_ENV=demo`, never sets
+`allow_live`, and with `KALSHI_DRY_RUN=true` (the default) it simulates fills
+at the limit price without sending anything, which needs no API key at all.
+Note that the demo exchange lists few 15-minute crypto markets; when none is
+open the loop waits and logs it.
 
 ## Development
 

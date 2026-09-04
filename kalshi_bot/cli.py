@@ -327,6 +327,81 @@ def cmd_fairvalue(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """Demo-only alternating up/down trader with loss cap and profit target."""
+    from pathlib import Path
+
+    from .demo_loop import DemoLoop, LoopConfig, LoopState
+
+    if settings.env != "demo":
+        sys.exit("demo-trade only runs against the demo exchange: set KALSHI_ENV=demo")
+    cfg = LoopConfig(
+        series=args.series,
+        contracts=args.contracts,
+        max_price=args.max_price,
+        loss_cap=args.loss_cap,
+        profit_target=args.profit_target,
+        max_trades=args.max_trades,
+        min_ttc=args.min_ttc,
+        interval=args.interval,
+        first_side=args.first_side,
+        stop_file=Path(args.stop_file),
+        state_file=Path(args.state_file),
+    )
+    try:
+        cfg.validate()
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
+    if args.reset:
+        if cfg.state_file.exists():
+            cfg.state_file.unlink()
+            print(f"cleared {cfg.state_file}")
+        if cfg.stop_file.exists():
+            cfg.stop_file.unlink()
+            print(f"cleared {cfg.stop_file}")
+        if args.status or not args.run_after_reset:
+            return 0
+    if args.status:
+        state = LoopState.load(cfg.state_file)
+        print(state.summary())
+        for h in state.history[-10:]:
+            print(
+                f"  {h['ticker']:32} {h['side']:3} x{h['count']:.0f} @ {h['price']:.3f} "
+                f"{h['result']:3} {h['net']:+.2f}"
+            )
+        return 0
+    if cfg.stop_file.exists():
+        sys.exit(f"{cfg.stop_file} exists; delete it (or use --reset) to start")
+    if settings.dry_run:
+        print("KALSHI_DRY_RUN=true: orders are simulated at the limit price, nothing is sent.")
+    else:
+        print("Sending paper orders to the demo exchange. Ctrl-C or the stop file stops it.")
+    print(f"State: {cfg.state_file}   Stop file: {cfg.stop_file}   Dashboard: kalshi-bot demo-ui")
+    with _client(settings, need_auth=not settings.dry_run) as client:
+        loop = DemoLoop(client, cfg)
+        reason = loop.run()
+    print(f"stopped: {reason}")
+    print(loop.state.summary())
+    return 0
+
+
+def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
+    """Local web dashboard for the demo loop (reads its state file; can stop it)."""
+    from pathlib import Path
+
+    from .demo_ui import serve
+
+    server = serve(Path(args.state_file), Path(args.stop_file), host=args.host, port=args.port)
+    print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -429,6 +504,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_fairvalue)
 
+    s = sub.add_parser("demo-trade", help=cmd_demo_trade.__doc__)
+    s.add_argument("--series", default="KXBTC15M", help="series to trade (default KXBTC15M)")
+    s.add_argument("--contracts", type=int, default=1, help="contracts per trade")
+    s.add_argument(
+        "--max-price",
+        type=float,
+        default=0.60,
+        help="never pay more than this per contract (dollars); caps the loss per trade",
+    )
+    s.add_argument(
+        "--loss-cap", type=float, default=5.0, help="stop when realised P&L falls to -X dollars"
+    )
+    s.add_argument(
+        "--profit-target", type=float, default=10.0, help="stop when realised P&L reaches X dollars"
+    )
+    s.add_argument("--max-trades", type=int, default=None, help="stop after N trades")
+    s.add_argument(
+        "--min-ttc", type=float, default=120.0, help="no entries under this many seconds to close"
+    )
+    s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
+    s.add_argument("--first-side", choices=["yes", "no"], default="yes")
+    s.add_argument("--state-file", default="state/demo_loop.json")
+    s.add_argument("--stop-file", default="state/STOP")
+    s.add_argument("--status", action="store_true", help="print the saved state and exit")
+    s.add_argument(
+        "--reset", action="store_true", help="delete the saved state and stop file, then exit"
+    )
+    s.add_argument(
+        "--run-after-reset", action="store_true", help="with --reset: start the loop afterwards"
+    )
+    s.set_defaults(func=cmd_demo_trade)
+
+    s = sub.add_parser("demo-ui", help=cmd_demo_ui.__doc__)
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--state-file", default="state/demo_loop.json")
+    s.add_argument("--stop-file", default="state/STOP")
+    s.set_defaults(func=cmd_demo_ui)
+
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
     s.add_argument("--ticker", default=None)
     s.set_defaults(func=cmd_cancel_all)
@@ -454,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         "spot-ws",
         "whale",
         "fairvalue",
+        "demo-ui",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
