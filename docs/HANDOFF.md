@@ -1,7 +1,7 @@
 # Kalshi 15-minute crypto bot: handoff
 
 Paste or upload this file at the start of a new chat to continue the work.
-It is the complete context as of 2026-09-04. The code is the source of truth;
+It is the complete context as of 2026-09-04 (evening). The code is the source of truth;
 this document says what exists, what was learned, what was decided, and what
 comes next.
 
@@ -18,7 +18,8 @@ Phases:
 
 1. Done: config, RSA-PSS signing, HTTP client, CLI.
 2. Done: market-data recorder (books, trades, settlements, spot).
-3. Tooling done, awaiting data: research reports (`analyze`, `whale`).
+3. Tooling done, awaiting data: research reports (`analyze`, `whale`,
+   `fairvalue`). Both pre-registered hypotheses now have a test.
 4. Not started: risk engine, decision log / feature store, strategy interface.
 5. Not started: demo run with paper orders.
 6. Not started: production at minimum size.
@@ -29,14 +30,16 @@ public endpoints. It started collecting clean data (schema v3) around
 
 ## 2. Repository
 
-- GitHub: `clewvu/my-project`, branch `claude/kalshi-trading-automation-45k7jt`
-  (all work is on this branch; master has only a devcontainer).
+- GitHub: `clewvu/my-project`. Work through 2026-09-04 afternoon is on
+  `claude/kalshi-trading-automation-45k7jt`; the fair-value test was added on
+  `claude/kalshi-crypto-bot-handoff-w39dj8`, which contains that branch plus
+  the newer commits. Pull the newer branch. Master has only a devcontainer.
 - Local clone on Cameron's machine: `C:\Users\lewiscc2\kalshi-bot`, venv at
   `.venv`, activated with `.\.venv\Scripts\Activate.ps1`.
 - Python 3.11+ (Cameron has 3.14). Install: `pip install -e ".[dev]"`.
-- Tests: `pytest` (88 passing). Lint: `ruff check . && ruff format .`.
+- Tests: `pytest` (104 passing). Lint: `ruff check . && ruff format .`.
 - Commit convention: descriptive message, tests and lint clean before push,
-  push with `git push -u origin claude/kalshi-trading-automation-45k7jt`.
+  push with `git push -u origin <branch>`.
 
 Layout:
 
@@ -58,6 +61,7 @@ kalshi_bot/
                rounded up to the cent per order (verify against schedule)
   analysis.py  research report (pandas)
   whale.py     whale-follow hypothesis test (pandas)
+  fairvalue.py fair-value model, backtest, verdict, basis measurement (pandas)
   cli.py       kalshi-bot command line
 docs/
   research-brief.md  revised, pre-registered research plan (read this)
@@ -79,6 +83,7 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | spot-ws --seconds N | no | test the WebSocket feed alone |
 | analyze | no | research report over the database |
 | whale [--threshold 1000] | no | whale-follow test |
+| fairvalue [--min-ttc 120] [--show-trades N] | no | fair-value test |
 | cancel-all | yes | cancel resting orders (honours dry run) |
 
 ## 3. Safety model (do not weaken)
@@ -154,10 +159,27 @@ Primary tests, both on pooled BTC + DOGE with a series term:
    inside, filled only if traded through). Spot-conditioned null. Gate: 200
    whale sweeps, time-ordered 70/30 split. Viable only if held-out taker net
    >= +1 cent/contract with a 95% CI excluding zero.
-2. Fair value: p_up = Phi(ln(S/K) / (sigma * sqrt(tau))) with realized vol;
-   trade only when it beats the ask by fees plus a margin. Not yet coded;
-   `analyze` already reports the spot-vs-strike signal, calibration, Brier
-   scores, lead-lag, and a fee-inclusive backtest grid as groundwork.
+2. Fair value (coded, `kalshi_bot/fairvalue.py`): p_up = Phi(ln(S/K) /
+   (sigma * sqrt(tau))) with sigma the RMS of 5-second Coinbase log returns
+   over 30 or 60 minutes and tau the variance-equivalent horizon of the
+   one-minute settlement average ((t - 60) + 20 outside the last minute, t/3
+   inside). Rule: one entry per market at the first snapshot where a side's
+   fair value beats its ask by fee plus margin (ladder 0 to 5 cents), no
+   entry under 120 s, fill at the next snapshot's ask, hold to settlement;
+   maker variant as for whales. Vol window and margin are fitted on the first
+   70% of markets by the lower CI bound of taker net; verdict on the last 30%
+   with the whale gate (200 trades, 60 held out) and threshold (+1 cent, CI
+   excluding zero). Clusters are 15-minute windows (BTC and DOGE closing
+   together share one move). Diagnostics: annualised realised vol, Brier of
+   model vs market mid by horizon, realised outcome by model-minus-market
+   gap bucket, and the Coinbase-vs-settlement basis from `expiration_value`.
+   Synthetic-world check: with a book that ignores spot the test says VIABLE;
+   with a book equal to true fair value it says INCONCLUSIVE with negative
+   training net. Sample-size reality from the same worlds: an edge of about
+   5 cents/contract needs roughly 200+ held-out trades before the CI clears
+   zero, so expect INCONCLUSIVE for the first days even if an edge exists.
+   `analyze` still reports the spot-vs-strike signal, calibration, Brier
+   scores, lead-lag, and the fee-inclusive backtest grid as groundwork.
 
 Dropped: perp funding/basis (no information on a 15-minute horizon), news or
 search tools, random-entry nulls, unclustered confidence intervals.
@@ -203,11 +225,27 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
 
 ## 9. Immediate next steps
 
-1. Wait for roughly a day of data, then run `kalshi-bot record-stats`,
-   `kalshi-bot analyze`, and `kalshi-bot whale`; interpret against the
-   brief's thresholds.
-2. Code the fair-value model and backtest (section 3 of the brief) so both
-   hypotheses are tested on the same data.
-3. Only if a test passes: phase 4 (risk engine, decision log / feature
+1. Cameron: `git pull`, `pip install -e ".[dev]"`, restart the recorder.
+2. Wait for roughly a day of data, then run `kalshi-bot record-stats`,
+   `kalshi-bot analyze`, `kalshi-bot whale`, and `kalshi-bot fairvalue`;
+   paste the output into the chat and interpret against the brief's
+   thresholds. Look first at the `fairvalue` basis table (how often the
+   Coinbase minute-average disagreed with the result: that is the floor on
+   model error near the strike) and at the gap-signal table (whether
+   model-minus-market predicts anything at all). Expect INCONCLUSIVE from
+   both verdicts for the first days; that is the gate working.
+3. If the first real report shows the vol estimator misbehaving on live data
+   (annualised vol far from 30 to 80%, or low model coverage), fix the
+   estimator before reading anything else. Possible causes: WebSocket ticks
+   with sub-5-second gaps are fine, but a stalled feed forward-fills zeros
+   into the returns.
+4. Only if a test passes: phase 4 (risk engine, decision log / feature
    store, strategy interface), then demo, then live at minimum size.
-4. Fold the section 6 review into docs/research-brief.md when phase 4 starts.
+5. Fold the section 6 review into docs/research-brief.md when phase 4 starts.
+
+Note on demo trading: Kalshi's demo environment (`demo.kalshi.co`, paper
+money, separate API key) works with `KALSHI_ENV=demo`, and the client can
+place orders there once `KALSHI_DRY_RUN=false`. But there is no strategy
+loop yet (phase 4), and the demo lists almost no 15-minute crypto markets,
+so a demo trial of this bot is not meaningful before phase 5. `status`,
+`markets`, and `cancel-all` against demo are a safe way to test a key.

@@ -143,6 +143,34 @@ The known risk: the Coinbase price and the CF Benchmarks index differ by a
 basis that is small but not zero. Near the strike that basis is the whole
 trade. The `expiration_value` field will let us measure it.
 
+**[added] Implementation (`kalshi_bot/fairvalue.py`, `kalshi-bot fairvalue`).**
+The averaging adjustment is included from the start because it is one line:
+with `t` seconds to close, the variance-equivalent horizon is
+`tau = (t - 60) + 20` outside the settlement minute and `t / 3` inside it.
+Volatility is the root mean square of 5-second log returns over the last 30
+or 60 minutes; both windows are candidates. The margin ladder is 0, 1, 2, 3
+and 5 cents beyond the taker fee.
+
+**[added] Trade rule as backtested.** One entry per market at the first
+snapshot where either side's fair value exceeds its ask by the fee plus the
+margin, never under 120 seconds to close (the risk framework's no-entry
+window), filled at the next snapshot's ask (the whale copy convention) and
+held to settlement. Maker variant as in section 2.
+
+**[added] Validation and threshold, same as section 2.** Vol window and
+margin are chosen on the first 70% of markets by close time, by the lower
+bound of the clustered confidence interval on taker net (so a margin that
+fired a handful of times cannot win on luck), and the verdict is read on the
+last 30% only. Clusters are 15-minute windows rather than markets, because a
+BTC and a DOGE market closing at the same time share one crypto move. Gate:
+200 trades at the chosen configuration, at least 60 of them held out. Viable
+only if held-out taker net is at least +1 cent per contract with a 95%
+interval excluding zero. Diagnostics that are not part of the verdict: Brier
+score of the model against the market mid by horizon, realised outcome by
+bucket of model-minus-market gap, and the basis between Coinbase and the
+settlement index (mean, spread, and how many markets the basis alone
+decided).
+
 ## 4. Risk framework
 
 Implemented as a single `RiskEngine.check(order, state) -> Allow | Reject`

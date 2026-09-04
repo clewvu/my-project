@@ -4,7 +4,17 @@ from kalshi_bot.config import Settings
 
 def test_parser_has_commands():
     p = build_parser()
-    for cmd in ["check", "status", "markets", "orderbook", "candles", "cancel-all"]:
+    for cmd in [
+        "check",
+        "status",
+        "markets",
+        "orderbook",
+        "candles",
+        "cancel-all",
+        "analyze",
+        "whale",
+        "fairvalue",
+    ]:
         args = p.parse_args([cmd] + (["X"] if cmd in ("orderbook", "candles") else []))
         assert args.command == cmd
 

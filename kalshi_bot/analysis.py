@@ -56,7 +56,8 @@ def load(
     con = sqlite3.connect(db_path)
     try:
         markets = pd.read_sql(
-            "SELECT ticker, series_ticker, strike, open_ts, close_ts, status, result FROM markets",
+            "SELECT ticker, series_ticker, strike, open_ts, close_ts, status, result, "
+            "expiration_value FROM markets",
             con,
         )
         snaps = pd.read_sql(
@@ -70,6 +71,21 @@ def load(
         spot = pd.read_sql("SELECT ts, source, symbol, price FROM spot", con)
     finally:
         con.close()
+    return assemble(markets, snaps, spot, series=series, horizons=horizons)
+
+
+def assemble(
+    markets: pd.DataFrame,
+    snaps: pd.DataFrame,
+    spot: pd.DataFrame,
+    series: list[str] | None = None,
+    horizons: tuple[int, ...] = HORIZONS,
+) -> Dataset:
+    """Join raw ``markets``, ``snapshots`` and ``spot`` frames into a Dataset.
+
+    This is everything ``load`` does after reading SQLite, exposed so research
+    code and tests can build a Dataset from frames directly.
+    """
     spot = prefer_websocket_spot(spot)
 
     if series:

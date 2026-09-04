@@ -61,6 +61,7 @@ kalshi_bot/
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
   whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
+  fairvalue.py realised-vol fair-value model and backtest (needs pandas)
   cli.py      kalshi-bot command line
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
@@ -155,6 +156,20 @@ and maker after fees, spot conditioning, a time-ordered validation split, and
 splits by threshold, time to close, series, and aggressor side. Under 200
 whale sweeps it reports "inconclusive" by construction.
 
+`kalshi-bot fairvalue` runs the fair-value test from section 3 of the brief.
+Fair value is `Phi(ln(S/K) / (sigma * sqrt(tau)))` with `S` Coinbase spot,
+`K` the strike, `sigma` the realised volatility of 5-second spot returns over
+the last 30 or 60 minutes, and `tau` the variance-equivalent horizon of the
+one-minute settlement average. The backtest buys one contract of the side
+whose fair value beats its ask by the taker fee plus a margin, once per
+market, never under 120 seconds to close, filled at the next snapshot's ask
+and held to settlement. The report gives realised volatility by series, the
+Coinbase-vs-settlement-index basis, Brier scores of the model against the
+market mid, whether the model-minus-market gap predicts settlement, and the
+pre-registered verdict: vol window and margin are fitted on the first 70% of
+markets by close time and judged on the last 30% with the same gate and
+threshold as the whale test. `--show-trades N` prints the last N trades.
+
 `kalshi_bot/fees.py` holds the fee model (7% x price x (1 - price) per
 contract for takers, rounded up to the cent per order). Check it against
 Kalshi's current schedule for the series before relying on it.
@@ -169,7 +184,8 @@ ruff check . && ruff format .
 ## Roadmap
 
 - Phase 2 (done): market-data recorder for BTC/DOGE 15-minute markets.
-- Phase 3 (tooling done): research on the recorded data; decide whether an edge exists.
+- Phase 3 (tooling done): research on the recorded data (`analyze`, `whale`,
+  `fairvalue`); decide whether an edge exists.
 - Phase 4: risk engine (per-order, per-market and daily-loss limits, kill
   switch), execution layer, strategy interface.
 - Phase 5: run on demo with real (paper) orders.
