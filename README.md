@@ -2,9 +2,9 @@
 
 Automated trading for Kalshi's 15-minute crypto markets (`KXBTC15M`, `KXDOGE15M`).
 
-Phase 1 (this commit): configuration, request signing, a throttled and retrying
-HTTP client, typed models, and a CLI for looking at markets and your account.
-No strategy yet, and `dry_run` is on by default so nothing can trade.
+So far: configuration, request signing, a throttled and retrying HTTP client,
+typed models, a CLI for looking at markets and your account, and a market-data
+recorder. No strategy yet, and `dry_run` is on by default so nothing can trade.
 
 ## Setup
 
@@ -54,12 +54,45 @@ kalshi_bot/
   auth.py     RSA-PSS signing (KALSHI-ACCESS-* headers)
   client.py   KalshiClient: throttle, retry/backoff, dry-run, live guard
   models.py   Market, Orderbook, Balance, Position, Order, Fill, Candle
+  storage.py  SQLite store for recorded market data
+  recorder.py polling loop: books, trades, settlements, spot
+  spot.py     Coinbase public spot price feed
   cli.py      kalshi-bot command line
 tests/        pytest suite; HTTP is mocked, no network needed
 ```
 
 Prices are integer cents (1-99), sizes are contract counts. The client only
 uses the cent fields, ignoring the newer `*_dollars` strings the API also returns.
+
+## Recording market data (phase 2)
+
+Before writing a strategy we need data. The recorder polls the 15-minute BTC
+and DOGE series and writes everything to SQLite:
+
+```bash
+kalshi-bot record                      # KXBTC15M + KXDOGE15M, every 5s, to state/market_data.sqlite
+kalshi-bot record --series KXBTC15M --interval 3 --db ~/kalshi-data/btc.sqlite
+kalshi-bot record-stats                # what has been captured so far
+```
+
+Per tick it stores, for every open market in each series: a top-of-book
+snapshot with the resting levels, any new public trades, and (unless
+`--no-spot`) the Coinbase spot price for BTC-USD and DOGE-USD. Markets that
+have closed are re-fetched about once a minute until their settlement result is
+known. No credentials are needed; every endpoint used is public.
+
+Leave it running for a few days (a `tmux` or `screen` session is enough). A
+single failing request is logged and skipped, and the loop backs off when the
+exchange is unreachable. Ctrl-C stops it cleanly.
+
+Tables: `markets`, `snapshots`, `trades`, `spot`. Timestamps are unix seconds,
+prices are cents. Open it with any SQLite tool or pandas:
+
+```python
+import pandas as pd, sqlite3
+con = sqlite3.connect("state/market_data.sqlite")
+snaps = pd.read_sql("select * from snapshots", con, parse_dates={"ts": "s"})
+```
 
 ## Development
 
@@ -70,9 +103,9 @@ ruff check . && ruff format .
 
 ## Roadmap
 
-- Phase 2: risk engine (per-order, per-market and daily-loss limits, kill
-  switch), SQLite state, execution layer.
-- Phase 3: strategy interface, market-data recorder for BTC/DOGE 15-minute
-  markets, research notebook, first strategy.
-- Phase 4: run on demo with real (paper) orders.
-- Phase 5: production, small limits.
+- Phase 2 (done): market-data recorder for BTC/DOGE 15-minute markets.
+- Phase 3: research on the recorded data; decide whether an edge exists.
+- Phase 4: risk engine (per-order, per-market and daily-loss limits, kill
+  switch), execution layer, strategy interface.
+- Phase 5: run on demo with real (paper) orders.
+- Phase 6: production, small limits.

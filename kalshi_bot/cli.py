@@ -11,6 +11,11 @@ from datetime import UTC, datetime
 from . import __version__
 from .client import KalshiClient, KalshiError
 from .config import Settings
+from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
+from .spot import SpotFeed
+from .storage import MarketDataStore
+
+DEFAULT_DB = "state/market_data.sqlite"
 
 
 def _setup_logging(level: str) -> None:
@@ -152,6 +157,51 @@ def cmd_cancel_all(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record(settings: Settings, args: argparse.Namespace) -> int:
+    """Record orderbooks, trades, settlements and spot prices to SQLite (Ctrl-C to stop)."""
+    spot = None if args.no_spot else SpotFeed(args.spot_symbol or DEFAULT_SPOT_SYMBOLS)
+    with _client(settings, need_auth=False) as client, MarketDataStore(args.db) as store:
+        rec = Recorder(
+            client,
+            store,
+            series=args.series or DEFAULT_SERIES,
+            interval=args.interval,
+            book_depth=args.depth,
+            spot=spot,
+        )
+        try:
+            rec.run(max_ticks=args.ticks)
+        finally:
+            if spot is not None:
+                spot.close()
+    return 0
+
+
+def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
+    """Summarise what the recorder has captured so far."""
+    with MarketDataStore(args.db) as store:
+        st = store.stats()
+    span = ""
+    if st["first_ts"] and st["last_ts"]:
+        first = datetime.fromtimestamp(st["first_ts"], tz=UTC)
+        last = datetime.fromtimestamp(st["last_ts"], tz=UTC)
+        hours = (st["last_ts"] - st["first_ts"]) / 3600
+        span = f"{_fmt_time(first)} -> {_fmt_time(last)} ({hours:.1f}h)"
+    print(f"db:         {args.db}")
+    print(f"snapshots:  {st['snapshots']:,}  {span}")
+    print(f"trades:     {st['trades']:,}")
+    print(f"spot:       {st['spot']:,}")
+    print(f"markets:    {st['markets']:,} seen, {st['settled']:,} settled")
+    for row in st["by_series"]:
+        settled = row["settled"] or 0
+        yes = row["yes_wins"] or 0
+        rate = f"{yes / settled:.1%} yes" if settled else "-"
+        print(
+            f"  {row['series'] or '?':12} markets={row['markets']:<5} settled={settled:<5} {rate}"
+        )
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -181,6 +231,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=int, default=1, help="candle size in minutes: 1, 60, 1440")
     s.set_defaults(func=cmd_candles)
 
+    s = sub.add_parser("record", help=cmd_record.__doc__)
+    s.add_argument(
+        "--series",
+        action="append",
+        help=f"series ticker; repeatable (default: {' '.join(DEFAULT_SERIES)})",
+    )
+    s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
+    s.add_argument("--depth", type=int, default=10, help="orderbook levels to store")
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument(
+        "--ticks", type=int, default=None, help="stop after N ticks (default: run forever)"
+    )
+    s.add_argument("--no-spot", action="store_true", help="skip the Coinbase spot price feed")
+    s.add_argument(
+        "--spot-symbol",
+        action="append",
+        help=f"spot symbol; repeatable (default: {' '.join(DEFAULT_SPOT_SYMBOLS)})",
+    )
+    s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("record-stats", help=cmd_record_stats.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.set_defaults(func=cmd_record_stats)
+
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
     s.add_argument("--ticker", default=None)
     s.set_defaults(func=cmd_cancel_all)
@@ -194,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         sys.exit(f"config error: {exc}")
     _setup_logging(settings.log_level)
-    if args.command != "check" and args.command != "markets":
+    if args.command not in ("check", "markets", "record-stats"):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
         return args.func(settings, args)
