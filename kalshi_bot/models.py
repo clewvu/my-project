@@ -33,6 +33,16 @@ def _cents(value: Any) -> int | None:
     return round(float(value))
 
 
+def _count(value: Any) -> int:
+    """Contract counts arrive as ints, floats, or numeric strings; treat missing as 0."""
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _price(d: dict[str, Any], name: str) -> int | None:
     """Read ``name`` in cents, falling back to ``name_dollars`` (a dollars string)."""
     value = d.get(name)
@@ -73,7 +83,7 @@ class Market:
             no_bid=_price(d, "no_bid"),
             no_ask=_price(d, "no_ask"),
             last_price=_price(d, "last_price"),
-            volume=int(d.get("volume") or 0),
+            volume=_count(d.get("volume", d.get("volume_fp"))),
             open_time=_parse_time(d.get("open_time")),
             close_time=_parse_time(d.get("close_time")),
             expiration_time=_parse_time(d.get("expiration_time")),

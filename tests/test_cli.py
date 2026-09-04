@@ -37,3 +37,30 @@ def test_env_override_and_record_default(monkeypatch):
     parser = cli.build_parser()
     cli.main(["--env-file", "/nonexistent", "--env", "prod", "check"])
     assert seen["env"] == "prod"
+
+
+def test_markets_raw_prints_json(monkeypatch, capsys):
+    import kalshi_bot.cli as cli
+    from kalshi_bot.models import Market
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def get_markets(self, **kw):
+            return [
+                Market.from_dict({"ticker": "T", "yes_bid_dollars": "0.21", "volume_fp": "12.0"})
+            ]
+
+    monkeypatch.setattr(cli, "_client", lambda settings, need_auth: FakeClient())
+    settings = cli.Settings.from_env("/nonexistent")
+    args = cli.build_parser().parse_args(["markets", "--raw", "--limit", "1"])
+    assert cli.cmd_markets(settings, args) == 0
+    out = capsys.readouterr().out
+    assert '"yes_bid_dollars": "0.21"' in out and "ticker" in out
+    args = cli.build_parser().parse_args(["markets"])
+    cli.cmd_markets(settings, args)
+    assert "  21 " in capsys.readouterr().out

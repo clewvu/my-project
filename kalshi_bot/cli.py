@@ -99,8 +99,12 @@ def cmd_markets(settings: Settings, args: argparse.Namespace) -> int:
     """List markets in a series."""
     with _client(settings, need_auth=False) as client:
         markets = client.get_markets(
-            series_ticker=args.series, status=args.status, limit=args.limit, max_pages=1
+            series_ticker=args.series, status=args.status or None, limit=args.limit, max_pages=1
         )
+    if args.raw:
+        for m in markets[: args.limit]:
+            print(json.dumps(m.raw, indent=2, default=str))
+        return 0
     markets.sort(key=lambda m: m.close_time or datetime.max.replace(tzinfo=UTC))
     print(f"{'ticker':34} {'status':8} {'bid':>4} {'ask':>4} {'last':>4} {'vol':>7}  close (UTC)")
     for m in markets[: args.limit]:
