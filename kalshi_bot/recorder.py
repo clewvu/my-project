@@ -27,6 +27,18 @@ from .storage import MarketDataStore
 log = logging.getLogger(__name__)
 
 DEFAULT_SERIES = ["KXBTC15M", "KXDOGE15M"]
+DEAD_STATUSES = {"closed", "settled", "finalized", "determined"}
+
+
+def is_live(market: Market, now: float) -> bool:
+    """True if the market is still trading: not in a terminal status and not past close."""
+    if market.status.lower() in DEAD_STATUSES:
+        return False
+    if market.close_time is not None and market.close_time.timestamp() <= now:
+        return False
+    return True
+
+
 DEFAULT_SPOT_SYMBOLS = ["BTC-USD", "DOGE-USD"]
 
 
@@ -75,9 +87,10 @@ class Recorder:
                 result.errors.append(f"{series}: list markets: {exc}")
                 log.warning("%s: list markets failed: %s", series, exc)
                 continue
-            if not markets:
-                log.debug("%s: no open markets", series)
-            for market in markets:
+            live = [m for m in markets if is_live(m, now)]
+            if not live:
+                log.debug("%s: no live markets (%d returned)", series, len(markets))
+            for market in live:
                 result.markets += 1
                 self._record_market(market, now, result)
 

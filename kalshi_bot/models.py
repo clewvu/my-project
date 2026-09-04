@@ -25,9 +25,20 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 def _cents(value: Any) -> int | None:
-    if value is None:
+    """Integer cents from a cents number, or from a dollars string such as "0.45"."""
+    if value is None or value == "":
         return None
-    return int(round(float(value)))
+    if isinstance(value, str):
+        return round(float(value) * 100)
+    return round(float(value))
+
+
+def _price(d: dict[str, Any], name: str) -> int | None:
+    """Read ``name`` in cents, falling back to ``name_dollars`` (a dollars string)."""
+    value = d.get(name)
+    if value is None:
+        value = d.get(f"{name}_dollars")
+    return _cents(value)
 
 
 @dataclass(frozen=True)
@@ -57,11 +68,11 @@ class Market:
             series_ticker=d.get("series_ticker"),
             title=d.get("title") or "",
             status=d.get("status") or "",
-            yes_bid=_cents(d.get("yes_bid")),
-            yes_ask=_cents(d.get("yes_ask")),
-            no_bid=_cents(d.get("no_bid")),
-            no_ask=_cents(d.get("no_ask")),
-            last_price=_cents(d.get("last_price")),
+            yes_bid=_price(d, "yes_bid"),
+            yes_ask=_price(d, "yes_ask"),
+            no_bid=_price(d, "no_bid"),
+            no_ask=_price(d, "no_ask"),
+            last_price=_price(d, "last_price"),
             volume=int(d.get("volume") or 0),
             open_time=_parse_time(d.get("open_time")),
             close_time=_parse_time(d.get("close_time")),
@@ -111,11 +122,13 @@ class Orderbook:
     @classmethod
     def from_dict(cls, ticker: str, d: dict[str, Any]) -> Orderbook:
         book = d.get("orderbook", d) or {}
-        return cls(
-            ticker=ticker,
-            yes=cls._levels(book.get("yes", book.get("true"))),
-            no=cls._levels(book.get("no", book.get("false"))),
-        )
+        yes = book.get("yes")
+        if yes is None:
+            yes = book.get("yes_dollars", book.get("true"))
+        no = book.get("no")
+        if no is None:
+            no = book.get("no_dollars", book.get("false"))
+        return cls(ticker=ticker, yes=cls._levels(yes), no=cls._levels(no))
 
     @staticmethod
     def _levels(raw: Any) -> list[Level]:
@@ -127,7 +140,7 @@ class Orderbook:
                 price, count = item[0], item[1]
             if price is None or count is None:
                 continue
-            levels.append(Level(price=int(round(float(price))), count=int(count)))
+            levels.append(Level(price=_cents(price) or 0, count=int(count)))
         levels.sort(key=lambda lv: lv.price, reverse=True)
         return levels
 
@@ -237,8 +250,8 @@ class Order:
             action=d.get("action") or "",
             type=d.get("type") or "",
             status=d.get("status") or "",
-            yes_price=_cents(d.get("yes_price")),
-            no_price=_cents(d.get("no_price")),
+            yes_price=_price(d, "yes_price"),
+            no_price=_price(d, "no_price"),
             count=int(d.get("count") or d.get("initial_count") or 0),
             remaining_count=int(d.get("remaining_count") or 0),
             created_time=_parse_time(d.get("created_time")),
@@ -262,7 +275,7 @@ class Fill:
         side = d.get("side") or ""
         price = d.get("price")
         if price is None:
-            price = d.get("yes_price") if side == "yes" else d.get("no_price")
+            price = _price(d, "yes_price") if side == "yes" else _price(d, "no_price")
         return cls(
             fill_id=d.get("fill_id") or d.get("trade_id") or "",
             order_id=d.get("order_id") or "",

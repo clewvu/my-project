@@ -305,6 +305,17 @@ def _parse_ts(value: Any) -> float | None:
     return dt.timestamp()
 
 
+def _cents_or_none(cents: Any, dollars: Any = None) -> int | None:
+    if cents is not None:
+        return _int_or_none(cents)
+    if dollars in (None, ""):
+        return None
+    try:
+        return round(float(dollars) * 100)
+    except (TypeError, ValueError):
+        return None
+
+
 def _int_or_none(value: Any) -> int | None:
     if value is None:
         return None

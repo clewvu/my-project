@@ -75,6 +75,12 @@ kalshi-bot record --series KXBTC15M --interval 3 --db ~/kalshi-data/btc.sqlite
 kalshi-bot record-stats                # what has been captured so far
 ```
 
+The recorder reads from the **production** exchange's public endpoints by
+default, whatever `KALSHI_ENV` says, because the demo exchange lists almost no
+15-minute markets. Reads cannot trade. Any other command can be pointed at
+production for reading with `--env prod`, for example
+`kalshi-bot --env prod markets --series KXBTC15M`.
+
 Per tick it stores, for every open market in each series: a top-of-book
 snapshot with the resting levels, any new public trades, and (unless
 `--no-spot`) the Coinbase spot price for BTC-USD and DOGE-USD. Markets that

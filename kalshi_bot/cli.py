@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import logging
 import sys
 import time
@@ -10,7 +12,7 @@ from datetime import UTC, datetime
 
 from . import __version__
 from .client import KalshiClient, KalshiError
-from .config import Settings
+from .config import BASE_URLS, Settings
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
 from .spot import SpotFeed
 from .storage import MarketDataStore
@@ -24,6 +26,7 @@ def _setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _client(settings: Settings, *, need_auth: bool) -> KalshiClient:
@@ -115,6 +118,13 @@ def cmd_orderbook(settings: Settings, args: argparse.Namespace) -> int:
     with _client(settings, need_auth=False) as client:
         m = client.get_market(args.ticker)
         book = client.get_orderbook(args.ticker, depth=args.depth)
+    if args.raw:
+        print(
+            json.dumps(
+                {"market": m.raw, "orderbook": dataclasses.asdict(book)}, indent=2, default=str
+            )
+        )
+        return 0
     print(f"{m.ticker}  {m.title}")
     print(
         f"status={m.status}  closes {_fmt_time(m.close_time)}  "
@@ -208,6 +218,12 @@ def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kalshi-bot", description="Kalshi trading bot")
     p.add_argument("--env-file", default=None, help="path to a .env file (default: ./.env)")
+    p.add_argument(
+        "--env",
+        choices=sorted(BASE_URLS),
+        default=None,
+        help="override KALSHI_ENV for this command (demo | prod)",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("check", help=cmd_check.__doc__).set_defaults(func=cmd_check)
@@ -217,11 +233,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--series", default="KXBTC15M", help="series ticker, e.g. KXBTC15M")
     s.add_argument("--status", default="open", help="open | closed | settled | (empty for all)")
     s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--raw", action="store_true", help="print raw API JSON")
     s.set_defaults(func=cmd_markets)
 
     s = sub.add_parser("orderbook", help=cmd_orderbook.__doc__)
     s.add_argument("ticker")
     s.add_argument("--depth", type=int, default=10)
+    s.add_argument("--raw", action="store_true", help="print raw API JSON")
     s.set_defaults(func=cmd_orderbook)
 
     s = sub.add_parser("candles", help=cmd_candles.__doc__)
@@ -232,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_candles)
 
     s = sub.add_parser("record", help=cmd_record.__doc__)
+    s.set_defaults(default_env="prod")  # public data; demo has almost no markets
     s.add_argument(
         "--series",
         action="append",
@@ -267,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env(args.env_file)
     except ValueError as exc:
         sys.exit(f"config error: {exc}")
+    env_override = args.env or getattr(args, "default_env", None)
+    if env_override and env_override != settings.env:
+        settings = dataclasses.replace(settings, env=env_override)
     _setup_logging(settings.log_level)
     if args.command not in ("check", "markets", "record-stats"):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)

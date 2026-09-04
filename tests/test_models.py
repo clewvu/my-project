@@ -63,3 +63,21 @@ def test_candle_nested_and_flat():
     flat = Candle.from_dict({"start_ts": 1, "end_ts": 61, "open": 40, "close": 50})
     assert nested.high == 55 and nested.end_ts == 61 and nested.volume == 3
     assert flat.open == 40 and flat.high is None
+
+
+def test_dollar_string_fallbacks():
+    m = Market.from_dict(
+        {
+            "ticker": "T",
+            "yes_bid_dollars": "0.45",
+            "yes_ask_dollars": "0.4700",
+            "last_price_dollars": "0.46",
+        }
+    )
+    assert (m.yes_bid, m.yes_ask, m.last_price) == (45, 47, 46)
+    book = Orderbook.from_dict(
+        "T", {"orderbook": {"yes_dollars": [["0.45", 3]], "no_dollars": [["0.50", 1]]}}
+    )
+    assert book.best_yes_bid == 45 and book.best_no_bid == 50
+    # cents fields win when both are present
+    assert Market.from_dict({"ticker": "T", "yes_bid": 40, "yes_bid_dollars": "0.45"}).yes_bid == 40

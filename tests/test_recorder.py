@@ -111,8 +111,25 @@ def test_spot_feed_parses_and_tolerates_failures():
 
 def test_run_max_ticks_stops():
     client, store = FakeClient(), MarketDataStore()
+    # run() uses the real clock, so the market must close in the future
+    client.open["KXBTC15M"] = [market("BTC-1", "KXBTC15M", close="2099-01-01T00:00:00Z")]
     rec = Recorder(client, store, series=["KXBTC15M"], interval=1)
-    rec.interval = 1.0
     rec._stop.wait = lambda t: None  # don't actually sleep
     assert rec.run(max_ticks=3, install_signals=False) == 3
     assert store.stats()["snapshots"] == 3
+
+
+def test_dead_markets_are_skipped():
+    from kalshi_bot.recorder import is_live
+
+    now = market("X", "S").close_time.timestamp()
+    assert is_live(market("X", "S"), now - 10)
+    assert not is_live(market("X", "S"), now + 1)
+    assert not is_live(market("X", "S", status="closed"), now - 10)
+    assert not is_live(market("X", "S", status="settled", close="2099-01-01T00:00:00Z"), now)
+    assert is_live(market("X", "S", status="active", close="2099-01-01T00:00:00Z"), now)
+
+    client, store = FakeClient(), MarketDataStore()
+    client.open["KXBTC15M"].append(market("OLD", "KXBTC15M", status="closed"))
+    res = Recorder(client, store, series=["KXBTC15M"]).tick(now=now - 10)
+    assert res.markets == 1 and store.get_market_row("OLD") is None
