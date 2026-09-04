@@ -37,16 +37,27 @@ def extract_pem(text: bytes | str) -> bytes:
     Kalshi's download is a clean PEM, but people paste keys into notes files
     with the key id and other text around them. Line endings are normalised.
     """
-    data = text.encode("utf-8") if isinstance(text, str) else text
+    data = text.encode("utf-8") if isinstance(text, str) else _to_utf8(text)
     match = PEM_BLOCK.search(data)
     if not match:
         raise ValueError("no '-----BEGIN ... PRIVATE KEY-----' block found in the key file")
     return match.group(0).replace(b"\r\n", b"\n").replace(b"\r", b"\n") + b"\n"
 
 
+def _to_utf8(data: bytes) -> bytes:
+    """Notepad and PowerShell sometimes save UTF-16 (with a byte-order mark); normalise it."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16").encode("utf-8")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:]
+    if len(data) > 4 and data[1:2] == b"\x00" and data[3:4] == b"\x00":
+        return data.decode("utf-16-le", "replace").encode("utf-8")
+    return data
+
+
 def find_key_id(text: bytes | str) -> str | None:
     """A Kalshi key id (a UUID) appearing in ``text`` outside the PEM block, if any."""
-    data = text.decode("utf-8", "replace") if isinstance(text, bytes) else text
+    data = _to_utf8(text).decode("utf-8", "replace") if isinstance(text, bytes) else text
     outside = PEM_BLOCK.sub(b"", data.encode("utf-8")).decode("utf-8", "replace")
     match = KEY_ID.search(outside)
     return match.group(0) if match else None

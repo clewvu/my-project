@@ -67,3 +67,18 @@ def test_extract_pem_tolerates_notes_and_crlf(rsa_key, tmp_path):
 
     with pytest.raises(ValueError):
         extract_pem(b"nothing here")
+
+
+def test_extract_pem_handles_utf16_and_bom(rsa_key):
+    from kalshi_bot.auth import extract_pem, find_key_id
+
+    pem = rsa_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    text = "id 12345678-abcd-4ef0-9876-0123456789ab\r\n" + pem
+    for encoded in (text.encode("utf-16"), text.encode("utf-8-sig"), text.encode("utf-16-le")):
+        assert extract_pem(encoded).startswith(b"-----BEGIN PRIVATE KEY-----")
+        assert find_key_id(encoded) == "12345678-abcd-4ef0-9876-0123456789ab"
+        Signer.from_pem("x", encoded)
