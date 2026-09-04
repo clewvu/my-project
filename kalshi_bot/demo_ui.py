@@ -100,8 +100,10 @@ async function refresh() {
   try { d = await (await fetch('/api/state')).json(); document.getElementById('err').textContent = ''; }
   catch (e) { document.getElementById('err').textContent = 'dashboard server unreachable'; return; }
   const s = d.state || {}; const c = s.config || {};
+  const series = Array.isArray(c.series) ? c.series.join(', ') : (c.series || '');
+  const size = c.dollars ? `$${fmt(c.dollars, 2)} per trade` : `${c.contracts || '?'} contract(s) per trade`;
   document.getElementById('cfg').textContent = d.state
-    ? `${c.env || ''} · ${c.series || ''} · ${c.contracts || '?'} contract(s) · max price ${fmt(c.max_price, 2)} · loss cap $${fmt(c.loss_cap, 2)} · profit target $${fmt(c.profit_target, 2)}`
+    ? `${c.env || ''} · ${series} · ${size} · max price ${fmt(c.max_price, 2)} · loss cap $${fmt(c.loss_cap, 2)} · profit target $${fmt(c.profit_target, 2)}`
     : `no state file yet at ${d.state_file}; start the loop with: kalshi-bot demo-trade`;
   const st = document.getElementById('status'), note = document.getElementById('statusnote');
   st.className = 'big';
@@ -115,11 +117,14 @@ async function refresh() {
   document.getElementById('lbar').style.width = (c.loss_cap ? Math.min(100, Math.max(0, -p / c.loss_cap * 100)) : 0) + '%';
   document.getElementById('trades').textContent = s.trades ?? '–';
   document.getElementById('wl').textContent = `${s.wins || 0} won · ${s.losses || 0} lost · fees $${fmt(s.fees_paid, 2)}` + (c.max_trades ? ` · max ${c.max_trades}` : '');
-  const o = s.open, oe = document.getElementById('open'), on = document.getElementById('opennote');
-  if (o) {
-    oe.textContent = `${o.side.toUpperCase()} x${o.count}`;
-    const left = Math.max(0, Math.round(o.close_ts - d.now));
-    on.innerHTML = `<span class="mono">${o.ticker}</span><br>` + (o.filled_count > 0 ? `filled at ${fmt(o.fill_price, 3)}` : `resting at ${fmt(o.limit_price, 3)}, unfilled`) + ` · closes in ${Math.floor(left/60)}m ${left%60}s`;
+  const opens = Object.entries(s.series || {}).filter(([, v]) => v && v.open).map(([name, v]) => [name, v.open]);
+  const oe = document.getElementById('open'), on = document.getElementById('opennote');
+  if (opens.length) {
+    oe.textContent = opens.map(([, o]) => `${o.side.toUpperCase()} x${o.count}`).join(' · ');
+    on.innerHTML = opens.map(([, o]) => {
+      const left = Math.max(0, Math.round(o.close_ts - d.now));
+      return `<span class="mono">${o.ticker}</span> ` + (o.filled_count > 0 ? `filled at ${fmt(o.fill_price, 3)}` : `resting at ${fmt(o.limit_price, 3)}, unfilled`) + ` · closes in ${Math.floor(left/60)}m ${left%60}s`;
+    }).join('<br>');
   } else { oe.textContent = 'none'; on.textContent = ''; }
   document.getElementById('stopnote').textContent = d.stop_file_present ? `stop file present (${d.stop_file}); the loop will exit and refuse to start until cleared` : '';
   const rows = (s.history || []).slice().reverse().slice(0, 30).map(h =>

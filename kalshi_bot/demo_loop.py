@@ -1,28 +1,34 @@
 """Demo-only alternating trader.
 
 A deliberately dumb strategy for exercising the order path on Kalshi's demo
-(paper money) exchange: in each successive 15-minute market it buys one side,
-alternating YES ("up") and NO ("down"), holds to settlement, and books the
+(paper money) exchange: for each configured series (BTC and DOGE 15-minute
+markets by default) it buys one side of each successive market, alternating
+YES ("up") and NO ("down") per series, holds to settlement, and books the
 result. It exists to test plumbing, not to make money; the research modules
 decide whether anything has an edge.
 
-Bounds
-------
+Sizing and bounds
+-----------------
+* ``dollars``: spend about this much per trade; contracts =
+  floor(dollars / ask), at least 1. ``contracts`` is used instead when
+  ``dollars`` is unset.
 * ``max_price``: never pay more than this per contract, which caps the loss
-  on any single trade at ``contracts * max_price`` plus the fee.
+  on any single trade at what was spent plus the fee.
 * ``loss_cap``: stop once cumulative realised P&L (after fees) falls to
-  ``-loss_cap`` dollars.
-* ``profit_target``: stop once cumulative realised P&L reaches this.
-* ``max_trades``: stop after this many trades.
+  ``-loss_cap`` dollars. ``profit_target``: stop once it reaches this.
+* ``max_trades``: stop after this many trades across all series.
 * ``min_ttc``: no entries, and any unfilled order cancelled, inside this
   many seconds of close.
+
+A cap that is hit while positions are open stops new entries; the loop keeps
+running until those positions settle, then exits.
 
 Stopping
 --------
 Ctrl-C, or create the stop file (``state/STOP`` by default). Both cancel
 resting orders; an already-filled position is held to settlement and booked
-on the next run. State (P&L, trade count, last side, open position) lives in
-a JSON file so a restart cannot reset the caps. ``--reset`` clears it.
+on the next run. State lives in a JSON file so a restart cannot reset the
+caps. ``--reset`` clears it.
 
 Safety
 ------
@@ -36,9 +42,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +57,7 @@ from .models import Market
 log = logging.getLogger(__name__)
 
 SIDES = ("yes", "no")
+DEFAULT_SERIES = ("KXBTC15M", "KXDOGE15M")
 SETTLEMENT_GRACE_S = 30.0
 SETTLEMENT_GIVE_UP_S = 3 * 3600.0
 
@@ -60,8 +68,9 @@ class RefusedProduction(Exception):
 
 @dataclass
 class LoopConfig:
-    series: str = "KXBTC15M"
+    series: tuple[str, ...] = DEFAULT_SERIES
     contracts: int = 1
+    dollars: float | None = None
     max_price: float = 0.60
     loss_cap: float = 5.0
     profit_target: float = 10.0
@@ -73,8 +82,12 @@ class LoopConfig:
     state_file: Path = Path("state/demo_loop.json")
 
     def validate(self) -> None:
+        if not self.series:
+            raise ValueError("at least one series is required")
         if self.contracts < 1:
             raise ValueError("contracts must be at least 1")
+        if self.dollars is not None and self.dollars <= 0:
+            raise ValueError("dollars must be positive")
         if not 0 < self.max_price < 1:
             raise ValueError("max_price must be between 0 and 1 dollars")
         if self.loss_cap <= 0 or self.profit_target <= 0:
@@ -83,6 +96,11 @@ class LoopConfig:
             raise ValueError("first_side must be yes or no")
         if self.min_ttc < 0 or self.interval <= 0:
             raise ValueError("min_ttc must be >= 0 and interval > 0")
+
+    def size(self, price: float) -> int:
+        if self.dollars is None:
+            return self.contracts
+        return max(1, math.floor(self.dollars / price + 1e-9))
 
 
 @dataclass
@@ -97,6 +115,7 @@ class OpenTrade:
     filled_count: float = 0.0
     fill_price: float | None = None
     simulated: bool = False
+    prev_side: str | None = None  # the series' last_side before this entry, for undo
 
     @property
     def filled(self) -> bool:
@@ -104,38 +123,10 @@ class OpenTrade:
 
 
 @dataclass
-class LoopState:
+class SeriesState:
     last_side: str | None = None
-    trades: int = 0
-    wins: int = 0
-    losses: int = 0
-    realized_pnl: float = 0.0
-    fees_paid: float = 0.0
     open: OpenTrade | None = None
     seen_tickers: list[str] = field(default_factory=list)
-    history: list[dict[str, Any]] = field(default_factory=list)
-    halted: str | None = None
-    last_tick_ts: float | None = None  # heartbeat for the dashboard
-    stopped: str | None = None  # why the last run ended
-    config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
-
-    @classmethod
-    def load(cls, path: Path) -> LoopState:
-        if not path.exists():
-            return cls()
-        data = json.loads(path.read_text())
-        open_trade = data.pop("open", None)
-        state = cls(**data)
-        if open_trade:
-            state.open = OpenTrade(**open_trade)
-        return state
-
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = asdict(self)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, default=str))
-        tmp.replace(path)
 
     def next_side(self, first_side: str) -> str:
         if self.last_side is None:
@@ -147,11 +138,56 @@ class LoopState:
             self.seen_tickers.append(ticker)
             del self.seen_tickers[:-100]
 
+
+@dataclass
+class LoopState:
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    realized_pnl: float = 0.0
+    fees_paid: float = 0.0
+    series: dict[str, SeriesState] = field(default_factory=dict)
+    history: list[dict[str, Any]] = field(default_factory=list)
+    halted: str | None = None
+    last_tick_ts: float | None = None  # heartbeat for the dashboard
+    stopped: str | None = None  # why the last run ended
+    config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
+
+    @classmethod
+    def load(cls, path: Path) -> LoopState:
+        if not path.exists():
+            return cls()
+        data = json.loads(path.read_text())
+        known = {f.name for f in fields(cls)}
+        series_raw = data.pop("series", {}) or {}
+        state = cls(**{k: v for k, v in data.items() if k in known})
+        if isinstance(series_raw, dict):
+            for name, raw in series_raw.items():
+                open_raw = raw.pop("open", None)
+                ss = SeriesState(**{k: v for k, v in raw.items() if k != "open"})
+                if open_raw:
+                    ss.open = OpenTrade(**open_raw)
+                state.series[name] = ss
+        return state
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(asdict(self), indent=2, default=str))
+        tmp.replace(path)
+
+    def for_series(self, name: str) -> SeriesState:
+        return self.series.setdefault(name, SeriesState())
+
+    @property
+    def open_trades(self) -> list[tuple[str, OpenTrade]]:
+        return [(name, ss.open) for name, ss in self.series.items() if ss.open is not None]
+
     def summary(self) -> str:
-        pos = f"{self.open.side} x{self.open.count} {self.open.ticker}" if self.open else "none"
+        opens = ", ".join(f"{t.side} x{t.count} {t.ticker}" for _, t in self.open_trades) or "none"
         return (
             f"trades={self.trades} wins={self.wins} losses={self.losses} "
-            f"pnl={self.realized_pnl:+.2f} fees={self.fees_paid:.2f} open={pos}"
+            f"pnl={self.realized_pnl:+.2f} fees={self.fees_paid:.2f} open={opens}"
             + (f" halted={self.halted}" if self.halted else "")
         )
 
@@ -175,8 +211,9 @@ class DemoLoop:
         self.state = state or LoopState.load(config.state_file)
         self.state.config = {
             "env": "dry-run" if client.dry_run else "demo",
-            "series": config.series,
+            "series": list(config.series),
             "contracts": config.contracts,
+            "dollars": config.dollars,
             "max_price": config.max_price,
             "loss_cap": config.loss_cap,
             "profit_target": config.profit_target,
@@ -186,7 +223,7 @@ class DemoLoop:
         }
         self.clock = clock
         self.sleep = sleep
-        self._last_skip: tuple[str, str] | None = None
+        self._last_skip: dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------------ run
 
@@ -208,8 +245,9 @@ class DemoLoop:
         return "tick limit"
 
     def _stop(self, reason: str) -> str:
-        if self.state.open and not self.state.open.filled:
-            self._cancel_open("stopping")
+        for name, trade in self.state.open_trades:
+            if not trade.filled:
+                self._cancel_open(name, "stopping")
         self.state.stopped = reason
         self.state.save(self.cfg.state_file)
         log.info("demo loop stopped (%s): %s", reason, self.state.summary())
@@ -219,22 +257,25 @@ class DemoLoop:
         """One pass. Returns a stop reason, or None to keep going."""
         if self.cfg.stop_file.exists():
             return f"stop file {self.cfg.stop_file}"
-        if self.state.halted:
-            return self.state.halted
         now = self.clock()
         self.state.last_tick_ts = now
         self.state.stopped = None
-        if self.state.open:
-            self._settle_if_closed(now)
-        halt = self._check_caps()
-        if halt:
+        for name in self.cfg.series:
+            if self.state.for_series(name).open is not None:
+                self._settle_if_closed(name, now)
+        halt = self.state.halted or self._check_caps()
+        if halt and not self.state.halted:
             self.state.halted = halt
+            log.info("halting after open positions settle: %s", halt)
+        if halt and not self.state.open_trades:
             self.state.save(self.cfg.state_file)
             return halt
-        if self.state.open:
-            self._manage_open(now)
-        else:
-            self._maybe_enter(now)
+        for name in self.cfg.series:
+            ss = self.state.for_series(name)
+            if ss.open is not None:
+                self._manage_open(name, now)
+            elif not halt:
+                self._maybe_enter(name, now)
         self.state.save(self.cfg.state_file)
         return None
 
@@ -242,8 +283,6 @@ class DemoLoop:
 
     def _check_caps(self) -> str | None:
         s = self.state
-        if s.open is not None:
-            return None  # judge the caps once the open trade has settled
         if s.realized_pnl <= -self.cfg.loss_cap:
             return f"loss cap reached ({s.realized_pnl:+.2f} <= -{self.cfg.loss_cap:.2f})"
         if s.realized_pnl >= self.cfg.profit_target:
@@ -252,60 +291,64 @@ class DemoLoop:
             return f"max trades reached ({s.trades})"
         return None
 
-    def _maybe_enter(self, now: float) -> None:
-        market = self._pick_market(now)
+    def _maybe_enter(self, name: str, now: float) -> None:
+        ss = self.state.for_series(name)
+        market = self._pick_market(name, ss, now)
         if market is None:
             return
-        side = self.state.next_side(self.cfg.first_side)
+        side = ss.next_side(self.cfg.first_side)
         price = market.yes_ask if side == "yes" else market.no_ask
         if price is None:
-            self._skip(market.ticker, f"no {side} ask")
+            self._skip(name, market.ticker, f"no {side} ask")
             return
         if price > self.cfg.max_price:
             self._skip(
-                market.ticker, f"{side} ask {price:.3f} above max_price {self.cfg.max_price}"
+                name, market.ticker, f"{side} ask {price:.3f} above max_price {self.cfg.max_price}"
             )
             return
+        count = self.cfg.size(price)
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
         order = self.client.create_order(
             market.ticker,
             side=side,
             action="buy",
-            count=self.cfg.contracts,
+            count=count,
             price=price,
             order_type="limit",
         )
         trade = OpenTrade(
             ticker=market.ticker,
             side=side,
-            count=self.cfg.contracts,
+            count=count,
             limit_price=price,
             order_id=None if isinstance(order, DryRunOrder) else order.order_id,
             close_ts=close_ts,
             placed_ts=now,
             simulated=isinstance(order, DryRunOrder),
+            prev_side=ss.last_side,
         )
         if trade.simulated:
-            trade.filled_count = float(self.cfg.contracts)
+            trade.filled_count = float(count)
             trade.fill_price = price
-        self.state.open = trade
-        self.state.last_side = side
+        ss.open = trade
+        ss.last_side = side
+        ss.note_ticker(market.ticker)
         self.state.trades += 1
-        self.state.note_ticker(market.ticker)
         self.state.save(self.cfg.state_file)
         log.info(
-            "buy %s x%d %s at %.3f (%s)",
+            "buy %s x%d %s at %.3f (~$%.2f, %s)",
             side,
-            self.cfg.contracts,
+            count,
             market.ticker,
             price,
+            count * price,
             "simulated" if trade.simulated else f"order {trade.order_id}",
         )
 
-    def _pick_market(self, now: float) -> Market | None:
+    def _pick_market(self, name: str, ss: SeriesState, now: float) -> Market | None:
         candidates = []
-        for m in self.client.get_markets(series_ticker=self.cfg.series, status="open"):
-            if m.ticker in self.state.seen_tickers or m.close_time is None:
+        for m in self.client.get_markets(series_ticker=name, status="open"):
+            if m.ticker in ss.seen_tickers or m.close_time is None:
                 continue
             ttc = m.seconds_to_close(datetime.fromtimestamp(now, tz=UTC))
             if ttc is None or ttc < self.cfg.min_ttc:
@@ -316,14 +359,14 @@ class DemoLoop:
         candidates.sort(key=lambda c: c[0])
         return candidates[0][1]
 
-    def _skip(self, ticker: str, why: str) -> None:
+    def _skip(self, name: str, ticker: str, why: str) -> None:
         key = (ticker, why)
-        if key != self._last_skip:
+        if self._last_skip.get(name) != key:
             log.info("skip %s: %s", ticker, why)
-            self._last_skip = key
+            self._last_skip[name] = key
 
-    def _manage_open(self, now: float) -> None:
-        trade = self.state.open
+    def _manage_open(self, name: str, now: float) -> None:
+        trade = self.state.for_series(name).open
         if trade is None or trade.filled:
             return
         self._refresh_fills(trade)
@@ -338,7 +381,7 @@ class DemoLoop:
             )
             return
         if now >= trade.close_ts - self.cfg.min_ttc:
-            self._cancel_open("unfilled inside the no-entry window")
+            self._cancel_open(name, "unfilled inside the no-entry window")
 
     def _refresh_fills(self, trade: OpenTrade) -> None:
         if trade.order_id is None:
@@ -353,8 +396,17 @@ class DemoLoop:
             trade.filled_count = count
             trade.fill_price = sum(f.count * f.price for f in fills) / count
 
-    def _cancel_open(self, why: str) -> None:
-        trade = self.state.open
+    def _drop_unfilled(self, name: str, ss: SeriesState) -> None:
+        # the alternation and the trade count only advance on a fill
+        self.state.trades -= 1
+        if ss.open is not None:
+            ss.last_side = ss.open.prev_side
+        ss.open = None
+        self.state.save(self.cfg.state_file)
+
+    def _cancel_open(self, name: str, why: str) -> None:
+        ss = self.state.for_series(name)
+        trade = ss.open
         if trade is None:
             return
         if trade.order_id is not None:
@@ -368,24 +420,18 @@ class DemoLoop:
                 self.state.save(self.cfg.state_file)
                 return
         log.info("cancelled %s on %s: %s", trade.side, trade.ticker, why)
-        # the alternation and the trade count only advance on a fill
-        self.state.trades -= 1
-        self.state.last_side = _previous_side(self.state)
-        self.state.open = None
-        self.state.save(self.cfg.state_file)
+        self._drop_unfilled(name, ss)
 
-    def _settle_if_closed(self, now: float) -> None:
-        trade = self.state.open
+    def _settle_if_closed(self, name: str, now: float) -> None:
+        ss = self.state.for_series(name)
+        trade = ss.open
         if trade is None or now < trade.close_ts + SETTLEMENT_GRACE_S:
             return
         if not trade.filled:
             self._refresh_fills(trade)
             if not trade.filled:
                 log.info("%s closed with no fill; nothing to settle", trade.ticker)
-                self.state.trades -= 1
-                self.state.last_side = _previous_side(self.state)
-                self.state.open = None
-                self.state.save(self.cfg.state_file)
+                self._drop_unfilled(name, ss)
                 return
         market = self.client.get_market(trade.ticker)
         if market.result not in SIDES:
@@ -404,6 +450,7 @@ class DemoLoop:
         s.losses += int(not won)
         s.history.append(
             {
+                "series": name,
                 "ticker": trade.ticker,
                 "side": trade.side,
                 "count": trade.filled_count,
@@ -415,7 +462,7 @@ class DemoLoop:
             }
         )
         del s.history[:-200]
-        s.open = None
+        ss.open = None
         s.save(self.cfg.state_file)
         log.info(
             "settled %s: %s, %s x%.0f at %.3f -> %+.2f (fee %.2f); %s",
@@ -428,10 +475,3 @@ class DemoLoop:
             fee,
             s.summary(),
         )
-
-
-def _previous_side(state: LoopState) -> str | None:
-    """Undo one alternation step after a trade that never filled."""
-    if state.trades == 0:
-        return None
-    return "no" if state.last_side == "yes" else "yes"

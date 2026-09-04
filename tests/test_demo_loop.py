@@ -8,18 +8,25 @@ import pytest
 
 from kalshi_bot import demo_ui
 from kalshi_bot.client import DryRunOrder
-from kalshi_bot.demo_loop import DemoLoop, LoopConfig, LoopState, OpenTrade, RefusedProduction
+from kalshi_bot.demo_loop import (
+    DemoLoop,
+    LoopConfig,
+    LoopState,
+    OpenTrade,
+    RefusedProduction,
+    SeriesState,
+)
 from kalshi_bot.models import Fill, Market, Order
 
 T0 = 1_800_000_000.0
 
 
-def market(i, yes_ask=0.55, no_ask=0.47, result=None, status="open"):
+def market(i, yes_ask=0.55, no_ask=0.47, result=None, status="open", series="KXBTC15M"):
     open_ts = T0 + i * 900
     return Market.from_dict(
         {
-            "ticker": f"KXBTC15M-{i}",
-            "series_ticker": "KXBTC15M",
+            "ticker": f"{series}-{i}",
+            "series_ticker": series,
             "status": status,
             "open_time": open_ts,
             "close_time": open_ts + 900,
@@ -35,12 +42,13 @@ def market(i, yes_ask=0.55, no_ask=0.47, result=None, status="open"):
 class FakeClient:
     """Scripted demo exchange: one open market per 15-minute window."""
 
-    def __init__(self, results, dry_run=False, fill=True, asks=None):
+    def __init__(self, results, dry_run=False, fill=True, asks=None, series=("KXBTC15M",)):
         self.is_prod = False
         self.dry_run = dry_run
-        self.results = results  # index -> "yes" | "no"
+        self.results = results  # index -> "yes" | "no" (same for every series)
         self.fill = fill
         self.asks = asks or {}
+        self.series = series
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
         self.now = T0
@@ -49,14 +57,19 @@ class FakeClient:
         return int((self.now - T0) // 900)
 
     def get_markets(self, *, series_ticker=None, status=None, **kw):
+        if series_ticker not in self.series:
+            return []
         i = self._window()
         kw2 = self.asks.get(i, {})
-        return [market(i, **kw2)]
+        return [market(i, series=series_ticker, **kw2)]
 
     def get_market(self, ticker):
-        i = int(ticker.rsplit("-", 1)[1])
+        series, i = ticker.rsplit("-", 1)
+        i = int(i)
         closed = self.now >= T0 + (i + 1) * 900
-        return market(i, result=self.results.get(i) if closed else None, status="settled")
+        return market(
+            i, result=self.results.get(i) if closed else None, status="settled", series=series
+        )
 
     def create_order(self, ticker, *, side, action, count, price, order_type, **kw):
         body = {"ticker": ticker, "side": side, "action": action, "count": count, "price": price}
@@ -98,6 +111,7 @@ class FakeClient:
 
 
 def make(tmp_path, client, **cfg_kw):
+    cfg_kw.setdefault("series", tuple(client.series))
     cfg = LoopConfig(
         interval=1.0,
         stop_file=tmp_path / "STOP",
@@ -128,7 +142,13 @@ def test_config_validation():
         LoopConfig(max_price=1.5).validate()
     with pytest.raises(ValueError):
         LoopConfig(first_side="up").validate()
+    with pytest.raises(ValueError):
+        LoopConfig(dollars=0).validate()
     LoopConfig().validate()
+    assert LoopConfig(dollars=2.0).size(0.55) == 3
+    assert LoopConfig(dollars=2.0).size(0.90) == 2
+    assert LoopConfig(dollars=0.10).size(0.55) == 1
+    assert LoopConfig(contracts=4).size(0.55) == 4
 
 
 def test_alternates_and_books_settlement(tmp_path):
@@ -143,10 +163,11 @@ def test_alternates_and_books_settlement(tmp_path):
     assert s.realized_pnl == pytest.approx(-0.57 - 0.06, abs=1e-9)
     assert s.fees_paid == pytest.approx(0.06)
     assert [h["result"] for h in s.history] == ["yes", "yes", "no"]
-    assert s.open is None
-    # persisted, and reloadable with the open field handled
+    assert s.open_trades == []
+    # persisted, and reloadable with the nested series state handled
     reloaded = LoopState.load(loop.cfg.state_file)
-    assert reloaded.realized_pnl == pytest.approx(s.realized_pnl) and reloaded.last_side == "yes"
+    assert reloaded.realized_pnl == pytest.approx(s.realized_pnl)
+    assert reloaded.series["KXBTC15M"].last_side == "yes"
 
 
 def test_no_entry_inside_min_ttc(tmp_path):
@@ -194,19 +215,20 @@ def test_max_trades(tmp_path):
     client = FakeClient({i: "yes" for i in range(5)})
     loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100, max_trades=2)
     assert loop.run().startswith("max trades")
-    assert len(client.orders) == 2 and loop.state.open is None  # halts after the last settles
+    assert len(client.orders) == 2 and not loop.state.open_trades  # halts after the last settles
 
 
 def test_stop_file_cancels_resting_order(tmp_path):
     client = FakeClient({0: "yes"}, fill=False)
     loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100)
     loop.run(max_ticks=2)
-    assert loop.state.open is not None and not loop.state.open.filled
+    ss = loop.state.series["KXBTC15M"]
+    assert ss.open is not None and not ss.open.filled
     (tmp_path / "STOP").write_text("x")
     reason = loop.run(max_ticks=5)
     assert reason.startswith("stop file")
     assert client.cancelled == ["o1"]
-    assert loop.state.open is None and loop.state.trades == 0 and loop.state.last_side is None
+    assert ss.open is None and loop.state.trades == 0 and ss.last_side is None
     assert loop.state.stopped == reason
 
 
@@ -228,7 +250,7 @@ def test_keyboard_interrupt_saves_state(tmp_path):
 
     loop.sleep = boom
     assert loop.run() == "interrupted"
-    assert LoopState.load(loop.cfg.state_file).open is not None
+    assert LoopState.load(loop.cfg.state_file).open_trades
 
 
 def test_dry_run_simulates_fill(tmp_path):
@@ -243,20 +265,58 @@ def test_settlement_waits_for_result(tmp_path):
     client = FakeClient({})  # never settles
     loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100)
     loop.run(max_ticks=20)
-    assert loop.state.open is not None and loop.state.trades == 1
+    assert loop.state.open_trades and loop.state.trades == 1
 
 
 def test_state_roundtrip(tmp_path):
-    s = LoopState(trades=2, realized_pnl=1.5, last_side="no")
-    s.open = OpenTrade("T", "yes", 1, 0.5, "o1", T0 + 900, T0, filled_count=1.0, fill_price=0.5)
+    s = LoopState(trades=2, realized_pnl=1.5)
+    ss = s.for_series("KXBTC15M")
+    ss.last_side = "no"
+    ss.open = OpenTrade("T", "yes", 1, 0.5, "o1", T0 + 900, T0, filled_count=1.0, fill_price=0.5)
     s.save(tmp_path / "s.json")
     r = LoopState.load(tmp_path / "s.json")
-    assert r.open == s.open and r.trades == 2 and r.last_side == "no"
-    assert r.next_side("yes") == "yes"
-    assert LoopState().next_side("no") == "no"
+    rs = r.series["KXBTC15M"]
+    assert rs.open == ss.open and r.trades == 2 and rs.last_side == "no"
+    assert rs.next_side("yes") == "yes"
+    assert SeriesState().next_side("no") == "no"
     for _ in range(150):
-        s.note_ticker(str(_))
-    assert len(s.seen_tickers) == 100
+        ss.note_ticker(str(_))
+    assert len(ss.seen_tickers) == 100
+    # an old single-series state file loads without crashing
+    (tmp_path / "old.json").write_text(
+        json.dumps({"last_side": "yes", "trades": 1, "open": None, "seen_tickers": []})
+    )
+    assert LoopState.load(tmp_path / "old.json").trades == 1
+
+
+def test_two_series_alternate_independently(tmp_path):
+    client = FakeClient({0: "yes", 1: "no", 2: "yes"}, series=("KXBTC15M", "KXDOGE15M"))
+    loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100, dollars=2.0, max_trades=6)
+    assert loop.run().startswith("max trades")
+    by_series = {}
+    for o in client.orders:
+        by_series.setdefault(o["ticker"].rsplit("-", 1)[0], []).append(o)
+    assert [o["side"] for o in by_series["KXBTC15M"]] == ["yes", "no", "yes"]
+    assert [o["side"] for o in by_series["KXDOGE15M"]] == ["yes", "no", "yes"]
+    # $2 at a 55c ask is 3 contracts; at 47c it is 4
+    assert [o["count"] for o in by_series["KXBTC15M"]] == [3, 4, 3]
+    assert loop.state.trades == 6 and loop.state.wins == 6
+    assert {h["series"] for h in loop.state.history} == {"KXBTC15M", "KXDOGE15M"}
+    text = loop.state.summary()
+    assert "trades=6" in text
+
+
+def test_cap_waits_for_open_positions(tmp_path):
+    # every trade loses; the loss cap trips while the second series still has a position
+    client = FakeClient(
+        {i: ("no" if i % 2 == 0 else "yes") for i in range(10)},
+        series=("KXBTC15M", "KXDOGE15M"),
+    )
+    loop, _ = make(tmp_path, client, loss_cap=1.0, profit_target=100)
+    reason = loop.run()
+    assert reason.startswith("loss cap")
+    assert loop.state.open_trades == []  # nothing left dangling on the exchange
+    assert loop.state.halted
 
 
 # ---------------------------------------------------------------- dashboard

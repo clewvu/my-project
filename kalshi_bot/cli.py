@@ -331,13 +331,14 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
     """Demo-only alternating up/down trader with loss cap and profit target."""
     from pathlib import Path
 
-    from .demo_loop import DemoLoop, LoopConfig, LoopState
+    from .demo_loop import DEFAULT_SERIES, DemoLoop, LoopConfig, LoopState
 
     if settings.env != "demo":
         sys.exit("demo-trade only runs against the demo exchange: set KALSHI_ENV=demo")
     cfg = LoopConfig(
-        series=args.series,
+        series=tuple(args.series) if args.series else DEFAULT_SERIES,
         contracts=args.contracts,
+        dollars=args.dollars,
         max_price=args.max_price,
         loss_cap=args.loss_cap,
         profit_target=args.profit_target,
@@ -505,7 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_fairvalue)
 
     s = sub.add_parser("demo-trade", help=cmd_demo_trade.__doc__)
-    s.add_argument("--series", default="KXBTC15M", help="series to trade (default KXBTC15M)")
+    s.add_argument(
+        "--series",
+        action="append",
+        help="series to trade; repeatable (default: KXBTC15M and KXDOGE15M)",
+    )
+    s.add_argument(
+        "--dollars",
+        type=float,
+        default=None,
+        help="spend about this much per trade (contracts = dollars / ask); overrides --contracts",
+    )
     s.add_argument("--contracts", type=int, default=1, help="contracts per trade")
     s.add_argument(
         "--max-price",
