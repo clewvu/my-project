@@ -176,11 +176,24 @@ class LoopState:
                 state.series[name] = ss
         return state
 
-    def save(self, path: Path) -> None:
+    def save(self, path: Path, attempts: int = 20) -> None:
+        """Write atomically, retrying the swap: on Windows it fails while a reader
+        (the dashboard, a sync client, an antivirus scan) has the file open."""
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(asdict(self), indent=2, default=str)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2, default=str))
-        tmp.replace(path)
+        tmp.write_text(payload)
+        for attempt in range(attempts):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (attempt + 1))
+        log.warning("could not swap %s into place; writing it directly", tmp)
+        try:
+            path.write_text(payload)
+        except OSError as exc:
+            log.warning("state save skipped: %s", exc)
 
     def for_series(self, name: str) -> SeriesState:
         return self.series.setdefault(name, SeriesState())

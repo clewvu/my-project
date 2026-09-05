@@ -283,6 +283,28 @@ def test_settlement_waits_for_result(tmp_path):
     assert loop.state.open_trades and loop.state.trades == 1
 
 
+def test_save_retries_when_the_swap_is_refused(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    calls = {"n": 0}
+    real_replace = Path.replace
+
+    def flaky(self, target):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("locked by another process")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky)
+    monkeypatch.setattr("kalshi_bot.demo_loop.time.sleep", lambda s: None)
+    LoopState(trades=5).save(tmp_path / "s.json")
+    assert calls["n"] == 3 and LoopState.load(tmp_path / "s.json").trades == 5
+    # never crashes even if the swap keeps failing
+    calls["n"] = -10_000
+    LoopState(trades=6).save(tmp_path / "s.json", attempts=2)
+    assert LoopState.load(tmp_path / "s.json").trades == 6
+
+
 def test_state_roundtrip(tmp_path):
     s = LoopState(trades=2, realized_pnl=1.5)
     ss = s.for_series("KXBTC15M")
