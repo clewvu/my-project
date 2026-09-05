@@ -285,6 +285,11 @@ the position by the selling fee plus `--exit-margin` (default 2 cents). With
 `alternate`, `--take-profit` and `--stop-loss` set fixed levels in dollars
 per contract. `--no-exits` holds everything to settlement.
 
+After a sale the same market can be entered again if the strategy sees a
+fresh edge: up to `--max-entries` per market (default 6), of which the first
+`--free-entries` (default 2) need only a signal and the rest also require
+that market to be in profit so far. One position per series at a time.
+
 ## Development
 
 ```bash

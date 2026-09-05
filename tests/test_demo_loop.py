@@ -338,6 +338,82 @@ def test_loop_sells_when_the_strategy_says_exit(tmp_path):
     assert loop2.state.history[-1]["result"] == "no"
 
 
+def _reentry_loop(tmp_path, client, strategy, **cfg_kw):
+    cfg = LoopConfig(
+        interval=1.0,
+        series=("KXBTC15M",),
+        dollars=2.0,
+        stop_file=tmp_path / "STOP",
+        state_file=tmp_path / f"state{id(client)}.json",
+        decision_log=None,
+        spot_db=None,
+        loss_cap=100,
+        profit_target=None,
+        **cfg_kw,
+    )
+
+    def sleep(s):
+        client.now += 30.0
+
+    return DemoLoop(client, cfg, clock=lambda: client.now, sleep=sleep, strategy=strategy)
+
+
+class _Churner:
+    """Enters whenever allowed and sells at the next tick at a chosen bid."""
+
+    name = "churn"
+    size_scale = 1.0
+
+    def __init__(self, sell_at):
+        self.sell_at = sell_at
+
+    def prepare(self, now):
+        pass
+
+    def signal(self, market, last_side, now):
+        from kalshi_bot.strategy import Signal
+
+        return Signal(side="yes", price=market.yes_ask, reason="in")
+
+    def exit(self, market, side, entry_price, now):
+        from kalshi_bot.strategy import Exit
+
+        return Exit(self.sell_at, "out")
+
+
+def test_reentry_capped_at_two_when_the_market_is_losing(tmp_path):
+    client = FakeClient({0: "yes"})
+    loop = _reentry_loop(
+        tmp_path, client, _Churner(sell_at=0.50), max_entries=6
+    )  # sells below entry
+    loop.run(max_ticks=25)  # 25 x 30 s: the whole 15-minute window minus the no-entry zone
+    buys = [o for o in client.orders if o["action"] == "buy" and o["ticker"] == "KXBTC15M-0"]
+    assert len(buys) == 2
+    ss = loop.state.series["KXBTC15M"]
+    assert ss.entries["KXBTC15M-0"] == 2 and ss.market_pnl["KXBTC15M-0"] < 0
+
+
+def test_reentry_up_to_six_while_the_market_is_profitable(tmp_path):
+    client = FakeClient({0: "yes"})
+    loop = _reentry_loop(
+        tmp_path, client, _Churner(sell_at=0.70), max_entries=6
+    )  # sells well above
+    loop.run(max_ticks=25)
+    buys = [o for o in client.orders if o["action"] == "buy" and o["ticker"] == "KXBTC15M-0"]
+    sells = [o for o in client.orders if o["action"] == "sell" and o["ticker"] == "KXBTC15M-0"]
+    assert len(buys) == 6 and len(sells) == 6
+    ss = loop.state.series["KXBTC15M"]
+    assert ss.entries["KXBTC15M-0"] == 6 and ss.market_pnl["KXBTC15M-0"] > 0
+    assert loop.state.realized_pnl > 0.5
+    # one entry only when configured so
+    client2 = FakeClient({0: "yes"})
+    loop2 = _reentry_loop(tmp_path, client2, _Churner(sell_at=0.70), max_entries=1)
+    loop2.run(max_ticks=25)
+    assert len([o for o in client2.orders if o["action"] == "buy"]) == 1
+    with pytest.raises(ValueError):
+        LoopConfig(max_entries=0).validate()
+
+
 def test_loop_uses_the_strategy_and_logs_decisions(tmp_path):
     from kalshi_bot.strategy import Signal, Skip
 

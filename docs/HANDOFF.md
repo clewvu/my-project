@@ -307,6 +307,10 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    service). Expect "candidate failed the promotion gate" for days; that is
    the gate. Sells use `time_in_force=immediate_or_cancel` on the V2
    endpoint, untested against a real fill as of this note.
+8. Re-entry (Cameron's ask, 2026-09-05): after a sale the same market may
+   be entered again on a fresh signal, up to `--max-entries` (6) per
+   market; beyond `--free-entries` (2) the market must be in profit so far
+   (`SeriesState.entries_allowed`). Still one open position per series.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

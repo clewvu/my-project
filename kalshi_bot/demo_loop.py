@@ -94,8 +94,12 @@ class LoopConfig:
     exit_margin: float = 0.02  # fairvalue: sell when the bid beats model value by this
     take_profit: float = 0.0  # alternate: sell when the bid is this far above entry (0 = off)
     stop_loss: float = 0.0  # alternate: sell when the bid is this far below entry (0 = off)
+    max_entries: int = 1  # entries per market (a re-entry needs the previous one sold)
+    free_entries: int = 2  # entries beyond this need the market to be in profit so far
 
     def validate(self) -> None:
+        if self.max_entries < 1 or self.free_entries < 1:
+            raise ValueError("max_entries and free_entries must be at least 1")
         if self.strategy not in ("alternate", "fairvalue"):
             raise ValueError("strategy must be alternate or fairvalue")
         if self.margin < 0 or self.vol_window < 300:
@@ -150,6 +154,8 @@ class SeriesState:
     last_side: str | None = None
     open: OpenTrade | None = None
     seen_tickers: list[str] = field(default_factory=list)
+    entries: dict[str, int] = field(default_factory=dict)  # ticker -> entries made
+    market_pnl: dict[str, float] = field(default_factory=dict)  # ticker -> realised so far
 
     def next_side(self, first_side: str) -> str:
         if self.last_side is None:
@@ -157,9 +163,26 @@ class SeriesState:
         return "no" if self.last_side == "yes" else "yes"
 
     def note_ticker(self, ticker: str) -> None:
+        self.entries[ticker] = self.entries.get(ticker, 0) + 1
         if ticker not in self.seen_tickers:
             self.seen_tickers.append(ticker)
             del self.seen_tickers[:-100]
+        for old in list(self.entries)[:-100]:
+            self.entries.pop(old, None)
+            self.market_pnl.pop(old, None)
+
+    def book(self, ticker: str, net: float) -> None:
+        self.market_pnl[ticker] = self.market_pnl.get(ticker, 0.0) + net
+
+    def entries_allowed(self, ticker: str, max_entries: int, free_entries: int) -> bool:
+        """Re-entry policy: the first ``free_entries`` need only a signal; beyond
+        that, and up to ``max_entries``, the market must be in profit so far."""
+        made = self.entries.get(ticker, 0)
+        if made >= max_entries:
+            return False
+        if made < free_entries:
+            return True
+        return self.market_pnl.get(ticker, 0.0) > 0
 
 
 @dataclass
@@ -416,7 +439,9 @@ class DemoLoop:
     def _pick_market(self, name: str, ss: SeriesState, now: float) -> Market | None:
         candidates = []
         for m in self.client.get_markets(series_ticker=name, status="open"):
-            if m.ticker in ss.seen_tickers or m.close_time is None:
+            if m.close_time is None:
+                continue
+            if not ss.entries_allowed(m.ticker, self.cfg.max_entries, self.cfg.free_entries):
                 continue
             ttc = m.seconds_to_close(datetime.fromtimestamp(now, tz=UTC))
             if ttc is None or ttc < self.cfg.min_ttc:
@@ -542,6 +567,7 @@ class DemoLoop:
         )
         del s.history[:-200]
         ss = s.for_series(name)
+        ss.book(trade.ticker, net)
         remaining = trade.filled_count - sold
         if remaining > 0.001:
             trade.filled_count = remaining
@@ -645,6 +671,7 @@ class DemoLoop:
             }
         )
         del s.history[:-200]
+        ss.book(trade.ticker, net)
         ss.open = None
         s.save(self.cfg.state_file)
         log.info(

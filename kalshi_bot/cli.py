@@ -452,6 +452,8 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         exit_margin=args.exit_margin,
         take_profit=args.take_profit,
         stop_loss=args.stop_loss,
+        max_entries=args.max_entries,
+        free_entries=args.free_entries,
     )
     try:
         cfg.validate()
@@ -959,6 +961,19 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         type=float,
         default=0.0,
         help="alternate: sell when the bid is this far below entry (dollars; 0 = off)",
+    )
+    s.add_argument(
+        "--max-entries",
+        type=int,
+        default=6,
+        help="entries per 15-minute market; a re-entry needs the previous position sold and "
+        "a fresh signal (default 6, 1 = one entry only)",
+    )
+    s.add_argument(
+        "--free-entries",
+        type=int,
+        default=2,
+        help="entries beyond this in one market require that market to be in profit so far",
     )
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
