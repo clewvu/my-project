@@ -506,8 +506,13 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Stops at -${cfg.loss_cap:.2f} realised loss {gain}.")
     print(f"Stop any time: Ctrl-C, the file {cfg.stop_file}, or the dashboard button.")
     print("=" * 72)
-    if balance < cfg.loss_cap:
-        sys.exit(f"balance ${balance:,.2f} is below the loss cap; nothing to protect")
+    from .demo_loop import LoopState
+
+    so_far = LoopState.load(cfg.state_file).realized_pnl
+    remaining = cfg.loss_cap + so_far  # realised P&L is negative when losing
+    print(f"Realised so far {so_far:+.2f}; ${max(remaining, 0):,.2f} more loss until the cap.")
+    if remaining > balance:
+        print(f"Note: the balance (${balance:,.2f}) would run out before the cap does.")
     if bal.breakdown:
         print("Balance by exchange shard: " + _shards_text(bal))
         print("Markets trade on: " + ", ".join(f"{k}: shard {v}" for k, v in shards.items()))
