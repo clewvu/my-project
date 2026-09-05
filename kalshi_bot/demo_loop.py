@@ -70,6 +70,22 @@ class RefusedProduction(Exception):
     """The demo loop was pointed at production."""
 
 
+def price_tick(price: float) -> float:
+    """Kalshi's grid: 0.001 below 10c and above 90c, 0.01 in between."""
+    return 0.01 if 0.10 <= price < 0.90 else 0.001
+
+
+def maker_price(bid: float | None, ask: float) -> float | None:
+    """One tick inside the spread on our side, or None when there is no room
+    (no bid, or bid + tick would reach the ask: then just take)."""
+    if bid is None:
+        return None
+    candidate = round(bid + price_tick(bid), 4)
+    if candidate >= ask - 1e-9:
+        return None
+    return candidate
+
+
 @dataclass
 class LoopConfig:
     series: tuple[str, ...] = DEFAULT_SERIES
@@ -99,10 +115,14 @@ class LoopConfig:
     risk_fraction: float | None = None  # of bankroll per trade; None = the learning loop's
     max_dollars: float = 20.0  # ceiling per trade under fixed-fraction sizing
     bankroll_refresh_s: float = 300.0
+    entry: str = "taker"  # taker: pay the ask. maker: rest one tick inside, then take
+    maker_wait_s: float = 20.0  # how long a maker order may rest before the taker fallback
 
     def validate(self) -> None:
         if self.max_entries < 1 or self.free_entries < 1:
             raise ValueError("max_entries and free_entries must be at least 1")
+        if self.entry not in ("taker", "maker"):
+            raise ValueError("entry must be taker or maker")
         if self.strategy not in ("alternate", "fairvalue"):
             raise ValueError("strategy must be alternate or fairvalue")
         if self.margin < 0 or self.vol_window < 300:
@@ -148,6 +168,8 @@ class OpenTrade:
     simulated: bool = False
     prev_side: str | None = None  # the series' last_side before this entry, for undo
     fee_paid: float | None = None  # exchange-reported fees on the fills, when available
+    maker: bool = False  # resting one tick inside the spread rather than taking the ask
+    taker_price: float | None = None  # the ask at the signal, for the taker fallback
 
     @property
     def filled(self) -> bool:
@@ -423,28 +445,36 @@ class DemoLoop:
             price, getattr(self.strategy, "size_scale", 1.0), dollars=self.trade_dollars(market)
         )
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
+        post_price, maker = price, False
+        if self.cfg.entry == "maker":
+            bid = market.yes_bid if side == "yes" else market.no_bid
+            inside = maker_price(bid, price)
+            if inside is not None:
+                post_price, maker = inside, True
         order = self.client.create_order(
             market.ticker,
             side=side,
             action="buy",
             count=count,
-            price=price,
+            price=post_price,
             order_type="limit",
         )
         trade = OpenTrade(
             ticker=market.ticker,
             side=side,
             count=count,
-            limit_price=price,
+            limit_price=post_price,
             order_id=None if isinstance(order, DryRunOrder) else order.order_id,
             close_ts=close_ts,
             placed_ts=now,
             simulated=isinstance(order, DryRunOrder),
             prev_side=ss.last_side,
+            maker=maker,
+            taker_price=price,
         )
         if trade.simulated:
             trade.filled_count = float(count)
-            trade.fill_price = price
+            trade.fill_price = post_price
         ss.open = trade
         ss.last_side = side
         ss.note_ticker(market.ticker)
@@ -460,13 +490,14 @@ class DemoLoop:
             order_id=trade.order_id,
         )
         log.info(
-            "%sbuy %s x%d %s at %.3f (~$%.2f, %s): %s",
+            "%sbuy %s x%d %s at %.3f%s (~$%.2f, %s): %s",
             "REAL MONEY: " if self.live else "",
             side,
             count,
             market.ticker,
-            price,
-            count * price,
+            post_price,
+            f" (maker; ask {price:.3f})" if maker else "",
+            count * post_price,
             "simulated" if trade.simulated else f"order {trade.order_id}",
             outcome.reason,
         )
@@ -503,6 +534,14 @@ class DemoLoop:
             return
         self._refresh_fills(trade)
         if trade.filled:
+            if trade.filled_count + 0.001 < trade.count and trade.order_id is not None:
+                # partial fill: cancel the resting remainder so nothing lingers
+                try:
+                    self.client.cancel_order(trade.order_id, ticker=trade.ticker)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("cancel remainder of %s failed: %s", trade.order_id, exc)
+                self._refresh_fills(trade)
+                trade.count = int(round(trade.filled_count))
             self.state.save(self.cfg.state_file)
             log.info(
                 "filled %s x%.0f %s at %.3f",
@@ -514,6 +553,65 @@ class DemoLoop:
             return
         if now >= trade.close_ts - self.cfg.min_ttc:
             self._cancel_open(name, "unfilled inside the no-entry window")
+            return
+        if trade.maker and now - trade.placed_ts >= self.cfg.maker_wait_s:
+            self._maker_to_taker(name, trade, now)
+
+    def _maker_to_taker(self, name: str, trade: OpenTrade, now: float) -> None:
+        """A maker order has rested long enough: cancel it and, if the strategy
+        still wants the trade, take the current ask instead."""
+        ss = self.state.for_series(name)
+        if trade.order_id is not None:
+            try:
+                self.client.cancel_order(trade.order_id, ticker=trade.ticker)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("cancel maker %s failed: %s", trade.order_id, exc)
+            self._refresh_fills(trade)
+            if trade.filled:
+                log.info("maker order %s filled before cancel; holding", trade.order_id)
+                trade.count = int(round(trade.filled_count))
+                self.state.save(self.cfg.state_file)
+                return
+        try:
+            market = self.client.get_market(trade.ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("quote for %s failed: %s", trade.ticker, exc)
+            self._drop_unfilled(name, ss)
+            return
+        outcome = self.strategy.signal(market, trade.prev_side, now)
+        if isinstance(outcome, Skip) or outcome.side != trade.side:
+            log.info(
+                "maker %s on %s unfilled and the signal is gone; dropping", trade.side, trade.ticker
+            )
+            self._drop_unfilled(name, ss)
+            return
+        order = self.client.create_order(
+            trade.ticker,
+            side=trade.side,
+            action="buy",
+            count=trade.count,
+            price=outcome.price,
+            order_type="limit",
+        )
+        trade.maker = False
+        trade.limit_price = outcome.price
+        trade.placed_ts = now
+        trade.order_id = None if isinstance(order, DryRunOrder) else order.order_id
+        trade.simulated = isinstance(order, DryRunOrder)
+        if trade.simulated:
+            trade.filled_count = float(trade.count)
+            trade.fill_price = outcome.price
+        self.state.save(self.cfg.state_file)
+        log.info(
+            "%smaker unfilled after %.0fs; taking %s x%d %s at %.3f (%s)",
+            "REAL MONEY: " if self.live else "",
+            self.cfg.maker_wait_s,
+            trade.side,
+            trade.count,
+            trade.ticker,
+            outcome.price,
+            "simulated" if trade.simulated else f"order {trade.order_id}",
+        )
 
     def _maybe_exit(self, name: str, trade: OpenTrade, now: float) -> None:
         """Ask the strategy whether to sell the filled position now, and do it."""

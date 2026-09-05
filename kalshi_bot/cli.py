@@ -456,6 +456,8 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         free_entries=args.free_entries,
         risk_fraction=args.risk_fraction,
         max_dollars=args.max_dollars,
+        entry=args.entry,
+        maker_wait_s=args.maker_wait,
     )
     try:
         cfg.validate()
@@ -990,6 +992,14 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         default=20.0,
         help="ceiling per trade under fixed-fraction sizing (default 20)",
     )
+    s.add_argument(
+        "--entry",
+        choices=["maker", "taker"],
+        default="maker",
+        help="maker: rest one tick inside the spread, then take after --maker-wait seconds "
+        "if unfilled (saves the spread and usually the fee). taker: pay the ask at once",
+    )
+    s.add_argument("--maker-wait", type=float, default=20.0, help="seconds a maker order may rest")
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--status", action="store_true", help="print the saved state and exit")

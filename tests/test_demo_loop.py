@@ -338,6 +338,107 @@ def test_loop_sells_when_the_strategy_says_exit(tmp_path):
     assert loop2.state.history[-1]["result"] == "no"
 
 
+def test_maker_price_grid():
+    from kalshi_bot.demo_loop import maker_price, price_tick
+
+    assert price_tick(0.55) == 0.01 and price_tick(0.05) == 0.001 and price_tick(0.95) == 0.001
+    assert maker_price(0.54, 0.56) == 0.55  # room for one tick inside
+    assert maker_price(0.55, 0.56) is None  # bid + tick reaches the ask: take
+    assert maker_price(None, 0.56) is None
+    assert maker_price(0.050, 0.053) == 0.051
+
+
+def _maker_loop(tmp_path, client, **cfg_kw):
+    from kalshi_bot.strategy import Signal
+
+    class Always:
+        name = "always"
+        size_scale = 1.0
+
+        def prepare(self, now):
+            pass
+
+        def signal(self, market, last_side, now):
+            return Signal(side="yes", price=market.yes_ask, reason="in")
+
+        def exit(self, market, side, entry_price, now):
+            return None
+
+    cfg = LoopConfig(
+        interval=1.0,
+        series=("KXBTC15M",),
+        dollars=2.0,
+        entry="maker",
+        maker_wait_s=20.0,
+        stop_file=tmp_path / "STOP",
+        state_file=tmp_path / f"m{id(client)}.json",
+        decision_log=None,
+        spot_db=None,
+        loss_cap=100,
+        profit_target=None,
+        max_trades=1,
+        **cfg_kw,
+    )
+
+    def sleep(s):
+        client.now += 10.0
+
+    return DemoLoop(client, cfg, clock=lambda: client.now, sleep=sleep, strategy=Always())
+
+
+def test_maker_entry_rests_inside_the_spread_and_fills(tmp_path):
+    client = FakeClient({0: "yes"})  # bid 0.54, ask 0.55 -> bid + tick reaches the ask: takes
+    loop = _maker_loop(tmp_path, client)
+    loop.run(max_ticks=3)
+    assert client.orders[0]["price"] == 0.55 and loop.state.open_trades[0][1].maker is False
+    client2 = FakeClient({0: "yes"}, asks={0: {"yes_ask": 0.58}})  # bid 0.57? no: bid = ask-0.01
+    # widen the spread: bid 0.55, ask 0.58 -> rest at 0.56
+    client2.get_markets = lambda **kw: [
+        Market.from_dict(
+            {
+                "ticker": "KXBTC15M-0",
+                "series_ticker": "KXBTC15M",
+                "status": "open",
+                "close_time": T0 + 900,
+                "yes_ask_dollars": "0.580",
+                "yes_bid_dollars": "0.550",
+                "no_ask_dollars": "0.450",
+                "no_bid_dollars": "0.420",
+            }
+        )
+    ]
+    loop2 = _maker_loop(tmp_path, client2)
+    loop2.run(max_ticks=3)
+    o = client2.orders[0]
+    assert o["price"] == 0.56 and o["count"] == 3  # $2 / 0.56
+    t = loop2.state.open_trades[0][1]
+    assert t.maker and t.taker_price == 0.58 and t.filled and t.fill_price == 0.56
+
+
+def test_maker_falls_back_to_taker_after_the_wait(tmp_path):
+    client = FakeClient({0: "yes"}, fill=False)
+    wide = Market.from_dict(
+        {
+            "ticker": "KXBTC15M-0",
+            "series_ticker": "KXBTC15M",
+            "status": "open",
+            "close_time": T0 + 900,
+            "yes_ask_dollars": "0.580",
+            "yes_bid_dollars": "0.550",
+            "no_ask_dollars": "0.450",
+            "no_bid_dollars": "0.420",
+        }
+    )
+    client.get_markets = lambda **kw: [wide]
+    client.get_market = lambda ticker: wide
+    loop = _maker_loop(tmp_path, client)
+    loop.run(max_ticks=4)  # 0, 10, 20, 30 s: the maker order is 20 s old at tick 3
+    assert [o["price"] for o in client.orders] == [0.56, 0.58]
+    assert client.cancelled == ["o1"]
+    t = loop.state.open_trades[0][1]
+    assert t.maker is False and t.limit_price == 0.58 and t.order_id == "o2"
+
+
 def test_fixed_fraction_sizing_uses_the_shard_balance(tmp_path):
     from kalshi_bot.models import Balance
     from kalshi_bot.strategy import Signal
