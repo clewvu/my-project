@@ -1,11 +1,11 @@
-"""Demo-only alternating trader.
+"""The trading loop: one entry per market per series, hold to settlement.
 
-A deliberately dumb strategy for exercising the order path on Kalshi's demo
-(paper money) exchange: for each configured series (BTC and DOGE 15-minute
-markets by default) it buys one side of each successive market, alternating
-YES ("up") and NO ("down") per series, holds to settlement, and books the
-result. It exists to test plumbing, not to make money; the research modules
-decide whether anything has an edge.
+The loop asks a strategy (``kalshi_bot.strategy``) which side to buy, if
+any, in each open market of each configured series (BTC and DOGE 15-minute
+markets by default), sizes the order, places it, tracks the fill, books the
+settlement, and enforces the caps. ``alternate`` buys YES then NO on
+successive markets and exists to test plumbing; ``fairvalue`` is the model
+from the research brief and stays out unless it sees an edge over the fee.
 
 Sizing and bounds
 -----------------
@@ -56,6 +56,7 @@ from typing import Any
 from .client import DryRunOrder, KalshiClient
 from .fees import order_fee
 from .models import Market
+from .strategy import DecisionLog, Skip, Strategy, build_strategy
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +84,17 @@ class LoopConfig:
     first_side: str = "yes"
     stop_file: Path = Path("state/STOP")
     state_file: Path = Path("state/demo_loop.json")
+    strategy: str = "alternate"  # alternate | fairvalue
+    margin: float = 0.02  # fairvalue: edge required beyond the fee, dollars
+    vol_window: float = 1800.0  # fairvalue: seconds of spot history behind sigma
+    spot_db: Path | None = Path("state/market_data.sqlite")  # seeds spot history if present
+    decision_log: Path | None = Path("state/decisions.jsonl")
 
     def validate(self) -> None:
+        if self.strategy not in ("alternate", "fairvalue"):
+            raise ValueError("strategy must be alternate or fairvalue")
+        if self.margin < 0 or self.vol_window < 300:
+            raise ValueError("margin must be >= 0 and vol_window at least 300 seconds")
         if not self.series:
             raise ValueError("at least one series is required")
         if self.contracts < 1:
@@ -222,6 +232,7 @@ class DemoLoop:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         allow_production: bool = False,
+        strategy: Strategy | None = None,
     ) -> None:
         if client.is_prod and not allow_production:
             raise RefusedProduction("the demo loop only runs against the demo exchange")
@@ -245,6 +256,21 @@ class DemoLoop:
         self.clock = clock
         self.sleep = sleep
         self._last_skip: dict[str, tuple[str, str]] = {}
+        self.strategy: Strategy = strategy or build_strategy(
+            config.strategy,
+            first_side=config.first_side,
+            max_price=config.max_price,
+            margin=config.margin,
+            vol_window_s=config.vol_window,
+            spot_db=config.spot_db,
+            series=config.series,
+            now=clock(),
+        )
+        self.decisions = DecisionLog(config.decision_log)
+        self.state.config["strategy"] = self.strategy.name
+        if config.strategy == "fairvalue":
+            self.state.config["margin"] = config.margin
+            self.state.config["vol_window"] = config.vol_window
 
     # ------------------------------------------------------------------ run
 
@@ -281,6 +307,7 @@ class DemoLoop:
         now = self.clock()
         self.state.last_tick_ts = now
         self.state.stopped = None
+        self.strategy.prepare(now)
         for name in self.cfg.series:
             if self.state.for_series(name).open is not None:
                 self._settle_if_closed(name, now)
@@ -317,16 +344,14 @@ class DemoLoop:
         market = self._pick_market(name, ss, now)
         if market is None:
             return
-        side = ss.next_side(self.cfg.first_side)
-        price = market.yes_ask if side == "yes" else market.no_ask
-        if price is None:
-            self._skip(name, market.ticker, f"no {side} ask")
-            return
-        if price > self.cfg.max_price:
-            self._skip(
-                name, market.ticker, f"{side} ask {price:.3f} above max_price {self.cfg.max_price}"
+        outcome = self.strategy.signal(market, ss.last_side, now)
+        if isinstance(outcome, Skip):
+            self._skip(name, market.ticker, outcome.reason)
+            self.decisions.record(
+                now=now, strategy=self.strategy.name, series=name, market=market, outcome=outcome
             )
             return
+        side, price = outcome.side, outcome.price
         count = self.cfg.size(price)
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
         order = self.client.create_order(
@@ -356,8 +381,17 @@ class DemoLoop:
         ss.note_ticker(market.ticker)
         self.state.trades += 1
         self.state.save(self.cfg.state_file)
+        self.decisions.record(
+            now=now,
+            strategy=self.strategy.name,
+            series=name,
+            market=market,
+            outcome=outcome,
+            count=count,
+            order_id=trade.order_id,
+        )
         log.info(
-            "%sbuy %s x%d %s at %.3f (~$%.2f, %s)",
+            "%sbuy %s x%d %s at %.3f (~$%.2f, %s): %s",
             "REAL MONEY: " if self.live else "",
             side,
             count,
@@ -365,6 +399,7 @@ class DemoLoop:
             price,
             count * price,
             "simulated" if trade.simulated else f"order {trade.order_id}",
+            outcome.reason,
         )
 
     def _pick_market(self, name: str, ss: SeriesState, now: float) -> Market | None:

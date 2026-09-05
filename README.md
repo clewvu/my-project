@@ -234,6 +234,29 @@ for unattended runs). The command prints your balance and the expected fee
 drag first. State goes to `state/live_loop.json`; the stop file and the
 dashboard button work the same way.
 
+### Strategies: `--strategy alternate | fairvalue`
+
+`kalshi_bot/strategy.py` separates *what to buy* from the loop's plumbing.
+`alternate` is the coin-flip test above. `fairvalue` runs the research
+brief's model live: Coinbase spot every tick, realised volatility over the
+last 30 minutes (seeded from the recorder's database at start when it
+exists, so there is no warm-up), fair value `Phi(ln(S/K) / (sigma sqrt(tau)))`,
+and a trade only when a side's fair value beats its ask by the taker fee
+plus `--margin` (default 2 cents). Guards: spot older than 10 seconds, too
+little history for volatility, or an ask above `--max-price` all mean no
+trade. Most markets are skipped; that is the design.
+
+```bash
+kalshi-bot --env prod live-trade --strategy fairvalue --margin 0.03 --dollars 5 --loss-cap 50 --profit-target 0 --real-money
+```
+
+Every decision, trade or skip, is appended to `state/decisions.jsonl`
+with the strategy's inputs (spot, strike, sigma, seconds to close, both asks,
+model probability, edges). Judge the model against what settled by joining
+that file with the recorder's `markets` table. Its edge is unproven until
+`kalshi-bot fairvalue` on recorded data says VIABLE; until then treat a live
+fair-value run as a paid experiment.
+
 ## Development
 
 ```bash

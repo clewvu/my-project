@@ -284,9 +284,20 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    estimator before reading anything else. Possible causes: WebSocket ticks
    with sub-5-second gaps are fine, but a stalled feed forward-fills zeros
    into the returns.
-4. Only if a test passes: phase 4 (risk engine, decision log / feature
-   store, strategy interface), then demo, then live at minimum size.
-5. Fold the section 6 review into docs/research-brief.md when phase 4 starts.
+4. Phase 4 has started early at Cameron's request (2026-09-05): the
+   strategy interface and the decision log / feature store exist
+   (`kalshi_bot/strategy.py`, `state/decisions.jsonl`), and the fair-value
+   model can run live with `--strategy fairvalue`. Still to build from the
+   risk section: persisted daily loss cap with manual reset (the loop's cap
+   is per run-state), consecutive-loss breaker, reconciliation against
+   exchange positions, Telegram kill switch and heartbeat. The live
+   fair-value run has no verdict behind it yet; the pre-registered gate is
+   still `kalshi-bot fairvalue` on recorded data. Use the decision log to
+   compare the live model's p_yes with settlements as a second check.
+5. Fold the section 6 review into docs/research-brief.md now that phase 4
+   has started.
+6. Cameron's current live settings (2026-09-05): $5 per trade, $50 loss
+   cap, no profit cap, balance about $140 after a $100 deposit.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

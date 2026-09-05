@@ -403,6 +403,11 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         first_side=args.first_side,
         stop_file=Path(args.stop_file),
         state_file=Path(args.state_file),
+        strategy=args.strategy,
+        margin=args.margin,
+        vol_window=args.vol_window,
+        spot_db=Path(args.spot_db) if args.spot_db else None,
+        decision_log=Path(args.decision_log) if args.decision_log else None,
     )
     try:
         cfg.validate()
@@ -497,8 +502,15 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     fee = fee_per_contract(0.5)
     per_trade = max(1, int(cfg.dollars / 0.5)) * fee
     print("=" * 72)
-    print("REAL MONEY. This strategy alternates YES/NO with no edge; its expected")
-    print(f"result is minus the fee, about ${per_trade:.2f} per trade at 50c, before the spread.")
+    if cfg.strategy == "fairvalue":
+        print("REAL MONEY. Strategy: fair value. Trades only when the model's probability")
+        print(f"beats the ask by the fee plus {cfg.margin:.2f}; most markets will be skipped.")
+        print("Its edge is unproven until the recorded data says otherwise (kalshi-bot fairvalue).")
+    else:
+        print("REAL MONEY. This strategy alternates YES/NO with no edge; its expected")
+        print(
+            f"result is minus the fee, about ${per_trade:.2f} per trade at 50c, before the spread."
+        )
     print(f"Balance ${balance:,.2f}. Per trade ~${cfg.dollars:.2f} on {', '.join(cfg.series)}.")
     gain = "(no profit cap)"
     if cfg.profit_target is not None:
@@ -842,6 +854,32 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
     )
     s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
     s.add_argument("--first-side", choices=["yes", "no"], default="yes")
+    s.add_argument(
+        "--strategy",
+        choices=["alternate", "fairvalue"],
+        default="alternate",
+        help="alternate: YES/NO in turn (no edge). fairvalue: the research brief's model; "
+        "trades only when fair value beats the ask by the fee plus --margin",
+    )
+    s.add_argument(
+        "--margin", type=float, default=0.02, help="fairvalue: required edge beyond the fee"
+    )
+    s.add_argument(
+        "--vol-window",
+        type=float,
+        default=1800.0,
+        help="fairvalue: seconds of spot history behind the volatility estimate",
+    )
+    s.add_argument(
+        "--spot-db",
+        default="state/market_data.sqlite",
+        help="recorder database used to seed spot history at start ('' to skip)",
+    )
+    s.add_argument(
+        "--decision-log",
+        default="state/decisions.jsonl",
+        help="where every decision and its inputs are appended ('' to disable)",
+    )
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--status", action="store_true", help="print the saved state and exit")

@@ -114,6 +114,8 @@ class FakeClient:
 
 def make(tmp_path, client, **cfg_kw):
     cfg_kw.setdefault("series", tuple(client.series))
+    cfg_kw.setdefault("decision_log", tmp_path / "decisions.jsonl")
+    cfg_kw.setdefault("spot_db", None)
     cfg = LoopConfig(
         interval=1.0,
         stop_file=tmp_path / "STOP",
@@ -274,6 +276,59 @@ def test_dry_run_simulates_fill(tmp_path):
     assert loop.run().startswith("max trades")
     assert loop.state.trades == 1 and loop.state.losses == 1
     assert loop.state.history[0]["price"] == 0.55 and loop.state.config["env"] == "dry-run"
+
+
+def test_loop_uses_the_strategy_and_logs_decisions(tmp_path):
+    from kalshi_bot.strategy import Signal, Skip
+
+    class PickyStrategy:
+        name = "picky"
+
+        def __init__(self):
+            self.prepared = 0
+
+        def prepare(self, now):
+            self.prepared += 1
+
+        def signal(self, market, last_side, now):
+            if market.ticker.endswith("-0"):
+                return Skip("waiting for window 1", inputs={"p_yes": 0.5})
+            return Signal(side="no", price=market.no_ask, reason="model says no", edge=0.07)
+
+    client = FakeClient({0: "yes", 1: "no"})
+    strat = PickyStrategy()
+    cfg = LoopConfig(
+        interval=1.0,
+        series=("KXBTC15M",),
+        stop_file=tmp_path / "STOP",
+        state_file=tmp_path / "state.json",
+        decision_log=tmp_path / "decisions.jsonl",
+        spot_db=None,
+        loss_cap=100,
+        profit_target=None,
+        max_trades=1,
+    )
+
+    def sleep(s):
+        client.now += 60.0
+
+    loop = DemoLoop(client, cfg, clock=lambda: client.now, sleep=sleep, strategy=strat)
+    assert loop.run().startswith("max trades")
+    assert strat.prepared > 0
+    assert [o["ticker"] for o in client.orders] == ["KXBTC15M-1"]
+    assert client.orders[0]["side"] == "no" and loop.state.wins == 1
+    rows = [json.loads(line) for line in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    assert [r["action"] for r in rows] == ["skip", "trade"]
+    assert rows[1]["reason"] == "model says no" and rows[1]["count"] == 1
+    assert loop.state.config["strategy"] == "picky"
+
+
+def test_fairvalue_config_validation(tmp_path):
+    with pytest.raises(ValueError):
+        LoopConfig(strategy="magic").validate()
+    with pytest.raises(ValueError):
+        LoopConfig(strategy="fairvalue", vol_window=10).validate()
+    LoopConfig(strategy="fairvalue").validate()
 
 
 def test_settlement_waits_for_result(tmp_path):
