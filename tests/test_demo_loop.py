@@ -434,7 +434,7 @@ def _get(server, path, method="GET"):
 def test_dashboard_serves_page_and_state(dashboard):
     server, tmp_path = dashboard
     status, body = _get(server, "/")
-    assert status == 200 and b"Kalshi demo loop" in body
+    assert status == 200 and b"Kalshi 15-minute desk" in body
     status, body = _get(server, "/api/state")
     data = json.loads(body)
     assert data["state"] is None and data["alive"] is False and not data["stop_file_present"]

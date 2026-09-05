@@ -42,4 +42,4 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "W"]
 
 [tool.ruff.lint.per-file-ignores]
-"kalshi_bot/demo_ui.py" = ["E501"]  # embedded HTML/JS page
+"kalshi_bot/dashboard_page.py" = ["E501"]  # embedded HTML/JS page
