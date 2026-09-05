@@ -292,6 +292,7 @@ class FairValueStrategy:
         self.calib_a = 0.0
         self.calib_b = 1.0
         self.size_scale = 1.0
+        self.risk_fraction = 0.0  # of bankroll per trade, from the learning loop; 0 = off
         self.halt = False
         self.halt_note = ""
         self.exit_margin = exit_margin  # sell when the bid beats model value by this, after fees
@@ -323,6 +324,7 @@ class FairValueStrategy:
         self.calib_a = float(params.calib_a)
         self.calib_b = float(params.calib_b)
         self.size_scale = float(min(1.0, max(0.0, params.size_scale)))
+        self.risk_fraction = float(max(0.0, params.risk_fraction))
         self.halt = bool(params.halt)
         self.halt_note = params.note if params.halt else ""
         log.info(

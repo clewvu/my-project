@@ -96,6 +96,9 @@ class LoopConfig:
     stop_loss: float = 0.0  # alternate: sell when the bid is this far below entry (0 = off)
     max_entries: int = 1  # entries per market (a re-entry needs the previous one sold)
     free_entries: int = 2  # entries beyond this need the market to be in profit so far
+    risk_fraction: float | None = None  # of bankroll per trade; None = the learning loop's
+    max_dollars: float = 20.0  # ceiling per trade under fixed-fraction sizing
+    bankroll_refresh_s: float = 300.0
 
     def validate(self) -> None:
         if self.max_entries < 1 or self.free_entries < 1:
@@ -121,12 +124,14 @@ class LoopConfig:
         if self.min_ttc < 0 or self.interval <= 0:
             raise ValueError("min_ttc must be >= 0 and interval > 0")
 
-    def size(self, price: float, scale: float = 1.0) -> int:
-        """Contracts for one trade. ``scale`` (0..1) is the learning loop's only live knob."""
+    def size(self, price: float, scale: float = 1.0, dollars: float | None = None) -> int:
+        """Contracts for one trade. ``scale`` (0..1) is the learning loop's downward knob;
+        ``dollars`` overrides the configured amount (fixed-fraction sizing)."""
         scale = min(1.0, max(0.0, scale))
-        if self.dollars is None:
+        dollars = self.dollars if dollars is None else dollars
+        if dollars is None:
             return max(1, math.floor(self.contracts * scale + 1e-9))
-        return max(1, math.floor(self.dollars * scale / price + 1e-9))
+        return max(1, math.floor(dollars * scale / price + 1e-9))
 
 
 @dataclass
@@ -305,6 +310,33 @@ class DemoLoop:
         if config.strategy == "fairvalue":
             self.state.config["margin"] = config.margin
             self.state.config["vol_window"] = config.vol_window
+        self.bankroll: Any = None  # Balance, refreshed every bankroll_refresh_s
+        self._bankroll_ts: float | None = None
+
+    # ------------------------------------------------------------------ sizing
+
+    def _refresh_bankroll(self, now: float) -> None:
+        if self._bankroll_ts is not None and now - self._bankroll_ts < self.cfg.bankroll_refresh_s:
+            return
+        self._bankroll_ts = now
+        try:
+            self.bankroll = self.client.get_balance()
+        except Exception as exc:  # noqa: BLE001 - sizing falls back to --dollars
+            log.debug("balance refresh failed: %s", exc)
+
+    def trade_dollars(self, market: Market) -> float | None:
+        """Dollars for the next trade: a fraction of the bankroll on the market's
+        shard when fixed-fraction sizing is active, else the configured amount."""
+        fraction = self.cfg.risk_fraction
+        if fraction is None:
+            fraction = float(getattr(self.strategy, "risk_fraction", 0.0) or 0.0)
+        if fraction <= 0 or self.bankroll is None:
+            return self.cfg.dollars
+        available = self.bankroll.on_shard(getattr(market, "exchange_index", None))
+        dollars = available * fraction
+        if self.cfg.dollars is not None:
+            dollars = max(dollars, 0.0)
+        return round(min(self.cfg.max_dollars, dollars), 2) if dollars > 0 else self.cfg.dollars
 
     # ------------------------------------------------------------------ run
 
@@ -342,6 +374,7 @@ class DemoLoop:
         self.state.last_tick_ts = now
         self.state.stopped = None
         self.strategy.prepare(now)
+        self._refresh_bankroll(now)
         for name in self.cfg.series:
             if self.state.for_series(name).open is not None:
                 self._settle_if_closed(name, now)
@@ -386,7 +419,9 @@ class DemoLoop:
             )
             return
         side, price = outcome.side, outcome.price
-        count = self.cfg.size(price, getattr(self.strategy, "size_scale", 1.0))
+        count = self.cfg.size(
+            price, getattr(self.strategy, "size_scale", 1.0), dollars=self.trade_dollars(market)
+        )
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
         order = self.client.create_order(
             market.ticker,

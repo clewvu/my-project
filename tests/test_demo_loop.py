@@ -338,6 +338,77 @@ def test_loop_sells_when_the_strategy_says_exit(tmp_path):
     assert loop2.state.history[-1]["result"] == "no"
 
 
+def test_fixed_fraction_sizing_uses_the_shard_balance(tmp_path):
+    from kalshi_bot.models import Balance
+    from kalshi_bot.strategy import Signal
+
+    class Sized:
+        name = "sized"
+        size_scale = 1.0
+        risk_fraction = 0.02  # as the learning loop would set it
+
+        def prepare(self, now):
+            pass
+
+        def signal(self, market, last_side, now):
+            return Signal(side="yes", price=market.yes_ask, reason="in")
+
+    client = FakeClient({0: "yes"})
+    client.get_balance = lambda: Balance(balance=1000.0, breakdown={0: 500.0, 2: 500.0})
+    cfg = LoopConfig(
+        interval=1.0,
+        series=("KXBTC15M",),
+        dollars=5.0,
+        max_dollars=20.0,
+        stop_file=tmp_path / "STOP",
+        state_file=tmp_path / "s.json",
+        decision_log=None,
+        spot_db=None,
+        loss_cap=100,
+        profit_target=None,
+        max_trades=1,
+    )
+    loop = DemoLoop(client, cfg, clock=lambda: client.now, sleep=lambda s: None, strategy=Sized())
+    loop.run(max_ticks=2)
+    # no exchange_index on the fake market -> total balance 1000 x 2% = $20 -> 36 contracts at 0.55
+    assert client.orders[0]["count"] == 36
+    # the ceiling applies
+    client2 = FakeClient({0: "yes"})
+    client2.get_balance = lambda: Balance(balance=100000.0)
+    loop2 = DemoLoop(
+        client2,
+        dataclasses.replace(cfg, state_file=tmp_path / "s2.json"),
+        clock=lambda: client2.now,
+        sleep=lambda s: None,
+        strategy=Sized(),
+    )
+    loop2.run(max_ticks=2)
+    assert client2.orders[0]["count"] == 36  # $20 cap / 0.55
+    # --risk-fraction on the command line overrides the strategy's, and 0 means --dollars
+    client3 = FakeClient({0: "yes"})
+    client3.get_balance = lambda: Balance(balance=1000.0)
+    loop3 = DemoLoop(
+        client3,
+        dataclasses.replace(cfg, state_file=tmp_path / "s3.json", risk_fraction=0.0),
+        clock=lambda: client3.now,
+        sleep=lambda s: None,
+        strategy=Sized(),
+    )
+    loop3.run(max_ticks=2)
+    assert client3.orders[0]["count"] == 9  # $5 / 0.55
+    # balance unavailable -> --dollars
+    client4 = FakeClient({0: "yes"})
+    loop4 = DemoLoop(
+        client4,
+        dataclasses.replace(cfg, state_file=tmp_path / "s4.json"),
+        clock=lambda: client4.now,
+        sleep=lambda s: None,
+        strategy=Sized(),
+    )
+    loop4.run(max_ticks=2)
+    assert client4.orders[0]["count"] == 9
+
+
 def _reentry_loop(tmp_path, client, strategy, **cfg_kw):
     cfg = LoopConfig(
         interval=1.0,

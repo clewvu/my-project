@@ -52,6 +52,28 @@ MIN_LIVE_TRADES_FOR_DRIFT = 30
 DRIFT_Z_SHRINK = -2.0  # realised wins this many standard errors below expected: halve size
 DRIFT_Z_HALT = -3.0  # this far below: stop trading until the next healthy cycle
 MIN_SIZE_SCALE = 0.25
+KELLY_FRACTION = 0.25  # quarter Kelly: the estimate is noisy, full Kelly ruins real edges too
+MAX_RISK_FRACTION = 0.05  # never more than 5% of the bankroll on one trade
+DRAWDOWN_SHRINK = (
+    0.5  # drawdown from peak realised P&L, as a share of the loss cap, that halves size
+)
+
+
+def kelly_fraction(
+    win_rate: float, avg_ask: float, fee_rate: float = 0.07, quarter: float = KELLY_FRACTION
+) -> float:
+    """Fraction of bankroll to stake per trade for a binary contract.
+
+    Buying at q with win probability p, full Kelly is (p - q) / (1 - q) of the
+    bankroll (fees folded into q). Returned scaled by ``quarter`` and capped.
+    """
+    if not (0 < avg_ask < 1) or not (0 <= win_rate <= 1):
+        return 0.0
+    q = avg_ask + fee_rate * avg_ask * (1 - avg_ask)
+    if q >= 1:
+        return 0.0
+    full = (win_rate - q) / (1 - q)
+    return float(min(MAX_RISK_FRACTION, max(0.0, full * quarter)))
 
 
 # ---------------------------------------------------------------- parameters
@@ -64,6 +86,7 @@ class Params:
     calib_a: float = 0.0  # Platt intercept
     calib_b: float = 1.0  # Platt slope
     size_scale: float = 1.0
+    risk_fraction: float = 0.0  # of bankroll per trade; 0 = use the loop's --dollars
     halt: bool = False
     updated: float | None = None
     source: str = "defaults"
@@ -256,6 +279,7 @@ def retrain(
         calib_a=cand.calib_a,
         calib_b=cand.calib_b,
         size_scale=incumbent.size_scale if incumbent else 1.0,
+        risk_fraction=kelly_fraction(cand.held_out["win_rate"], cand.held_out["avg_ask"]),
         halt=False,
         updated=time.time(),
         source="retrain",
@@ -372,6 +396,34 @@ def apply_drift(params: Params, drift: dict[str, Any]) -> Params:
     return params
 
 
+def drawdown_check(state_path: str | Path | None) -> dict[str, Any]:
+    """Drawdown of realised P&L from its running peak, as a share of the loss cap."""
+    if not state_path or not Path(state_path).exists():
+        return {"kind": "drawdown", "status": "insufficient"}
+    try:
+        state = json.loads(Path(state_path).read_text())
+    except (OSError, ValueError):
+        return {"kind": "drawdown", "status": "insufficient"}
+    hist = state.get("history") or []
+    loss_cap = float(((state.get("config") or {}).get("loss_cap")) or 0.0)
+    if len(hist) < 5 or loss_cap <= 0:
+        return {"kind": "drawdown", "status": "insufficient", "n": len(hist)}
+    equity, peak, worst = 0.0, 0.0, 0.0
+    for h in hist:
+        equity += float(h.get("net") or 0.0)
+        peak = max(peak, equity)
+        worst = max(worst, peak - equity)
+    share = worst / loss_cap
+    return {
+        "kind": "drawdown",
+        "n": len(hist),
+        "peak": round(peak, 2),
+        "drawdown": round(worst, 2),
+        "share_of_cap": round(share, 3),
+        "status": "shrink" if share >= DRAWDOWN_SHRINK else "ok",
+    }
+
+
 # ---------------------------------------------------------------- one cycle
 
 
@@ -393,6 +445,13 @@ def run_cycle(
         drift = drift_check(live_trades(decisions_path, live_state_path))
         record["drift"] = drift
         params = apply_drift(params, drift)
+        dd = drawdown_check(live_state_path)
+        record["drawdown"] = dd
+        if dd.get("status") == "shrink" and drift.get("status") in ("ok", "insufficient"):
+            params.size_scale = max(MIN_SIZE_SCALE, min(params.size_scale, 0.5))
+            params.note = (
+                f"size held at half on drawdown {dd['drawdown']} ({dd['share_of_cap']:.0%} of cap)"
+            )
     params.updated = time.time()
     params.save(params_path)
     record["time"] = datetime.now(UTC).isoformat(timespec="seconds")
@@ -402,6 +461,7 @@ def run_cycle(
         "calib_a": round(params.calib_a, 4),
         "calib_b": round(params.calib_b, 4),
         "size_scale": params.size_scale,
+        "risk_fraction": round(params.risk_fraction, 4),
         "halt": params.halt,
         "source": params.source,
     }
@@ -419,7 +479,7 @@ def describe(record_or_params: Params, record: dict[str, Any] | None = None) -> 
         "== active parameters",
         f"source={p.source} vol_window={p.vol_window:.0f}s margin={p.margin:.3f} "
         f"calibration=(a {p.calib_a:+.3f}, b {p.calib_b:.3f}) size_scale={p.size_scale:.2f} "
-        f"halt={p.halt}",
+        f"risk_fraction={p.risk_fraction:.3%} halt={p.halt}",
     ]
     if p.note:
         lines.append(f"note: {p.note}")

@@ -454,6 +454,8 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         stop_loss=args.stop_loss,
         max_entries=args.max_entries,
         free_entries=args.free_entries,
+        risk_fraction=args.risk_fraction,
+        max_dollars=args.max_dollars,
     )
     try:
         cfg.validate()
@@ -974,6 +976,19 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         type=int,
         default=2,
         help="entries beyond this in one market require that market to be in profit so far",
+    )
+    s.add_argument(
+        "--risk-fraction",
+        type=float,
+        default=None,
+        help="stake this fraction of the bankroll per trade (e.g. 0.02); default: whatever "
+        "the learning loop has promoted (0 until a candidate passes), else --dollars",
+    )
+    s.add_argument(
+        "--max-dollars",
+        type=float,
+        default=20.0,
+        help="ceiling per trade under fixed-fraction sizing (default 20)",
     )
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")

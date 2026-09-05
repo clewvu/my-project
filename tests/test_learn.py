@@ -33,6 +33,29 @@ def test_fit_calibration_recovers_known_shift():
     assert learn.apply_calibration(0.5, 1.0, 1.0) > 0.7
 
 
+def test_kelly_fraction():
+    # 60% win rate buying at 50c: full Kelly (0.6 - 0.5175)/(0.4825) = 0.171 -> quarter 0.043
+    assert learn.kelly_fraction(0.60, 0.50) == pytest.approx(0.0428, abs=0.002)
+    assert learn.kelly_fraction(0.90, 0.50) == learn.MAX_RISK_FRACTION  # capped
+    assert learn.kelly_fraction(0.50, 0.50) == 0.0  # no edge after fees
+    assert learn.kelly_fraction(0.40, 0.50) == 0.0  # negative edge
+    assert learn.kelly_fraction(0.60, 0.0) == 0.0 and learn.kelly_fraction(1.5, 0.5) == 0.0
+
+
+def test_drawdown_check(tmp_path):
+    assert learn.drawdown_check(None)["status"] == "insufficient"
+    s = LoopState()
+    s.config = {"loss_cap": 50.0}
+    for net in (5, 5, 5, -10, -10, -12, 2):
+        s.history.append({"net": net})
+    s.save(tmp_path / "live.json")
+    dd = learn.drawdown_check(tmp_path / "live.json")
+    assert dd["peak"] == 15 and dd["drawdown"] == 32 and dd["status"] == "shrink"
+    s.config = {"loss_cap": 500.0}
+    s.save(tmp_path / "live.json")
+    assert learn.drawdown_check(tmp_path / "live.json")["status"] == "ok"
+
+
 def test_params_roundtrip(tmp_path):
     p = learn.Params(margin=0.03, calib_a=0.1, size_scale=0.5, halt=True, note="x")
     p.save(tmp_path / "params.json")
@@ -63,6 +86,7 @@ def test_retrain_promotes_on_a_mispriced_book(stale_fv):
     assert promoted is not None and promoted.source == "retrain"
     assert promoted.vol_window in (1800.0, 3600.0) and promoted.margin >= 0
     assert promoted.halt is False and promoted.size_scale == 1.0
+    assert 0 < promoted.risk_fraction <= learn.MAX_RISK_FRACTION
     assert record["outcome"] == "promoted"
 
 
