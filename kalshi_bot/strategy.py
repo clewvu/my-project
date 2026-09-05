@@ -205,6 +205,108 @@ class SpotHistory:
         return len(rows)
 
 
+class DbSpotFeed:
+    """Spot from the recorder's database, where the WebSocket writer lands
+    every Coinbase tick, so the model sees sub-second prices instead of a
+    REST quote that can be several seconds old.
+
+    ``fetch`` returns the latest price per symbol whose row is younger than
+    ``max_age_s``; any symbol without a fresh row is asked of ``fallback``
+    (a REST feed) when one is given. ``last_source`` records where each
+    symbol's price came from on the last call.
+    """
+
+    source = "db"
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        symbols: list[str],
+        *,
+        max_age_s: float = 5.0,
+        fallback: Any = None,
+        clock: Any = time.time,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.symbols = list(symbols)
+        self.max_age_s = max_age_s
+        self.fallback = fallback
+        self.clock = clock
+        self.last_source: dict[str, str] = {}
+        self.last_age_s: dict[str, float] = {}
+        self._con: sqlite3.Connection | None = None
+        self._warned = False
+
+    def _connect(self) -> sqlite3.Connection | None:
+        if self._con is not None:
+            return self._con
+        if not self.db_path.exists():
+            return None
+        try:
+            self._con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0)
+        except sqlite3.Error as exc:
+            if not self._warned:
+                log.warning("spot database %s unavailable: %s", self.db_path, exc)
+                self._warned = True
+            return None
+        return self._con
+
+    def latest_rows(self) -> dict[str, tuple[float, float]]:
+        """{symbol: (ts, price)} for the newest row of each symbol."""
+        con = self._connect()
+        if con is None:
+            return {}
+        out: dict[str, tuple[float, float]] = {}
+        try:
+            for symbol in self.symbols:
+                row = con.execute(
+                    "SELECT ts, price FROM spot WHERE symbol = ? ORDER BY ts DESC LIMIT 1",
+                    (symbol,),
+                ).fetchone()
+                if row is not None:
+                    out[symbol] = (float(row[0]), float(row[1]))
+        except sqlite3.Error as exc:
+            log.warning("spot read from %s failed: %s", self.db_path, exc)
+            self._con = None
+        return out
+
+    def fetch(self) -> dict[str, float]:
+        now = self.clock()
+        prices: dict[str, float] = {}
+        rows = self.latest_rows()
+        missing = []
+        for symbol in self.symbols:
+            ts_price = rows.get(symbol)
+            if ts_price is not None and now - ts_price[0] <= self.max_age_s:
+                prices[symbol] = ts_price[1]
+                self.last_source[symbol] = "db"
+                self.last_age_s[symbol] = now - ts_price[0]
+            else:
+                missing.append(symbol)
+                self.last_age_s[symbol] = math.inf if ts_price is None else now - ts_price[0]
+        if missing and self.fallback is not None:
+            try:
+                fetched = self.fallback.fetch()
+            except Exception as exc:  # noqa: BLE001 - the loop tolerates a missed tick
+                log.warning("spot fallback fetch failed: %s", exc)
+                fetched = {}
+            for symbol in missing:
+                if symbol in fetched:
+                    prices[symbol] = float(fetched[symbol])
+                    self.last_source[symbol] = getattr(self.fallback, "source", "rest")
+        for symbol in self.symbols:
+            if symbol not in prices:
+                self.last_source[symbol] = "none"
+        return prices
+
+    def close(self) -> None:
+        if self._con is not None:
+            self._con.close()
+            self._con = None
+        if self.fallback is not None and hasattr(self.fallback, "close"):
+            self.fallback.close()
+
+
 # ---------------------------------------------------------------- strategies
 
 
@@ -529,6 +631,7 @@ def build_strategy(
     vol_window_s: float = 1800.0,
     spot_feed: Any = None,
     spot_db: str | Path | None = None,
+    spot_source: str = "auto",
     series: tuple[str, ...] = (),
     now: float | None = None,
     params_path: str | Path | None = None,
@@ -548,7 +651,13 @@ def build_strategy(
             from .spot import SpotFeed
 
             symbols = [SPOT_SYMBOLS[s] for s in series if s in SPOT_SYMBOLS]
-            spot_feed = SpotFeed(symbols)
+            if spot_source not in ("auto", "db", "rest"):
+                raise ValueError(f"spot_source must be auto, db or rest, not {spot_source!r}")
+            if spot_source == "rest" or spot_db is None:
+                spot_feed = SpotFeed(symbols)
+            else:
+                fallback = SpotFeed(symbols) if spot_source == "auto" else None
+                spot_feed = DbSpotFeed(spot_db, symbols, fallback=fallback)
         strat = FairValueStrategy(
             spot_feed,
             margin=margin,

@@ -24,12 +24,22 @@ Sizing and bounds
 A cap that is hit while positions are open stops new entries; the loop keeps
 running until those positions settle, then exits.
 
-Stopping
---------
+Stopping and pausing
+--------------------
 Ctrl-C, or create the stop file (``state/STOP`` by default). Both cancel
 resting orders; an already-filled position is held to settlement and booked
 on the next run. State lives in a JSON file so a restart cannot reset the
-caps. ``--reset`` clears it.
+caps. ``--reset`` clears it. The pause file (``state/PAUSE``) is softer:
+while it exists the loop keeps ticking, manages and settles what it holds,
+but opens nothing new; removing it resumes. The dashboard writes both.
+
+Reconciliation
+--------------
+Every ``reconcile_s`` seconds (and on the first tick) the loop compares its
+filled positions with the exchange's. A position on one of our series that
+the loop does not know about, or a filled trade the exchange does not
+show, is flagged; if it is still there at the next check the loop halts,
+because its P&L can no longer be trusted. Simulated fills are exempt.
 
 Safety
 ------
@@ -53,6 +63,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .alerts import AlertLog
 from .client import DryRunOrder, KalshiClient
 from .fees import order_fee
 from .models import Market
@@ -117,6 +128,10 @@ class LoopConfig:
     bankroll_refresh_s: float = 300.0
     entry: str = "taker"  # taker: pay the ask. maker: rest one tick inside, then take
     maker_wait_s: float = 20.0  # how long a maker order may rest before the taker fallback
+    pause_file: Path = Path("state/PAUSE")  # while present: no new entries, keep ticking
+    alerts_path: Path | None = Path("state/alerts.jsonl")  # the dashboard's event feed
+    reconcile_s: float = 120.0  # compare positions with the exchange this often; 0 = never
+    spot_source: str = "auto"  # fairvalue spot: auto (fresh DB tick, else REST) | db | rest
 
     def validate(self) -> None:
         if self.max_entries < 1 or self.free_entries < 1:
@@ -224,6 +239,8 @@ class LoopState:
     halted: str | None = None
     last_tick_ts: float | None = None  # heartbeat for the dashboard
     stopped: str | None = None  # why the last run ended
+    paused: bool = False  # the pause file was present at the last tick
+    reconciled_ts: float | None = None  # last successful check against the exchange
     config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
 
     @classmethod
@@ -320,6 +337,7 @@ class DemoLoop:
             margin=config.margin,
             vol_window_s=config.vol_window,
             spot_db=config.spot_db,
+            spot_source=config.spot_source,
             series=config.series,
             now=clock(),
             params_path=config.params_path,
@@ -334,6 +352,18 @@ class DemoLoop:
             self.state.config["vol_window"] = config.vol_window
         self.bankroll: Any = None  # Balance, refreshed every bankroll_refresh_s
         self._bankroll_ts: float | None = None
+        self.alerts = AlertLog(config.alerts_path)
+        self._reconcile_ts: float | None = None
+        self._mismatches: dict[str, str] = {}  # ticker -> problem seen at the last check
+        self._alert_src = "live" if self.live else self.state.config["env"]
+        per_trade = f"${config.dollars:.2f}" if config.dollars else f"{config.contracts} ct"
+        self.alerts.record(
+            "info",
+            self._alert_src,
+            f"loop started: {self.strategy.name}, {', '.join(config.series)}, "
+            f"{per_trade} per trade, loss cap ${config.loss_cap:.2f}",
+            now=clock(),
+        )
 
     # ------------------------------------------------------------------ sizing
 
@@ -385,6 +415,8 @@ class DemoLoop:
                 self._cancel_open(name, "stopping")
         self.state.stopped = reason
         self.state.save(self.cfg.state_file)
+        level = "halt" if self.state.halted or "cap" in reason else "info"
+        self.alerts.record(level, self._alert_src, f"loop stopped: {reason}", now=self.clock())
         log.info("demo loop stopped (%s): %s", reason, self.state.summary())
         return reason
 
@@ -395,14 +427,27 @@ class DemoLoop:
         now = self.clock()
         self.state.last_tick_ts = now
         self.state.stopped = None
+        paused = self.cfg.pause_file.exists()
+        if paused != self.state.paused:
+            self.state.paused = paused
+            self.alerts.record(
+                "warn" if paused else "info",
+                self._alert_src,
+                "paused from the dashboard: holding positions, opening nothing new"
+                if paused
+                else "resumed",
+                now=now,
+            )
         self.strategy.prepare(now)
         self._refresh_bankroll(now)
         for name in self.cfg.series:
             if self.state.for_series(name).open is not None:
                 self._settle_if_closed(name, now)
+        self._reconcile(now)
         halt = self.state.halted or self._check_caps()
         if halt and not self.state.halted:
             self.state.halted = halt
+            self.alerts.record("halt", self._alert_src, f"halting: {halt}", now=now)
             log.info("halting after open positions settle: %s", halt)
         if halt and not self.state.open_trades:
             self.state.save(self.cfg.state_file)
@@ -411,10 +456,66 @@ class DemoLoop:
             ss = self.state.for_series(name)
             if ss.open is not None:
                 self._manage_open(name, now)
-            elif not halt:
+            elif not (halt or paused):
                 self._maybe_enter(name, now)
         self.state.save(self.cfg.state_file)
         return None
+
+    # ------------------------------------------------------------------ reconciliation
+
+    def _reconcile(self, now: float) -> None:
+        """Compare filled positions with the exchange; halt on a repeated mismatch."""
+        if self.cfg.reconcile_s <= 0 or self.client.dry_run or self.state.halted:
+            return
+        if self._reconcile_ts is not None and now - self._reconcile_ts < self.cfg.reconcile_s:
+            return
+        self._reconcile_ts = now
+        try:
+            positions = self.client.get_positions(settlement_status="unsettled")
+        except Exception as exc:  # noqa: BLE001 - a failed check is reported, not fatal
+            self.alerts.record("warn", self._alert_src, f"reconciliation skipped: {exc}", now=now)
+            return
+        ours: dict[str, float] = {}
+        for _name, trade in self.state.open_trades:
+            if trade.filled and not trade.simulated:
+                signed = trade.filled_count if trade.side == "yes" else -trade.filled_count
+                ours[trade.ticker] = ours.get(trade.ticker, 0.0) + signed
+        # a market the loop already booked can linger on the exchange until Kalshi
+        # settles it a few minutes after close; that is not an unknown position
+        booked = {t for ss in self.state.series.values() for t in ss.seen_tickers if t not in ours}
+        exchange: dict[str, float] = {}
+        for pos in positions:
+            if abs(pos.position) < 1e-9 or pos.ticker.split("-")[0] not in self.cfg.series:
+                continue
+            if pos.ticker in booked:
+                continue
+            exchange[pos.ticker] = float(pos.position)
+        problems: dict[str, str] = {}
+        for ticker, qty in exchange.items():
+            if ticker not in ours:
+                problems[ticker] = (
+                    f"exchange holds {qty:+.0f} on {ticker} that this loop did not open"
+                )
+            elif abs(ours[ticker] - qty) > 0.5:
+                problems[ticker] = f"{ticker}: loop has {ours[ticker]:+.0f}, exchange {qty:+.0f}"
+        for ticker, qty in ours.items():
+            if ticker not in exchange:
+                problems[ticker] = f"{ticker}: loop holds {qty:+.0f} but the exchange shows none"
+        repeated = {t: p for t, p in problems.items() if t in self._mismatches}
+        self._mismatches = problems
+        if repeated:
+            self.state.halted = "reconciliation mismatch: " + "; ".join(repeated.values())
+            self.alerts.record("halt", self._alert_src, self.state.halted, now=now)
+            return
+        for text in problems.values():
+            self.alerts.record(
+                "warn",
+                self._alert_src,
+                f"reconciliation: {text} (halts if still there next check)",
+                now=now,
+            )
+        if not problems:
+            self.state.reconciled_ts = now
 
     # ------------------------------------------------------------------ steps
 
@@ -543,12 +644,13 @@ class DemoLoop:
                 self._refresh_fills(trade)
                 trade.count = int(round(trade.filled_count))
             self.state.save(self.cfg.state_file)
-            log.info(
-                "filled %s x%.0f %s at %.3f",
-                trade.side,
-                trade.filled_count,
-                trade.ticker,
-                trade.fill_price,
+            self.alerts.record(
+                "info",
+                self._alert_src,
+                f"filled {trade.side.upper()} x{trade.filled_count:.0f} {trade.ticker} "
+                f"at {trade.fill_price:.3f}{' (maker)' if trade.maker else ''}",
+                now=now,
+                ticker=trade.ticker,
             )
             return
         if now >= trade.close_ts - self.cfg.min_ttc:
@@ -710,18 +812,16 @@ class DemoLoop:
         else:
             ss.open = None
         s.save(self.cfg.state_file)
-        log.info(
-            "%ssold %s x%.0f %s at %.3f (entry %.3f) -> %+.2f; %s; %s",
-            "REAL MONEY: " if self.live else "",
-            trade.side,
-            sold,
-            trade.ticker,
-            sell_price,
-            entry,
-            net,
-            why,
-            s.summary(),
+        self.alerts.record(
+            "info",
+            self._alert_src,
+            f"sold {trade.side.upper()} x{sold:.0f} {trade.ticker} at {sell_price:.3f} "
+            f"(entry {entry:.3f}) -> {net:+.2f}; {why}",
+            now=now,
+            ticker=trade.ticker,
+            net=round(net, 4),
         )
+        log.info("%s%s", "REAL MONEY: " if self.live else "", s.summary())
 
     def _refresh_fills(self, trade: OpenTrade) -> None:
         if trade.order_id is None:
@@ -807,14 +907,13 @@ class DemoLoop:
         ss.book(trade.ticker, net)
         ss.open = None
         s.save(self.cfg.state_file)
-        log.info(
-            "settled %s: %s, %s x%.0f at %.3f -> %+.2f (fee %.2f); %s",
-            trade.ticker,
-            market.result.upper(),
-            trade.side,
-            trade.filled_count,
-            price,
-            net,
-            fee,
-            s.summary(),
+        self.alerts.record(
+            "info",
+            self._alert_src,
+            f"settled {trade.ticker} {market.result.upper()}: {trade.side.upper()} "
+            f"x{trade.filled_count:.0f} at {price:.3f} -> {net:+.2f} (fee {fee:.2f})",
+            now=now,
+            ticker=trade.ticker,
+            net=round(net, 4),
         )
+        log.info("%s", s.summary())

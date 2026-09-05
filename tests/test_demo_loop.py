@@ -17,7 +17,7 @@ from kalshi_bot.demo_loop import (
     RefusedProduction,
     SeriesState,
 )
-from kalshi_bot.models import Fill, Market, Order
+from kalshi_bot.models import Fill, Market, Order, Position
 
 T0 = 1_800_000_000.0
 
@@ -53,6 +53,8 @@ class FakeClient:
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
         self.now = T0
+        self.positions_override: dict[str, float] | None = None  # ticker -> signed qty
+        self.position_calls = 0
 
     def _window(self):
         return int((self.now - T0) // 900)
@@ -111,11 +113,28 @@ class FakeClient:
         self.cancelled.append(order_id)
         return None
 
+    def get_positions(self, **kw):
+        """What the exchange holds: every filled, uncancelled buy nets out per ticker,
+        unless a test overrides it."""
+        self.position_calls += 1
+        if self.positions_override is not None:
+            held = dict(self.positions_override)
+        else:
+            held = {}
+            for n, o in enumerate(self.orders, 1):
+                if not self.fill or f"o{n}" in self.cancelled or o["action"] != "buy":
+                    continue
+                signed = o["count"] if o["side"] == "yes" else -o["count"]
+                held[o["ticker"]] = held.get(o["ticker"], 0) + signed
+        return [Position.from_dict({"ticker": t, "position": q}) for t, q in held.items() if q]
+
 
 def make(tmp_path, client, **cfg_kw):
     cfg_kw.setdefault("series", tuple(client.series))
     cfg_kw.setdefault("decision_log", tmp_path / "decisions.jsonl")
     cfg_kw.setdefault("spot_db", None)
+    cfg_kw.setdefault("alerts_path", tmp_path / "alerts.jsonl")
+    cfg_kw.setdefault("pause_file", tmp_path / "PAUSE")
     cfg = LoopConfig(
         interval=1.0,
         stop_file=tmp_path / "STOP",
@@ -719,6 +738,112 @@ def test_cap_waits_for_open_positions(tmp_path):
     assert loop.state.halted
 
 
+# ---------------------------------------------------------------- reconciliation, pause, alerts
+
+
+def _alerts(tmp_path):
+    from kalshi_bot.alerts import tail
+
+    return tail(tmp_path / "alerts.jsonl")
+
+
+def test_reconciliation_passes_when_books_agree(tmp_path):
+    client = FakeClient({0: "yes", 1: "no"})
+    loop, _ = make(tmp_path, client, max_trades=2, reconcile_s=60.0)
+    loop.run()
+    assert client.position_calls >= 2
+    assert loop.state.reconciled_ts is not None
+    assert not any("reconciliation" in a["text"] for a in _alerts(tmp_path))
+    levels = [a["level"] for a in _alerts(tmp_path)]
+    texts = [a["text"] for a in _alerts(tmp_path)]
+    assert texts[0].startswith("loop started") and levels[0] == "info"
+    assert any(t.startswith("filled") for t in texts) and any(
+        t.startswith("settled") for t in texts
+    )
+    assert texts[-1].startswith("loop stopped") and levels[-1] == "halt"
+
+
+def test_reconciliation_halts_on_a_repeated_mismatch(tmp_path):
+    client = FakeClient({i: "yes" for i in range(6)})
+    client.positions_override = {"KXBTC15M-77": 3}  # a position the loop never opened
+    loop, _ = make(tmp_path, client, reconcile_s=60.0)
+    assert loop.run(max_ticks=4) == "tick limit"  # halted, but holding market 0 to settlement
+    reason = loop.state.halted
+    assert reason.startswith("reconciliation mismatch") and "did not open" in reason
+    alerts = _alerts(tmp_path)
+    warns = [a for a in alerts if a["level"] == "warn" and "reconciliation" in a["text"]]
+    halts = [a for a in alerts if a["level"] == "halt"]
+    assert len(warns) == 1 and "halts if still there" in warns[0]["text"]
+    assert halts and "reconciliation mismatch" in halts[0]["text"]
+    assert client.position_calls == 2
+
+
+def test_reconciliation_forgives_a_one_off_and_skips_simulated(tmp_path):
+    client = FakeClient({i: "yes" for i in range(6)})
+    client.positions_override = {"KXBTC15M-77": 3}
+    loop, _ = make(tmp_path, client, reconcile_s=60.0, max_trades=3)
+    assert loop.tick() is None  # warned
+    client.positions_override = None  # the exchange now agrees
+    client.now += 61
+    assert loop.tick() is None and not loop.state.halted
+    assert loop._mismatches == {}
+
+    sim = FakeClient({0: "yes"}, dry_run=True)
+    sim.positions_override = {"KXBTC15M-0": 99}
+    loop, _ = make(tmp_path / "sim", sim, reconcile_s=60.0, max_trades=1)
+    loop.run(max_ticks=3)
+    assert sim.position_calls == 0 and "reconciliation" not in (loop.state.halted or "")
+
+
+def test_reconciliation_survives_a_failed_call(tmp_path):
+    client = FakeClient({0: "yes"})
+
+    def boom(**kw):
+        raise RuntimeError("positions endpoint down")
+
+    client.get_positions = boom
+    loop, _ = make(tmp_path, client, max_trades=1, reconcile_s=60.0)
+    loop.run()
+    assert loop.state.trades == 1
+    assert any("reconciliation skipped" in a["text"] for a in _alerts(tmp_path))
+
+
+def test_pause_file_holds_entries_but_keeps_ticking(tmp_path):
+    client = FakeClient({i: "yes" for i in range(6)})
+    loop, _ = make(tmp_path, client, max_trades=2)
+    assert loop.tick() is None and loop.state.trades == 1
+    (tmp_path / "PAUSE").write_text("paused\n")
+    client.now += 16 * 60  # past the first market's close; it settles while paused
+    assert loop.tick() is None
+    assert loop.state.paused and loop.state.wins == 1 and loop.state.trades == 1
+    for _ in range(3):
+        client.now += 60
+        assert loop.tick() is None
+    assert loop.state.trades == 1  # nothing new while paused
+    (tmp_path / "PAUSE").unlink()
+    client.now += 60
+    assert loop.tick() is None
+    assert not loop.state.paused and loop.state.trades == 2
+    texts = [a["text"] for a in _alerts(tmp_path)]
+    assert any(t.startswith("paused") for t in texts) and "resumed" in texts
+
+
+def test_alert_log_tail_and_levels(tmp_path):
+    from kalshi_bot.alerts import AlertLog, tail
+
+    log = AlertLog(tmp_path / "a.jsonl")
+    for i in range(70):
+        log.record("info", "test", f"event {i}", now=T0 + i)
+    with pytest.raises(ValueError):
+        log.record("loud", "test", "nope")
+    rows = tail(tmp_path / "a.jsonl", n=50)
+    assert len(rows) == 50 and rows[0]["text"] == "event 20" and rows[-1]["ts"] == T0 + 69
+    assert tail(tmp_path / "missing.jsonl") == [] and tail(None) == []
+    (tmp_path / "a.jsonl").write_text("{broken\n" + json.dumps({"level": "warn"}) + "\n")
+    assert tail(tmp_path / "a.jsonl") == [{"level": "warn"}]
+    assert AlertLog(None).record("warn", "x", "unwritten")["level"] == "warn"
+
+
 # ---------------------------------------------------------------- dashboard
 
 
@@ -759,6 +884,59 @@ def test_dashboard_serves_page_and_state(dashboard):
     assert not Path(tmp_path / "STOP").exists()
     with pytest.raises(urllib.error.HTTPError):
         _get(server, "/nope")
+
+
+def test_dashboard_pause_resume_and_events(tmp_path):
+    from kalshi_bot.alerts import AlertLog
+
+    alerts = tmp_path / "alerts.jsonl"
+    AlertLog(alerts).record("info", "live", "filled YES x10", now=T0 - 30)
+    AlertLog(alerts).record("warn", "learner", "size cut", now=T0 - 20)
+    server = demo_ui.serve(
+        tmp_path / "state.json",
+        tmp_path / "STOP",
+        port=0,
+        pause_file=tmp_path / "PAUSE",
+        alerts_file=alerts,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        data = json.loads(_get(server, "/api/state")[1])
+        assert data["heartbeat"] == "none" and not data["pause_file_present"]
+        assert [a["text"] for a in data["alerts"]] == ["filled YES x10", "size cut"]
+        status, body = _get(server, "/api/pause", method="POST")
+        assert status == 200 and (tmp_path / "PAUSE").exists()
+        assert json.loads(body)["pause_file_present"] is True
+        _get(server, "/api/resume", method="POST")
+        assert not (tmp_path / "PAUSE").exists()
+        page = _get(server, "/")[1].decode()
+        assert "Pause entries" in page and "Activity" in page and "/api/resume" in page
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_heartbeat_states(tmp_path):
+    dash = demo_ui.Dashboard(tmp_path / "s.json", tmp_path / "STOP", alerts_file=None)
+    assert dash.snapshot(now=T0)["heartbeat"] == "none"
+    LoopState(last_tick_ts=T0 - 5).save(tmp_path / "s.json")
+    assert dash.snapshot(now=T0)["heartbeat"] == "alive"
+    LoopState(last_tick_ts=T0 - 5, paused=True).save(tmp_path / "s.json")
+    assert dash.snapshot(now=T0)["heartbeat"] == "paused"
+    LoopState(last_tick_ts=T0 - 5, halted="loss cap").save(tmp_path / "s.json")
+    assert dash.snapshot(now=T0)["heartbeat"] == "halted"
+    LoopState(last_tick_ts=T0 - 60).save(tmp_path / "s.json")
+    assert dash.snapshot(now=T0)["heartbeat"] == "quiet"
+    LoopState(last_tick_ts=T0 - 600).save(tmp_path / "s.json")
+    snap = dash.snapshot(now=T0)
+    assert snap["heartbeat"] == "stale"
+    assert (
+        snap["alerts"][-1]["source"] == "dashboard" and "no heartbeat" in snap["alerts"][-1]["text"]
+    )
+    LoopState(last_tick_ts=T0 - 600, stopped="interrupted").save(tmp_path / "s.json")
+    assert dash.snapshot(now=T0)["heartbeat"] == "stopped"
+    assert dash.pause_file == tmp_path / "PAUSE"  # defaults beside the stop file
 
 
 def test_dashboard_snapshot_handles_partial_write(tmp_path):
@@ -807,6 +985,11 @@ def test_live_trade_cli_gates(monkeypatch, capsys):
         cli.cmd_live_trade(prod, args)
     assert "at most" in str(exc.value)
     assert cli.build_parser().parse_args(["demo-trade"]).func is cli.cmd_demo_trade
+    args = parser.parse_args(["demo-trade", "--reconcile", "0", "--spot-source", "db"])
+    assert args.reconcile == 0 and args.spot_source == "db" and args.entry == "maker"
+    assert args.alerts == "state/alerts.jsonl" and args.pause_file == "state/PAUSE"
+    cfg = cli._loop_config(args)
+    assert cfg.reconcile_s == 0 and cfg.spot_source == "db" and cfg.alerts_path is not None
 
 
 def test_dashboard_refuses_a_busy_port(dashboard):

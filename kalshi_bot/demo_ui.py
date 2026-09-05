@@ -3,8 +3,9 @@
 A single-page site served from the standard library, bound to localhost. It
 polls the loop's JSON state file every two seconds, so it works whether or
 not the loop is running, and it can stop the loop by creating the same stop
-file the loop watches. No third-party dependencies, nothing leaves the
-machine.
+file the loop watches, pause and resume it the same way, and shows the
+event feed both loops append to. No third-party dependencies, nothing
+leaves the machine.
 
     kalshi-bot demo-ui            # then open http://127.0.0.1:8765
 """
@@ -19,11 +20,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import alerts as alertmod
 from .dashboard_page import PAGE
 
 log = logging.getLogger(__name__)
 
 ALIVE_WITHIN_S = 30.0
+STALE_AFTER_S = 90.0  # a running loop that has not ticked for this long is presumed dead
+ALERTS_SHOWN = 40
 
 
 class Dashboard:
@@ -33,10 +37,18 @@ class Dashboard:
     write different files); each poll shows the most recently modified one.
     """
 
-    def __init__(self, state_file: Path | list[Path], stop_file: Path) -> None:
+    def __init__(
+        self,
+        state_file: Path | list[Path],
+        stop_file: Path,
+        pause_file: Path | None = None,
+        alerts_file: Path | None = None,
+    ) -> None:
         files = state_file if isinstance(state_file, list) else [state_file]
         self.state_files = [Path(f) for f in files]
         self.stop_file = Path(stop_file)
+        self.pause_file = Path(pause_file) if pause_file else self.stop_file.with_name("PAUSE")
+        self.alerts_file = Path(alerts_file) if alerts_file else None
 
     @property
     def state_file(self) -> Path:
@@ -54,15 +66,46 @@ class Dashboard:
                 state = json.loads(state_file.read_text())
             except ValueError:
                 state = None  # mid-write; the next poll will get it
-        last = (state or {}).get("last_tick_ts")
+        st = state or {}
+        last = st.get("last_tick_ts")
         alive = bool(state) and last is not None and now - float(last) <= ALIVE_WITHIN_S
+        # heartbeat: a loop that ended says so in ``stopped``; one that simply
+        # went quiet (crash, closed laptop, lost network) is "stale"
+        if not state:
+            heartbeat = "none"
+        elif st.get("stopped"):
+            heartbeat = "stopped"
+        elif alive:
+            heartbeat = (
+                "halted" if st.get("halted") else ("paused" if st.get("paused") else "alive")
+            )
+        elif last is not None and now - float(last) > STALE_AFTER_S:
+            heartbeat = "stale"
+        else:
+            heartbeat = "quiet"
+        rows = alertmod.tail(self.alerts_file, ALERTS_SHOWN)
+        if heartbeat == "stale":
+            rows.append(
+                {
+                    "ts": now,
+                    "level": "warn",
+                    "source": "dashboard",
+                    "text": f"no heartbeat for {int(now - float(last))}s: the loop is not "
+                    "running. Restart it, or check the window it ran in",
+                }
+            )
         return {
             "now": now,
             "state": state,
             "state_file": str(state_file),
             "stop_file": str(self.stop_file),
             "stop_file_present": self.stop_file.exists(),
-            "alive": alive and not (state or {}).get("halted"),
+            "pause_file": str(self.pause_file),
+            "pause_file_present": self.pause_file.exists(),
+            "alerts_file": str(self.alerts_file) if self.alerts_file else None,
+            "alerts": rows,
+            "heartbeat": heartbeat,
+            "alive": alive and not st.get("halted"),
         }
 
     def stop(self) -> None:
@@ -74,6 +117,16 @@ class Dashboard:
     def clear_stop(self) -> None:
         if self.stop_file.exists():
             self.stop_file.unlink()
+
+    def pause(self) -> None:
+        self.pause_file.parent.mkdir(parents=True, exist_ok=True)
+        self.pause_file.write_text(
+            f"paused from dashboard at {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+
+    def resume(self) -> None:
+        if self.pause_file.exists():
+            self.pause_file.unlink()
 
 
 def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
@@ -103,6 +156,10 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
                 dash.stop()
             elif self.path == "/api/clear-stop":
                 dash.clear_stop()
+            elif self.path == "/api/pause":
+                dash.pause()
+            elif self.path == "/api/resume":
+                dash.resume()
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
                 return
@@ -120,11 +177,17 @@ class _Server(ThreadingHTTPServer):
 
 
 def serve(
-    state_file: Path | list[Path], stop_file: Path, host: str = "127.0.0.1", port: int = 8765
+    state_file: Path | list[Path],
+    stop_file: Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    pause_file: Path | None = None,
+    alerts_file: Path | None = None,
 ) -> ThreadingHTTPServer:
     """Bind and return the server; call ``serve_forever`` on it."""
+    dash = Dashboard(state_file, stop_file, pause_file=pause_file, alerts_file=alerts_file)
     try:
-        return _Server((host, port), make_handler(Dashboard(state_file, stop_file)))
+        return _Server((host, port), make_handler(dash))
     except OSError as exc:
         raise OSError(
             f"port {port} is already in use, probably by an earlier dashboard window; "

@@ -199,9 +199,16 @@ in contracts, never Kelly at full strength.
 - Run on a small Linux VPS under systemd, or Docker; the current Windows
   laptop is fine for recording but not for a 24/7 trader.
 - Telegram bot for alerts and the kill switch. Simpler than Slack for one
-  operator and works from a phone.
+  operator and works from a phone. **[implemented differently, 2026-09-05]**
+  The owner declined push alerts. The dashboard (`kalshi-bot demo-ui`) is
+  the alert channel: an event feed (`state/alerts.jsonl`) written by the
+  loop and the learner, a pause/resume control (`state/PAUSE`, no new
+  entries, positions still managed) and the stop file as the kill switch.
 - Heartbeat every five minutes; a dead-man alert if two are missed. P&L
-  summary at each settlement and daily.
+  summary at each settlement and daily. **[implemented]** The loop writes
+  a heartbeat every tick; the dashboard flags 90 seconds of silence.
+  Reconciliation (`DemoLoop._reconcile`) runs every 2 minutes and halts on
+  a mismatch that repeats.
 - Paper mode is the default. Live requires the explicit `allow_live` flag, the
   production environment, and a passing demo run.
 - Dashboard: a minimal page reading the decision log and P&L from SQLite.

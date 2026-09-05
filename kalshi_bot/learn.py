@@ -435,10 +435,23 @@ def run_cycle(
     decisions_path: str | Path | None = None,
     live_state_path: str | Path | None = None,
     fv: fvmod.FairValueData | None = None,
+    alerts_path: str | Path | None = None,
 ) -> Params:
+    from .alerts import AlertLog
+
+    alerts = AlertLog(alerts_path)
     incumbent = Params.load(params_path)
     promoted, record = retrain(db_path, incumbent, fv=fv)
     params = promoted or incumbent or Params()
+    if promoted is not None:
+        held = (record.get("candidate") or {}).get("held_out") or {}
+        alerts.record(
+            "info",
+            "learner",
+            f"promoted new parameters: margin {promoted.margin:.2f}, vol window "
+            f"{promoted.vol_window:.0f}s, risk {promoted.risk_fraction:.1%} of bankroll "
+            f"(held-out net {held.get('taker_net', float('nan')):+.3f}/contract)",
+        )
     if promoted is None and incumbent is None:
         params.note = record.get("outcome", "")
     if decisions_path and live_state_path:
@@ -452,6 +465,29 @@ def run_cycle(
             params.note = (
                 f"size held at half on drawdown {dd['drawdown']} ({dd['share_of_cap']:.0%} of cap)"
             )
+        if drift.get("status") == "halt":
+            alerts.record(
+                "halt",
+                "learner",
+                f"live results far below the model (z {drift.get('z', 0):+.1f}); "
+                "trading halted until the next cycle clears it",
+            )
+        elif drift.get("status") == "shrink":
+            alerts.record(
+                "warn",
+                "learner",
+                f"live results below the model (z {drift.get('z', 0):+.1f}); size cut to "
+                f"{params.size_scale:.0%}",
+            )
+        elif dd.get("status") == "shrink":
+            alerts.record("warn", "learner", params.note)
+        before = incumbent.size_scale if incumbent else 1.0
+        if (
+            params.size_scale != before
+            and drift.get("status") == "ok"
+            and dd.get("status") != "shrink"
+        ):
+            alerts.record("info", "learner", f"size scale {before:.0%} -> {params.size_scale:.0%}")
     params.updated = time.time()
     params.save(params_path)
     record["time"] = datetime.now(UTC).isoformat(timespec="seconds")

@@ -311,6 +311,36 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    be entered again on a fresh signal, up to `--max-entries` (6) per
    market; beyond `--free-entries` (2) the market must be in profit so far
    (`SeriesState.entries_allowed`). Still one open position per series.
+9. Robustness round (Cameron's "do all", 2026-09-05, with "no telegram
+   alerts just professional ui"):
+   * Fixed-fraction sizing: `learn.kelly_fraction` publishes
+     `risk_fraction` in params.json only on promotion; `DemoLoop.trade_dollars`
+     spends that fraction of the shard balance, capped by `--max-dollars`
+     (20) and the live ceiling; `learn.drawdown_check` halves size on a
+     drawdown of half the cap.
+   * Maker entries (`--entry maker`, default): `maker_price` rests one tick
+     inside the spread on the right grid; `_maker_to_taker` re-sends at the
+     ask after `--maker-wait` (20 s). Untested against a real fill.
+   * Reconciliation (`DemoLoop._reconcile`, `--reconcile` 120 s): compares
+     filled open trades with `get_positions(settlement_status="unsettled")`
+     on our series; warns once, halts if the mismatch repeats; ignores
+     tickers already booked (Kalshi settles a few minutes after close) and
+     dry-run fills.
+   * Event feed and controls: `kalshi_bot/alerts.py` (`AlertLog`, `tail`)
+     writes `state/alerts.jsonl` from the loop (start, fills, sales,
+     settlements, halts, pause/resume, reconciliation) and the learner
+     (promotions, size changes, drift, drawdown). The dashboard shows the
+     tail, a stale-heartbeat banner after 90 s of silence, and Pause /
+     Resume (`state/PAUSE`: keep ticking, open nothing new) beside Stop.
+   * Spot source (`--spot-source auto|db|rest`): `strategy.DbSpotFeed`
+     reads the newest recorder tick per symbol, uses it when under 5 s
+     old, else falls back to Coinbase REST.
+   * Deployment: `deploy/` has a Dockerfile and compose file (live,
+     dashboard, recorder, learn) with a server guide; the image build is
+     unverified (no Docker in the sandbox).
+   Not built: persisted daily loss cap with manual reset, consecutive-loss
+   breaker. The loss cap is cumulative realised loss per run-state, which
+   is what Cameron asked for.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

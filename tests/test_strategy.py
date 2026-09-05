@@ -35,6 +35,8 @@ def market(ttc=600.0, yes_ask=0.50, no_ask=0.52, strike=100.0, now=T0, series="K
 
 
 class FakeFeed:
+    source = "fake"
+
     def __init__(self, prices):
         self.prices = prices
         self.calls = 0
@@ -252,5 +254,77 @@ def test_build_strategy(tmp_path):
         st.build_strategy("magic")
     except ValueError as exc:
         assert "unknown strategy" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+# ---------------------------------------------------------------- db spot feed
+
+
+def test_db_spot_feed_prefers_fresh_ticks_and_falls_back(tmp_path):
+    from kalshi_bot.storage import MarketDataStore
+
+    db = tmp_path / "md.sqlite"
+    store = MarketDataStore(db)
+    store.insert_spots(
+        [
+            (T0 - 1.0, "coinbase_ws", "BTC-USD", 50_000.0, None),
+            (T0 - 0.5, "coinbase_ws", "BTC-USD", 50_010.0, None),
+            (T0 - 60.0, "coinbase_ws", "DOGE-USD", 0.10, None),  # stale
+        ]
+    )
+    store.close()
+    rest = FakeFeed({"BTC-USD": 49_000.0, "DOGE-USD": 0.11})
+    feed = st.DbSpotFeed(db, ["BTC-USD", "DOGE-USD"], fallback=rest, clock=lambda: T0)
+    prices = feed.fetch()
+    assert prices == {"BTC-USD": 50_010.0, "DOGE-USD": 0.11}
+    assert feed.last_source == {"BTC-USD": "db", "DOGE-USD": "fake"}
+    assert feed.last_age_s["BTC-USD"] == 0.5 and feed.last_age_s["DOGE-USD"] == 60.0
+
+    # db only: the stale symbol is simply absent
+    only = st.DbSpotFeed(db, ["BTC-USD", "DOGE-USD"], clock=lambda: T0)
+    assert only.fetch() == {"BTC-USD": 50_010.0} and only.last_source["DOGE-USD"] == "none"
+    only.close()
+
+    # everything stale later on, and a fallback that fails: an empty tick, no exception
+    class Boom:
+        source = "boom"
+
+        def fetch(self):
+            raise RuntimeError("down")
+
+    late = st.DbSpotFeed(db, ["BTC-USD"], fallback=Boom(), clock=lambda: T0 + 100)
+    assert late.fetch() == {} and late.last_source["BTC-USD"] == "none"
+
+    # no database yet: fallback carries everything
+    none = st.DbSpotFeed(tmp_path / "missing.sqlite", ["BTC-USD"], fallback=rest, clock=lambda: T0)
+    assert none.fetch() == {"BTC-USD": 49_000.0}
+    feed.close()
+
+
+def test_build_strategy_spot_source(tmp_path, monkeypatch):
+    from kalshi_bot import spot as spotmod
+
+    class NoNet(spotmod.SpotFeed):
+        def __init__(self, symbols, **kw):
+            self.symbols = list(symbols)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(spotmod, "SpotFeed", NoNet)
+    db = tmp_path / "md.sqlite"
+    auto = st.build_strategy("fairvalue", series=("KXBTC15M",), spot_db=db, spot_source="auto")
+    assert isinstance(auto.feed, st.DbSpotFeed) and isinstance(auto.feed.fallback, NoNet)
+    only = st.build_strategy("fairvalue", series=("KXBTC15M",), spot_db=db, spot_source="db")
+    assert isinstance(only.feed, st.DbSpotFeed) and only.feed.fallback is None
+    rest = st.build_strategy("fairvalue", series=("KXBTC15M",), spot_db=db, spot_source="rest")
+    assert isinstance(rest.feed, NoNet)
+    nodb = st.build_strategy("fairvalue", series=("KXBTC15M",), spot_db=None, spot_source="auto")
+    assert isinstance(nodb.feed, NoNet)
+    try:
+        st.build_strategy("fairvalue", series=("KXBTC15M",), spot_db=db, spot_source="magic")
+    except ValueError as exc:
+        assert "spot_source" in str(exc)
     else:
         raise AssertionError("expected ValueError")

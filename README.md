@@ -290,6 +290,68 @@ fresh edge: up to `--max-entries` per market (default 6), of which the first
 `--free-entries` (default 2) need only a signal and the rest also require
 that market to be in profit so far. One position per series at a time.
 
+### Sizing that scales with the bankroll
+
+`--dollars` is the floor. Once the learning loop has promoted parameters it
+also publishes a risk fraction (a quarter of the Kelly fraction implied by
+the held-out win rate, capped at 5% of the bankroll); the loop then spends
+that fraction of the balance on the market's exchange shard per trade, at
+most `--max-dollars` (default $20, and never above the live-trade ceiling).
+So size grows as profit accumulates and shrinks after losses, and it only
+ever exceeds `--dollars` when the gate has passed. `--risk-fraction`
+overrides the learner's figure; a drawdown of half the loss cap holds size
+at half until the equity recovers.
+
+### Maker entries
+
+By default (`--entry maker`) an entry rests one tick inside the spread
+instead of paying the ask: on the 1-cent grid in the middle of the book and
+the 0.1-cent grid in the tails. If it has not filled after `--maker-wait`
+seconds (default 20) the order is cancelled and re-sent at the ask, so a
+signal is never lost. A maker fill saves the spread and, on Kalshi's fee
+schedule, usually the taker fee. `--entry taker` pays the ask at once.
+
+### Reconciliation
+
+Every `--reconcile` seconds (default 120, and on the first tick) the loop
+compares the positions it believes it holds with the exchange's own
+position list for the configured series. A position on the exchange the
+loop did not open, a filled trade the exchange does not show, or a quantity
+mismatch is raised as a warning; if the same problem is still there at the
+next check the loop halts, because its P&L can no longer be trusted, and
+says why in the dashboard. Markets the loop has already booked are ignored
+while Kalshi settles them. `--reconcile 0` disables the check.
+
+### Dashboard: pause, events, heartbeat
+
+`kalshi-bot demo-ui` shows the running loop (it reads whichever of
+`state/live_loop.json` and `state/demo_loop.json` is fresher, or the
+`--state-file` you give it) and offers three controls:
+
+* **Pause entries** writes `state/PAUSE`: the loop keeps ticking, manages
+  and settles what it holds, but opens nothing new. **Resume** removes it.
+* **Stop loop** writes `state/STOP`: resting orders are cancelled and the
+  loop exits. **Clear stop file** lets it start again.
+* The **Activity** panel is the event feed both loops append to
+  (`state/alerts.jsonl`): fills, sales, settlements, halts, cap hits,
+  reconciliation warnings, and the learner's promotions, size changes and
+  drift halts. A loop that stops ticking for 90 seconds without saying why
+  is flagged as having no heartbeat, in the pill and in a banner.
+
+There are no push alerts by design; the page is the alert channel. On a
+server, bind it with `--host 0.0.0.0` behind your own access control (see
+`deploy/README.md`).
+
+### Spot source
+
+With `--strategy fairvalue` the model's spot price comes, by default
+(`--spot-source auto`), from the recorder's database whenever its latest
+WebSocket tick is under 5 seconds old, and from Coinbase's REST endpoint
+otherwise. That means the live model sees the same sub-second feed the
+research uses when the recorder is running alongside it. `--spot-source db`
+never falls back to REST (a stale feed then means no trades); `--spot-source
+rest` ignores the database.
+
 ## Development
 
 ```bash

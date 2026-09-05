@@ -72,8 +72,28 @@ PAGE = r"""<!doctype html>
            background: var(--surface); color: var(--ink); cursor: pointer; }
   button:hover { background: var(--surface-2); }
   button.stop { background: var(--bad); border-color: transparent; color: #fff; }
+  button.pause { background: var(--warn-mark); border-color: transparent; color: #0b0b0b; }
+  button.resume { background: var(--good-mark); border-color: transparent; color: #fff; }
   .note { color: var(--ink-2); font-size: 13px; }
   #err { color: var(--bad); font-size: 13px; }
+  .banner { display: none; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 12px; margin: 0 0 14px;
+            border: 1px solid var(--ring); background: var(--surface); font-size: 13px; }
+  .banner.show { display: flex; }
+  .banner.warn { border-color: color-mix(in oklab, var(--warn-mark) 55%, transparent); background: color-mix(in oklab, var(--warn-mark) 12%, var(--surface)); }
+  .banner.halt { border-color: color-mix(in oklab, var(--bad) 55%, transparent); background: color-mix(in oklab, var(--bad) 10%, var(--surface)); }
+  .banner b { font-weight: 600; }
+  .banner .spacer { flex: 1; }
+
+  .events { grid-column: span 12; }
+  .ev-list { display: flex; flex-direction: column; margin-top: 8px; max-height: 360px; overflow-y: auto; }
+  .ev { display: grid; grid-template-columns: 56px 12px 72px 1fr; gap: 10px; align-items: baseline; padding: 8px 0;
+        border-bottom: 1px solid var(--hair); font-size: 13px; }
+  .ev:last-child { border-bottom: none; }
+  .ev .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .ev .lvl { width: 8px; height: 8px; border-radius: 50%; background: var(--axis); position: relative; top: -1px; }
+  .ev.warn .lvl { background: var(--warn-mark); } .ev.halt .lvl { background: var(--bad); }
+  .ev.halt .x { color: var(--bad); font-weight: 600; } .ev.warn .x { color: var(--warn); }
+  .ev .src { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
 
   .chart { grid-column: span 12; }
   .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
@@ -131,11 +151,14 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="row" style="margin:0">
       <div class="pill" id="pill"><span class="dot"></span><span id="pilltext">–</span></div>
+      <button class="pause" id="pausebtn" onclick="post('/api/pause')">Pause entries</button>
+      <button class="resume" id="resumebtn" onclick="post('/api/resume')" style="display:none">Resume</button>
       <button class="stop" onclick="post('/api/stop')">Stop loop</button>
       <button onclick="post('/api/clear-stop')">Clear stop file</button>
     </div>
   </header>
   <div class="row" style="margin:-8px 0 14px"><span class="note" id="stopnote"></span><span id="err"></span></div>
+  <div class="banner" id="banner"><span id="bannertext"></span><span class="spacer"></span><span class="note" id="bannernote"></span></div>
 
   <div class="grid">
     <section class="card hero">
@@ -181,6 +204,11 @@ PAGE = r"""<!doctype html>
           <div id="series" style="margin-top:6px"><div class="note">nothing settled yet</div></div>
         </div>
       </div>
+    </section>
+
+    <section class="card events">
+      <div class="chart-head"><div class="label">Activity, latest first</div><div class="value" id="evnote"></div></div>
+      <div class="ev-list" id="events"><div class="note">no events yet</div></div>
     </section>
   </div>
 
@@ -262,8 +290,18 @@ async function refresh() {
   $('title').textContent = live ? 'Kalshi 15-minute desk · real money' : 'Kalshi 15-minute desk · ' + (c.env || 'idle');
   const series = Array.isArray(c.series) ? c.series.join(' · ') : (c.series || '');
   $('cfg').textContent = d.state ? `${series} · reading ${d.state_file}` : `no state file yet at ${d.state_file}`;
-  const pill = $('pill'); pill.className = 'pill' + (live ? ' live' : '') + (s.halted ? ' halt' : d.alive ? ' on' : '');
-  $('pilltext').textContent = s.halted ? 'halted' : d.alive ? (live ? 'live · running' : 'running') : (s.stopped ? 'stopped' : 'not running');
+  const hb = d.heartbeat || 'none';
+  const pill = $('pill'); pill.className = 'pill' + (live ? ' live' : '') + (s.halted || hb === 'paused' || hb === 'stale' ? ' halt' : d.alive ? ' on' : '');
+  $('pilltext').textContent = s.halted ? 'halted' : hb === 'paused' ? (live ? 'live · paused' : 'paused') : hb === 'stale' ? 'no heartbeat' : d.alive ? (live ? 'live · running' : 'running') : (s.stopped ? 'stopped' : 'not running');
+  const paused = d.pause_file_present;
+  $('pausebtn').style.display = paused ? 'none' : '';
+  $('resumebtn').style.display = paused ? '' : 'none';
+  const banner = $('banner');
+  if (hb === 'stale') { banner.className = 'banner show halt'; $('bannertext').innerHTML = `<b>No heartbeat.</b> The loop last ticked at ${tm(s.last_tick_ts)} and has gone quiet: it is not trading and not watching its positions.`; $('bannernote').textContent = 'restart it in its window, or on the server'; }
+  else if (s.halted) { banner.className = 'banner show halt'; $('bannertext').innerHTML = `<b>Halted.</b> ${s.halted}`; $('bannernote').textContent = d.alive ? 'open positions settle, then the loop exits' : (s.stopped ? 'the loop has exited' : ''); }
+  else if (paused) { banner.className = 'banner show warn'; $('bannertext').innerHTML = `<b>Paused.</b> Nothing new is opened; open positions are still managed and settle normally.`; $('bannernote').textContent = d.alive ? 'Resume to trade again' : 'the loop is not running'; }
+  else if (d.stop_file_present) { banner.className = 'banner show warn'; $('bannertext').innerHTML = `<b>Stop file present.</b> The loop exits and will not start until it is cleared.`; $('bannernote').textContent = d.stop_file; }
+  else { banner.className = 'banner'; }
   const p = Number(s.realized_pnl || 0);
   const pnl = $('pnl'); pnl.textContent = signed(p); pnl.className = 'value hero-fig ' + cls(p);
   const hist = s.history || [];
@@ -292,7 +330,13 @@ async function refresh() {
   hist.forEach(h => { const k = h.series || (h.ticker || '').split('-')[0]; const b = bySeries[k] = bySeries[k] || {n: 0, w: 0, net: 0}; b.n++; b.w += h.won ? 1 : 0; b.net += Number(h.net || 0); });
   const keys = Object.keys(bySeries);
   $('series').innerHTML = keys.length ? keys.map(k => `<div class="series-row"><span>${k}</span><span class="n">${bySeries[k].n} trades · ${Math.round(100 * bySeries[k].w / bySeries[k].n)}% · <span class="${cls(bySeries[k].net)}">${signed(bySeries[k].net)}</span></span></div>`).join('') : '<div class="note">nothing settled yet</div>';
-  $('stopnote').textContent = d.stop_file_present ? `stop file present (${d.stop_file}); the loop exits and will not start until it is cleared` : '';
+  $('stopnote').textContent = '';
+  const evs = (d.alerts || []).slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
+  const warnCount = evs.filter(e => e.level !== 'info').length;
+  $('evnote').textContent = evs.length ? `${evs.length} shown` + (warnCount ? ` · ${warnCount} need attention` : '') : '';
+  $('events').innerHTML = evs.length ? evs.map(e =>
+    `<div class="ev ${e.level || 'info'}"><span class="t">${tm(e.ts)}</span><span class="lvl"></span><span class="src">${e.source || ''}</span><span class="x">${String(e.text || '').replace(/</g, '&lt;')}</span></div>`
+  ).join('') : '<div class="note">no events yet</div>';
   $('hist').innerHTML = hist.slice().reverse().slice(0, 40).map(h =>
     `<tr><td>${tm(h.settled_ts)}</td><td class="mono">${h.ticker}</td><td><span class="side">${h.side.toUpperCase()}</span></td><td class="num">${fmt(h.count, 0)}</td><td class="num">${fmt(h.price, 3)}</td><td>${h.result.toUpperCase()}</td><td class="num ${cls(h.net)}">${signed(h.net)}</td></tr>`
   ).join('') || '<tr><td colspan="7" class="note">nothing settled yet</td></tr>';

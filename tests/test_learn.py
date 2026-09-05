@@ -161,6 +161,23 @@ def test_drift_check_and_apply(tmp_path):
     assert not p.halt and p.size_scale == 0.25  # floor
     p = learn.apply_drift(p, {"status": "ok"})
     assert not p.halt and p.size_scale == pytest.approx(0.375)
+    # a drifting live book raises a halt alert through the cycle
+    from kalshi_bot.storage import MarketDataStore
+
+    MarketDataStore(tmp_path / "empty.sqlite").close()
+    dec, state = _live_files(tmp_path, 200, 0.40)
+    learn.run_cycle(
+        db_path=tmp_path / "empty.sqlite",
+        params_path=tmp_path / "p.json",
+        history_path=tmp_path / "h.jsonl",
+        decisions_path=dec,
+        live_state_path=state,
+        alerts_path=tmp_path / "drift_alerts.jsonl",
+    )
+    from kalshi_bot.alerts import tail
+
+    events = tail(tmp_path / "drift_alerts.jsonl")
+    assert events[-1]["level"] == "halt" and "far below" in events[-1]["text"]
     p = learn.apply_drift(learn.Params(size_scale=0.9), {"status": "ok"})
     assert p.size_scale == 1.0
 
@@ -183,8 +200,14 @@ def test_run_cycle_writes_params_and_history(stale_fv, tmp_path):
         decisions_path=dec,
         live_state_path=state,
         fv=stale_fv,
+        alerts_path=tmp_path / "alerts.jsonl",
     )
     assert params_path.exists() and p.source == "retrain" and not p.halt
+    from kalshi_bot.alerts import tail
+
+    events = tail(tmp_path / "alerts.jsonl")
+    assert len(events) == 1 and events[0]["source"] == "learner"
+    assert events[0]["level"] == "info" and "promoted" in events[0]["text"]
     rows = [json.loads(line) for line in hist_path.read_text().splitlines()]
     assert rows[-1]["outcome"] == "promoted" and rows[-1]["drift"]["status"] == "ok"
     assert "active" in rows[-1]

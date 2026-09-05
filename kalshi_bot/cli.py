@@ -389,6 +389,7 @@ def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
             history_path=args.history,
             decisions_path=args.decisions or None,
             live_state_path=args.live_state or None,
+            alerts_path=args.alerts or None,
         )
         record = {}
         try:
@@ -458,6 +459,10 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         max_dollars=args.max_dollars,
         entry=args.entry,
         maker_wait_s=args.maker_wait,
+        reconcile_s=args.reconcile,
+        spot_source=args.spot_source,
+        pause_file=Path(args.pause_file),
+        alerts_path=Path(args.alerts) if args.alerts else None,
     )
     try:
         cfg.validate()
@@ -697,7 +702,14 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
         if args.state_file
         else [Path("state/live_loop.json"), Path("state/demo_loop.json")]
     )
-    server = serve(files, Path(args.stop_file), host=args.host, port=args.port)
+    server = serve(
+        files,
+        Path(args.stop_file),
+        host=args.host,
+        port=args.port,
+        pause_file=Path(args.pause_file),
+        alerts_file=Path(args.alerts) if args.alerts else None,
+    )
     print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
     print("showing whichever of these was updated most recently: " + ", ".join(map(str, files)))
     try:
@@ -828,6 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--history", default="state/learn_history.jsonl")
     s.add_argument("--decisions", default="state/decisions.jsonl", help="live decision log")
     s.add_argument("--live-state", default="state/live_loop.json", help="live loop state")
+    s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed for the dashboard")
     s.add_argument(
         "--every", type=float, default=0.0, help="repeat every N seconds (0 = run once and exit)"
     )
@@ -870,6 +883,8 @@ def build_parser() -> argparse.ArgumentParser:
         "state/demo_loop.json)",
     )
     s.add_argument("--stop-file", default="state/STOP")
+    s.add_argument("--pause-file", default="state/PAUSE")
+    s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed to show")
     s.set_defaults(func=cmd_demo_ui)
 
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
@@ -1000,8 +1015,24 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         "if unfilled (saves the spread and usually the fee). taker: pay the ask at once",
     )
     s.add_argument("--maker-wait", type=float, default=20.0, help="seconds a maker order may rest")
+    s.add_argument(
+        "--reconcile",
+        type=float,
+        default=120.0,
+        help="seconds between checks of the loop's positions against the exchange; a mismatch "
+        "that persists across two checks halts the loop (0 = never check)",
+    )
+    s.add_argument(
+        "--spot-source",
+        choices=["auto", "db", "rest"],
+        default="auto",
+        help="fairvalue: where spot comes from. auto: the recorder database when its latest "
+        "tick is fresh, else Coinbase REST. db: the database only. rest: Coinbase only",
+    )
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
+    s.add_argument("--pause-file", default="state/PAUSE")
+    s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed for the dashboard")
     s.add_argument("--status", action="store_true", help="print the saved state and exit")
     s.add_argument(
         "--reset", action="store_true", help="delete the saved state and stop file, then exit"
