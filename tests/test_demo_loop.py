@@ -313,7 +313,7 @@ def test_loop_sells_when_the_strategy_says_exit(tmp_path):
             return Signal(side="yes", price=market.yes_ask, reason="in")
 
         def exit(self, market, side, entry_price, now):
-            return Exit(market.yes_bid, "take it", inputs={"bid": market.yes_bid})
+            return Exit(market.yes_bid, "take it", inputs={"bid": market.yes_bid}, stop=True)
 
     client = FakeClient({0: "no"})  # would have lost at settlement
     cfg = LoopConfig(
@@ -559,8 +559,9 @@ class _Churner:
     name = "churn"
     size_scale = 1.0
 
-    def __init__(self, sell_at):
+    def __init__(self, sell_at, stop=True):
         self.sell_at = sell_at
+        self.stop = stop  # insist on the sale even at a loss
 
     def prepare(self, now):
         pass
@@ -573,7 +574,7 @@ class _Churner:
     def exit(self, market, side, entry_price, now):
         from kalshi_bot.strategy import Exit
 
-        return Exit(self.sell_at, "out")
+        return Exit(self.sell_at, "out", stop=self.stop)
 
 
 NO_CHURN_CONTROL = dict(min_hold_s=0, reentry_cooloff_s=0, max_consecutive_losses=0)
@@ -616,6 +617,26 @@ def test_reentry_up_to_six_while_the_market_is_profitable(tmp_path):
         LoopConfig(min_hold_s=-1).validate()
     with pytest.raises(ValueError):
         LoopConfig(max_consecutive_losses=-1).validate()
+
+
+def test_losing_exit_is_held_unless_it_is_a_stop(tmp_path):
+    # the strategy wants out below entry every tick but does not call it a stop:
+    # the loop holds to settlement, which here pays out in full
+    client = FakeClient({0: "yes"})
+    loop = _reentry_loop(
+        tmp_path, client, _Churner(sell_at=0.50, stop=False), max_entries=6, **NO_CHURN_CONTROL
+    )
+    loop.run(max_ticks=40)
+    assert not [o for o in client.orders if o["action"] == "sell"]
+    assert loop.state.history and loop.state.history[0]["result"] == "yes"
+    assert loop.state.realized_pnl > 0
+    # a profitable exit needs no stop
+    client2 = FakeClient({0: "yes"})
+    loop2 = _reentry_loop(
+        tmp_path, client2, _Churner(sell_at=0.70, stop=False), max_entries=1, **NO_CHURN_CONTROL
+    )
+    loop2.run(max_ticks=5)
+    assert len([o for o in client2.orders if o["action"] == "sell"]) == 1
 
 
 def test_min_hold_and_cooloff_slow_the_churn(tmp_path):

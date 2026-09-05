@@ -354,7 +354,13 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    logged as `spot_last`), CLI defaults `--max-entries 2 --free-entries
    1`, and the consecutive-loss breaker (`DemoLoop._book_result`,
    `LoopState.breaker_until`/`loss_streak`, `--max-consecutive-losses 3
-   --loss-pause 1800`; shown as a banner in the dashboard).
+   --loss-pause 1800`; shown as a banner in the dashboard). Then, on
+   "selling at a loss when its not necessary": `Exit.stop` marks a sale
+   the strategy insists on; `DemoLoop._maybe_exit` refuses any other sale
+   whose net (`_sale_net`) is negative and holds to settlement. Fair value
+   sets `stop=True` only when its value of the position is at or under
+   `stop_value` (`--stop-value`, 0.10; 0 = never sell at a loss);
+   alternate's `--stop-loss` is a stop. Take-profit exits are unchanged.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

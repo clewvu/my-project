@@ -140,6 +140,14 @@ def test_fairvalue_exit_sells_when_the_market_overpays():
     m = market(strike=last * 1.01, yes_ask=0.32, no_ask=0.70, now=T0)
     ex = s.exit(m, "yes", 0.50, T0)
     assert isinstance(ex, st.Exit) and ex.price == 0.31 and ex.inputs["sell_surplus"] > 0.02
+    assert ex.stop and "salvage" in ex.reason  # below entry, but the model calls it dead
+    # the same sale is refused when the model still gives the position a chance
+    s.stop_value = 0.0
+    assert s.exit(m, "yes", 0.50, T0) is None
+    s.stop_value = 0.10
+    # above entry it is a plain take-profit, not a stop
+    ex_tp = s.exit(m, "yes", 0.20, T0)
+    assert isinstance(ex_tp, st.Exit) and not ex_tp.stop
     # position the model still values highly: hold
     m2 = market(strike=last * 0.99, yes_ask=0.90, no_ask=0.12, now=T0)
     assert s.exit(m2, "yes", 0.50, T0) is None

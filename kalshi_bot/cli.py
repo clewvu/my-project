@@ -462,6 +462,7 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         reconcile_s=args.reconcile,
         spot_source=args.spot_source,
         spot_smooth_s=args.spot_smooth,
+        stop_value=args.stop_value,
         min_hold_s=args.min_hold,
         reentry_cooloff_s=args.cooloff,
         allow_flip=args.allow_flip,
@@ -1031,6 +1032,13 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         type=float,
         default=1800.0,
         help="seconds the consecutive-loss breaker holds entries (default 1800, two windows)",
+    )
+    s.add_argument(
+        "--stop-value",
+        type=float,
+        default=0.10,
+        help="fairvalue: a sale below entry is only made when the model values the position "
+        "at or under this (default 0.10; 0 = never sell at a loss, hold to settlement)",
     )
     s.add_argument(
         "--spot-smooth",

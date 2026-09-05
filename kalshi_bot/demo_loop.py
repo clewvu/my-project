@@ -133,6 +133,8 @@ class LoopConfig:
     reconcile_s: float = 120.0  # compare positions with the exchange this often; 0 = never
     spot_source: str = "auto"  # fairvalue spot: auto (fresh DB tick, else REST) | db | rest
     spot_smooth_s: float = 10.0  # fairvalue: model spot is the mean over this many seconds
+    stop_value: float = 0.10  # fairvalue: sell at a loss only when the model values the
+    # position at or under this (0 = never sell at a loss; hold to settlement)
     # churn control: a position is held at least min_hold_s before an exit may
     # fire; a market sold out of waits reentry_cooloff_s before another entry;
     # allow_flip permits buying the other side of a market already traded
@@ -371,6 +373,7 @@ class DemoLoop:
             take_profit=config.take_profit,
             stop_loss=config.stop_loss,
             spot_smooth_s=config.spot_smooth_s,
+            stop_value=config.stop_value,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name
@@ -794,6 +797,16 @@ class DemoLoop:
         count = int(trade.filled_count)
         if count < 1:
             return
+        # a losing sale needs the strategy to insist (a stop); otherwise the
+        # position is held to settlement, where it can still win in full
+        would_net = self._sale_net(trade, count, decision.price)
+        if would_net < 0 and not decision.stop:
+            self._skip(
+                name,
+                trade.ticker,
+                f"holding: selling at {decision.price:.3f} would book {would_net:+.2f}; not a stop",
+            )
+            return
         order = self.client.create_order(
             trade.ticker,
             side=trade.side,
@@ -833,6 +846,15 @@ class DemoLoop:
             )
             return
         self._book_sale(name, trade, sold, sell_price, now, decision.reason)
+
+    def _sale_net(self, trade: OpenTrade, sold: float, sell_price: float) -> float:
+        """Net result of selling ``sold`` contracts at ``sell_price``, after both fees."""
+        entry = trade.fill_price if trade.fill_price is not None else trade.limit_price
+        entry_fee_total = (
+            trade.fee_paid if trade.fee_paid is not None else order_fee(entry, trade.filled_count)
+        )
+        entry_fee = entry_fee_total * (sold / trade.filled_count) if trade.filled_count else 0.0
+        return sold * (sell_price - entry) - entry_fee - order_fee(sell_price, sold)
 
     def _book_sale(
         self, name: str, trade: OpenTrade, sold: float, sell_price: float, now: float, why: str

@@ -71,11 +71,17 @@ class Skip:
 
 @dataclass
 class Exit:
-    """Sell an open position now at ``price`` (the bid on our side)."""
+    """Sell an open position now at ``price`` (the bid on our side).
+
+    ``stop`` marks a sale the strategy insists on even at a loss (a stop
+    loss, or a position it now values as nearly worthless). Without it the
+    loop refuses to book a losing sale and holds to settlement instead.
+    """
 
     price: float
     reason: str
     inputs: dict[str, Any] = field(default_factory=dict)
+    stop: bool = False
 
 
 class Strategy(Protocol):
@@ -362,6 +368,7 @@ class AlternatingStrategy:
                 bid,
                 f"stop loss: bid {bid:.3f} <= entry {entry_price:.3f} - {self.stop_loss:.2f}",
                 inputs,
+                stop=True,
             )
         return None
 
@@ -393,10 +400,14 @@ class FairValueStrategy:
         exit_margin: float = 0.02,
         params_reload_s: float = 60.0,
         spot_smooth_s: float = 10.0,
+        stop_value: float = 0.10,
     ) -> None:
         self.feed = spot_feed
         self.margin = margin
         self.spot_smooth_s = spot_smooth_s  # model spot = mean over this many seconds
+        # a sale below entry is only proposed as a stop when the model values the
+        # position at or under this; 0 means never sell at a loss
+        self.stop_value = stop_value
         self.vol_window_s = vol_window_s
         self.max_price = max_price
         self.spot_stale_s = spot_stale_s
@@ -487,12 +498,22 @@ class FairValueStrategy:
         )
         surplus = bid - sell_fee - value
         ev.update({"bid": bid, "entry": entry_price, "hold_value": value, "sell_surplus": surplus})
-        if surplus >= self.effective_exit_margin:
+        if surplus < self.effective_exit_margin:
+            return None
+        if bid >= entry_price:
             return Exit(
                 bid,
                 f"sell {side} at {bid:.3f}: model value {value:.3f}, "
                 f"surplus {surplus:+.3f} after fee",
                 ev,
+            )
+        if self.stop_value > 0 and value <= self.stop_value:
+            return Exit(
+                bid,
+                f"stop {side} at {bid:.3f} (entry {entry_price:.3f}): model values it "
+                f"at {value:.3f}, salvage what the bid pays",
+                ev,
+                stop=True,
             )
         return None
 
@@ -668,6 +689,7 @@ def build_strategy(
     take_profit: float = 0.0,
     stop_loss: float = 0.0,
     spot_smooth_s: float = 10.0,
+    stop_value: float = 0.10,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -696,6 +718,7 @@ def build_strategy(
             params_path=params_path,
             exit_margin=exit_margin,
             spot_smooth_s=spot_smooth_s,
+            stop_value=stop_value,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())

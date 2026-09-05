@@ -307,6 +307,12 @@ Four rules hold it back, all on by default:
 * The exit margin is never below the entry margin (`--exit-margin` is a
   floor; `--margin` 0.03 means a round trip needs the model to move at least
   3 cents plus fees both ways).
+* **No selling at a loss unless it is a stop.** A sale that would book a
+  net loss after both fees is refused and the position is held to
+  settlement, where it can still win in full. The only exception is a stop:
+  with `fairvalue` that means the model values the position at or under
+  `--stop-value` (default 10 cents), so the bid is salvage; `--stop-value 0`
+  never sells at a loss. With `alternate`, `--stop-loss` is the stop.
 
 `--spot-smooth` (10 s) feeds the model the mean spot over the last ten
 seconds instead of the last print, so a single tick cannot trigger a trade.
