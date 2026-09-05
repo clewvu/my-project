@@ -132,10 +132,23 @@ class LoopConfig:
     alerts_path: Path | None = Path("state/alerts.jsonl")  # the dashboard's event feed
     reconcile_s: float = 120.0  # compare positions with the exchange this often; 0 = never
     spot_source: str = "auto"  # fairvalue spot: auto (fresh DB tick, else REST) | db | rest
+    spot_smooth_s: float = 10.0  # fairvalue: model spot is the mean over this many seconds
+    # churn control: a position is held at least min_hold_s before an exit may
+    # fire; a market sold out of waits reentry_cooloff_s before another entry;
+    # allow_flip permits buying the other side of a market already traded
+    min_hold_s: float = 60.0
+    reentry_cooloff_s: float = 120.0
+    allow_flip: bool = False
+    # consecutive-loss breaker: after this many losing results in a row (sales
+    # and settlements alike) no entries for loss_pause_s; 0 disables
+    max_consecutive_losses: int = 3
+    loss_pause_s: float = 1800.0
 
     def validate(self) -> None:
         if self.max_entries < 1 or self.free_entries < 1:
             raise ValueError("max_entries and free_entries must be at least 1")
+        if self.max_entries > 6:
+            raise ValueError("max_entries is capped at 6 per market")
         if self.entry not in ("taker", "maker"):
             raise ValueError("entry must be taker or maker")
         if self.strategy not in ("alternate", "fairvalue"):
@@ -158,6 +171,12 @@ class LoopConfig:
             raise ValueError("first_side must be yes or no")
         if self.min_ttc < 0 or self.interval <= 0:
             raise ValueError("min_ttc must be >= 0 and interval > 0")
+        if min(self.min_hold_s, self.reentry_cooloff_s, self.loss_pause_s, self.spot_smooth_s) < 0:
+            raise ValueError(
+                "min_hold_s, reentry_cooloff_s, loss_pause_s, spot_smooth_s must be >= 0"
+            )
+        if self.max_consecutive_losses < 0:
+            raise ValueError("max_consecutive_losses must be >= 0 (0 disables the breaker)")
 
     def size(self, price: float, scale: float = 1.0, dollars: float | None = None) -> int:
         """Contracts for one trade. ``scale`` (0..1) is the learning loop's downward knob;
@@ -185,6 +204,7 @@ class OpenTrade:
     fee_paid: float | None = None  # exchange-reported fees on the fills, when available
     maker: bool = False  # resting one tick inside the spread rather than taking the ask
     taker_price: float | None = None  # the ask at the signal, for the taker fallback
+    fill_ts: float | None = None  # when the fill was first seen; the hold clock starts here
 
     @property
     def filled(self) -> bool:
@@ -198,6 +218,8 @@ class SeriesState:
     seen_tickers: list[str] = field(default_factory=list)
     entries: dict[str, int] = field(default_factory=dict)  # ticker -> entries made
     market_pnl: dict[str, float] = field(default_factory=dict)  # ticker -> realised so far
+    last_exit_ts: dict[str, float] = field(default_factory=dict)  # ticker -> last sale
+    sides_traded: dict[str, str] = field(default_factory=dict)  # ticker -> first side bought
 
     def next_side(self, first_side: str) -> str:
         if self.last_side is None:
@@ -212,6 +234,8 @@ class SeriesState:
         for old in list(self.entries)[:-100]:
             self.entries.pop(old, None)
             self.market_pnl.pop(old, None)
+            self.last_exit_ts.pop(old, None)
+            self.sides_traded.pop(old, None)
 
     def book(self, ticker: str, net: float) -> None:
         self.market_pnl[ticker] = self.market_pnl.get(ticker, 0.0) + net
@@ -241,6 +265,8 @@ class LoopState:
     stopped: str | None = None  # why the last run ended
     paused: bool = False  # the pause file was present at the last tick
     reconciled_ts: float | None = None  # last successful check against the exchange
+    breaker_until: float | None = None  # consecutive-loss breaker: no entries until then
+    loss_streak: int = 0  # losing results in a row, sales and settlements alike
     config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
 
     @classmethod
@@ -344,6 +370,7 @@ class DemoLoop:
             exit_margin=config.exit_margin,
             take_profit=config.take_profit,
             stop_loss=config.stop_loss,
+            spot_smooth_s=config.spot_smooth_s,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name
@@ -452,14 +479,36 @@ class DemoLoop:
         if halt and not self.state.open_trades:
             self.state.save(self.cfg.state_file)
             return halt
+        if self.state.breaker_until is not None and now >= self.state.breaker_until:
+            self.state.breaker_until = None
+            self.alerts.record(
+                "info", self._alert_src, "loss breaker cleared; entries resume", now=now
+            )
+        blocked = halt or paused or self.state.breaker_until is not None
         for name in self.cfg.series:
             ss = self.state.for_series(name)
             if ss.open is not None:
                 self._manage_open(name, now)
-            elif not (halt or paused):
+            elif not blocked:
                 self._maybe_enter(name, now)
         self.state.save(self.cfg.state_file)
         return None
+
+    def _book_result(self, net: float, now: float) -> None:
+        """Track the losing streak and trip the breaker; called on every booked result."""
+        s = self.state
+        s.loss_streak = 0 if net > 0 else s.loss_streak + 1
+        limit = self.cfg.max_consecutive_losses
+        if limit > 0 and self.cfg.loss_pause_s > 0 and s.loss_streak >= limit:
+            if s.breaker_until is None or s.breaker_until < now:
+                s.breaker_until = now + self.cfg.loss_pause_s
+                self.alerts.record(
+                    "warn",
+                    self._alert_src,
+                    f"{s.loss_streak} losses in a row: no new entries for "
+                    f"{self.cfg.loss_pause_s / 60:.0f} minutes (open positions still managed)",
+                    now=now,
+                )
 
     # ------------------------------------------------------------------ reconciliation
 
@@ -542,6 +591,14 @@ class DemoLoop:
             )
             return
         side, price = outcome.side, outcome.price
+        first_side = ss.sides_traded.get(market.ticker)
+        if first_side is not None and first_side != side and not self.cfg.allow_flip:
+            why = f"would flip to {side} after buying {first_side} in this market"
+            self._skip(name, market.ticker, why)
+            self.decisions.record(
+                now=now, strategy=self.strategy.name, series=name, market=market, outcome=Skip(why)
+            )
+            return
         count = self.cfg.size(
             price, getattr(self.strategy, "size_scale", 1.0), dollars=self.trade_dollars(market)
         )
@@ -576,9 +633,11 @@ class DemoLoop:
         if trade.simulated:
             trade.filled_count = float(count)
             trade.fill_price = post_price
+            trade.fill_ts = now
         ss.open = trade
         ss.last_side = side
         ss.note_ticker(market.ticker)
+        ss.sides_traded.setdefault(market.ticker, side)
         self.state.trades += 1
         self.state.save(self.cfg.state_file)
         self.decisions.record(
@@ -610,6 +669,9 @@ class DemoLoop:
                 continue
             if not ss.entries_allowed(m.ticker, self.cfg.max_entries, self.cfg.free_entries):
                 continue
+            last_exit = ss.last_exit_ts.get(m.ticker)
+            if last_exit is not None and now - last_exit < self.cfg.reentry_cooloff_s:
+                continue
             ttc = m.seconds_to_close(datetime.fromtimestamp(now, tz=UTC))
             if ttc is None or ttc < self.cfg.min_ttc:
                 continue
@@ -630,11 +692,13 @@ class DemoLoop:
         if trade is None:
             return
         if trade.filled:
-            if self.cfg.exits and now < trade.close_ts:
+            held = now - (trade.fill_ts if trade.fill_ts is not None else trade.placed_ts)
+            if self.cfg.exits and now < trade.close_ts and held >= self.cfg.min_hold_s:
                 self._maybe_exit(name, trade, now)
             return
         self._refresh_fills(trade)
         if trade.filled:
+            trade.fill_ts = now
             if trade.filled_count + 0.001 < trade.count and trade.order_id is not None:
                 # partial fill: cancel the resting remainder so nothing lingers
                 try:
@@ -803,6 +867,8 @@ class DemoLoop:
         del s.history[:-200]
         ss = s.for_series(name)
         ss.book(trade.ticker, net)
+        ss.last_exit_ts[trade.ticker] = now
+        self._book_result(net, now)
         remaining = trade.filled_count - sold
         if remaining > 0.001:
             trade.filled_count = remaining
@@ -906,6 +972,7 @@ class DemoLoop:
         del s.history[:-200]
         ss.book(trade.ticker, net)
         ss.open = None
+        self._book_result(net, now)
         s.save(self.cfg.state_file)
         self.alerts.record(
             "info",

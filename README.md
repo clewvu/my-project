@@ -286,9 +286,37 @@ the position by the selling fee plus `--exit-margin` (default 2 cents). With
 per contract. `--no-exits` holds everything to settlement.
 
 After a sale the same market can be entered again if the strategy sees a
-fresh edge: up to `--max-entries` per market (default 6), of which the first
-`--free-entries` (default 2) need only a signal and the rest also require
-that market to be in profit so far. One position per series at a time.
+fresh edge: up to `--max-entries` per market (default 2, at most 6), of
+which the first `--free-entries` (default 1) need only a signal and the
+rest also require that market to be in profit so far. One position per
+series at a time.
+
+### Churn control and the loss breaker
+
+The fair-value exit ignores the entry price on purpose: it sells whenever
+the market pays more than the model's value, which is right in expectation
+but, near the strike, the model's probability swings several points on a
+0.1% move in spot while the book is stickier. Left alone the loop trades
+that difference every minute and pays two fees and the spread each time.
+Four rules hold it back, all on by default:
+
+* `--min-hold` (60 s): no exit until the position has been held this long.
+* `--cooloff` (120 s): after selling out of a market, no re-entry for this long.
+* No flips: once a side has been bought in a market, the other side is never
+  bought in that market (`--allow-flip` turns this off).
+* The exit margin is never below the entry margin (`--exit-margin` is a
+  floor; `--margin` 0.03 means a round trip needs the model to move at least
+  3 cents plus fees both ways).
+
+`--spot-smooth` (10 s) feeds the model the mean spot over the last ten
+seconds instead of the last print, so a single tick cannot trigger a trade.
+The raw print is still logged as `spot_last`.
+
+The consecutive-loss breaker holds the line on a bad hour: after
+`--max-consecutive-losses` (3) losing results in a row, sales and
+settlements alike, the loop opens nothing for `--loss-pause` seconds
+(1800, two windows) while still managing what it holds, then resumes and
+says so in the dashboard. The `--loss-cap` remains the hard stop.
 
 ### Sizing that scales with the bankroll
 

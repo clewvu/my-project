@@ -2,6 +2,8 @@ import json
 import math
 import random
 
+import pytest
+
 from kalshi_bot import strategy as st
 from kalshi_bot.models import Market
 
@@ -110,7 +112,7 @@ def test_fairvalue_strategy_trades_only_with_edge():
     hist = st.SpotHistory()
     last = gbm("BTC-USD", hist, 3600, 8e-5)
     feed = FakeFeed({"BTC-USD": last})
-    s = st.FairValueStrategy(feed, margin=0.02, history=hist, max_price=0.95)
+    s = st.FairValueStrategy(feed, margin=0.02, history=hist, max_price=0.95, spot_smooth_s=0)
     s.prepare(T0)
     assert feed.calls == 1 and hist.latest("BTC-USD")[0] == T0
     # strike far below spot: YES is nearly certain; a 50c ask is a big edge
@@ -146,6 +148,28 @@ def test_fairvalue_exit_sells_when_the_market_overpays():
     assert isinstance(ex2, st.Exit) and ex2.price == 0.11
     # no quote / stale data: hold
     assert s.exit(market(strike=last, now=T0 + 100), "yes", 0.5, T0 + 100) is None
+
+
+def test_spot_smoothing_and_exit_margin_floor():
+    hist = st.SpotHistory()
+    for i in range(30):
+        hist.push("BTC-USD", T0 - 30 + i, 100.0)
+    hist.push("BTC-USD", T0, 110.0)  # one wild print
+    assert hist.mean("BTC-USD", 10.0, T0) == pytest.approx((10 * 100 + 110) / 11)
+    assert hist.mean("BTC-USD", 0.0, T0) == 110.0
+    assert hist.mean("XRP-USD", 10.0, T0) is None
+    assert hist.mean("BTC-USD", 10.0, T0 + 1000) == 110.0  # empty window: the latest
+    # the model sees the smoothed spot; the raw print is kept for the log
+    gbm_hist = st.SpotHistory()
+    last = gbm("BTC-USD", gbm_hist, 3600, 8e-5)
+    s = st.FairValueStrategy(FakeFeed({}), history=gbm_hist, margin=0.03, exit_margin=0.02)
+    ev = s.evaluate(market(strike=last, now=T0), T0)
+    assert ev["spot_last"] == gbm_hist.latest("BTC-USD")[1]
+    assert ev["spot"] == gbm_hist.mean("BTC-USD", 10.0, T0) != ev["spot_last"]
+    # the exit needs at least the entry margin
+    assert s.effective_exit_margin == 0.03
+    s.exit_margin = 0.05
+    assert s.effective_exit_margin == 0.05
 
 
 def test_alternating_exit_take_profit_and_stop_loss():

@@ -299,6 +299,7 @@ async function refresh() {
   const banner = $('banner');
   if (hb === 'stale') { banner.className = 'banner show halt'; $('bannertext').innerHTML = `<b>No heartbeat.</b> The loop last ticked at ${tm(s.last_tick_ts)} and has gone quiet: it is not trading and not watching its positions.`; $('bannernote').textContent = 'restart it in its window, or on the server'; }
   else if (s.halted) { banner.className = 'banner show halt'; $('bannertext').innerHTML = `<b>Halted.</b> ${s.halted}`; $('bannernote').textContent = d.alive ? 'open positions settle, then the loop exits' : (s.stopped ? 'the loop has exited' : ''); }
+  else if (s.breaker_until && s.breaker_until > d.now) { banner.className = 'banner show warn'; $('bannertext').innerHTML = `<b>Loss breaker.</b> ${s.loss_streak || ''} losing results in a row; no new entries until ${tm(s.breaker_until)}. Open positions are still managed.`; $('bannernote').textContent = `${Math.ceil((s.breaker_until - d.now) / 60)} min left`; }
   else if (paused) { banner.className = 'banner show warn'; $('bannertext').innerHTML = `<b>Paused.</b> Nothing new is opened; open positions are still managed and settle normally.`; $('bannernote').textContent = d.alive ? 'Resume to trade again' : 'the loop is not running'; }
   else if (d.stop_file_present) { banner.className = 'banner show warn'; $('bannertext').innerHTML = `<b>Stop file present.</b> The loop exits and will not start until it is cleared.`; $('bannernote').textContent = d.stop_file; }
   else { banner.className = 'banner'; }

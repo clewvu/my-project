@@ -142,6 +142,22 @@ class SpotHistory:
         q = self._points.get(symbol)
         return q[-1] if q else None
 
+    def mean(self, symbol: str, window_s: float, now: float) -> float | None:
+        """Average price over the last ``window_s`` seconds, so one print cannot
+        move the model on its own; the latest price when the window is empty."""
+        q = self._points.get(symbol)
+        if not q:
+            return None
+        if window_s <= 0:
+            return q[-1][1]
+        total, n = 0.0, 0
+        for ts, price in reversed(q):
+            if ts < now - window_s:
+                break
+            total += price
+            n += 1
+        return total / n if n else q[-1][1]
+
     def sigma(
         self,
         symbol: str,
@@ -376,9 +392,11 @@ class FairValueStrategy:
         params_path: str | Path | None = None,
         exit_margin: float = 0.02,
         params_reload_s: float = 60.0,
+        spot_smooth_s: float = 10.0,
     ) -> None:
         self.feed = spot_feed
         self.margin = margin
+        self.spot_smooth_s = spot_smooth_s  # model spot = mean over this many seconds
         self.vol_window_s = vol_window_s
         self.max_price = max_price
         self.spot_stale_s = spot_stale_s
@@ -397,7 +415,10 @@ class FairValueStrategy:
         self.risk_fraction = 0.0  # of bankroll per trade, from the learning loop; 0 = off
         self.halt = False
         self.halt_note = ""
-        self.exit_margin = exit_margin  # sell when the bid beats model value by this, after fees
+        # sell when the bid beats model value by this, after fees; never below the
+        # entry margin, so a round trip needs the model to move at least as much
+        # as it took to get in (see ``effective_exit_margin``)
+        self.exit_margin = exit_margin
         self.reload_params(force=True)
 
     def reload_params(self, now: float | None = None, force: bool = False) -> bool:
@@ -466,7 +487,7 @@ class FairValueStrategy:
         )
         surplus = bid - sell_fee - value
         ev.update({"bid": bid, "entry": entry_price, "hold_value": value, "sell_surplus": surplus})
-        if surplus >= self.exit_margin:
+        if surplus >= self.effective_exit_margin:
             return Exit(
                 bid,
                 f"sell {side} at {bid:.3f}: model value {value:.3f}, "
@@ -474,6 +495,10 @@ class FairValueStrategy:
                 ev,
             )
         return None
+
+    @property
+    def effective_exit_margin(self) -> float:
+        return max(self.exit_margin, self.margin)
 
     def bootstrap(self, db_path: str | Path, series: tuple[str, ...], now: float) -> None:
         for name in series:
@@ -507,12 +532,16 @@ class FairValueStrategy:
         if latest is None:
             out["skip"] = "no spot"
             return out
-        spot_ts, spot = latest
-        out["spot"] = spot
+        spot_ts, spot_last = latest
+        out["spot_last"] = spot_last
         out["spot_age_s"] = round(now - spot_ts, 1)
         if now - spot_ts > self.spot_stale_s:
             out["skip"] = f"spot {now - spot_ts:.0f}s old"
             return out
+        spot = self.history.mean(symbol, self.spot_smooth_s, now)  # type: ignore[arg-type]
+        if spot is None:
+            spot = spot_last
+        out["spot"] = spot
         if market.strike is None or market.close_time is None:
             out["skip"] = "market has no strike or close time"
             return out
@@ -638,6 +667,7 @@ def build_strategy(
     exit_margin: float = 0.02,
     take_profit: float = 0.0,
     stop_loss: float = 0.0,
+    spot_smooth_s: float = 10.0,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -665,6 +695,7 @@ def build_strategy(
             max_price=max_price,
             params_path=params_path,
             exit_margin=exit_margin,
+            spot_smooth_s=spot_smooth_s,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())

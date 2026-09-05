@@ -461,6 +461,12 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         maker_wait_s=args.maker_wait,
         reconcile_s=args.reconcile,
         spot_source=args.spot_source,
+        spot_smooth_s=args.spot_smooth,
+        min_hold_s=args.min_hold,
+        reentry_cooloff_s=args.cooloff,
+        allow_flip=args.allow_flip,
+        max_consecutive_losses=args.max_consecutive_losses,
+        loss_pause_s=args.loss_pause,
         pause_file=Path(args.pause_file),
         alerts_path=Path(args.alerts) if args.alerts else None,
     )
@@ -967,7 +973,8 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         "--exit-margin",
         type=float,
         default=0.02,
-        help="fairvalue: sell when the bid beats the model's value by this after fees",
+        help="fairvalue: sell when the bid beats the model's value by this after fees "
+        "(never below --margin, so a round trip needs at least the entry edge back)",
     )
     s.add_argument(
         "--take-profit",
@@ -984,15 +991,53 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
     s.add_argument(
         "--max-entries",
         type=int,
-        default=6,
+        default=2,
         help="entries per 15-minute market; a re-entry needs the previous position sold and "
-        "a fresh signal (default 6, 1 = one entry only)",
+        "a fresh signal (default 2, 1 = one entry only, at most 6)",
     )
     s.add_argument(
         "--free-entries",
         type=int,
-        default=2,
-        help="entries beyond this in one market require that market to be in profit so far",
+        default=1,
+        help="entries beyond this in one market require that market to be in profit so far "
+        "(default 1)",
+    )
+    s.add_argument(
+        "--min-hold",
+        type=float,
+        default=60.0,
+        help="seconds a filled position is held before an exit may fire (default 60)",
+    )
+    s.add_argument(
+        "--cooloff",
+        type=float,
+        default=120.0,
+        help="seconds after selling out of a market before it may be entered again (default 120)",
+    )
+    s.add_argument(
+        "--allow-flip",
+        action="store_true",
+        help="allow buying the opposite side of a market already traded (off by default)",
+    )
+    s.add_argument(
+        "--max-consecutive-losses",
+        type=int,
+        default=3,
+        help="after this many losing results in a row, no entries for --loss-pause seconds "
+        "(default 3; 0 disables)",
+    )
+    s.add_argument(
+        "--loss-pause",
+        type=float,
+        default=1800.0,
+        help="seconds the consecutive-loss breaker holds entries (default 1800, two windows)",
+    )
+    s.add_argument(
+        "--spot-smooth",
+        type=float,
+        default=10.0,
+        help="fairvalue: the model's spot is the mean over this many seconds (default 10; "
+        "0 = the last print)",
     )
     s.add_argument(
         "--risk-fraction",

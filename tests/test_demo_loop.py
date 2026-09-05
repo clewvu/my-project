@@ -122,9 +122,11 @@ class FakeClient:
         else:
             held = {}
             for n, o in enumerate(self.orders, 1):
-                if not self.fill or f"o{n}" in self.cancelled or o["action"] != "buy":
+                if not self.fill or f"o{n}" in self.cancelled:
                     continue
                 signed = o["count"] if o["side"] == "yes" else -o["count"]
+                if o["action"] == "sell":
+                    signed = -signed
                 held[o["ticker"]] = held.get(o["ticker"], 0) + signed
         return [Position.from_dict({"ticker": t, "position": q}) for t, q in held.items() if q]
 
@@ -540,6 +542,8 @@ def _reentry_loop(tmp_path, client, strategy, **cfg_kw):
         spot_db=None,
         loss_cap=100,
         profit_target=None,
+        alerts_path=tmp_path / "alerts.jsonl",
+        pause_file=tmp_path / "PAUSE",
         **cfg_kw,
     )
 
@@ -572,10 +576,13 @@ class _Churner:
         return Exit(self.sell_at, "out")
 
 
+NO_CHURN_CONTROL = dict(min_hold_s=0, reentry_cooloff_s=0, max_consecutive_losses=0)
+
+
 def test_reentry_capped_at_two_when_the_market_is_losing(tmp_path):
     client = FakeClient({0: "yes"})
     loop = _reentry_loop(
-        tmp_path, client, _Churner(sell_at=0.50), max_entries=6
+        tmp_path, client, _Churner(sell_at=0.50), max_entries=6, **NO_CHURN_CONTROL
     )  # sells below entry
     loop.run(max_ticks=25)  # 25 x 30 s: the whole 15-minute window minus the no-entry zone
     buys = [o for o in client.orders if o["action"] == "buy" and o["ticker"] == "KXBTC15M-0"]
@@ -587,7 +594,7 @@ def test_reentry_capped_at_two_when_the_market_is_losing(tmp_path):
 def test_reentry_up_to_six_while_the_market_is_profitable(tmp_path):
     client = FakeClient({0: "yes"})
     loop = _reentry_loop(
-        tmp_path, client, _Churner(sell_at=0.70), max_entries=6
+        tmp_path, client, _Churner(sell_at=0.70), max_entries=6, **NO_CHURN_CONTROL
     )  # sells well above
     loop.run(max_ticks=25)
     buys = [o for o in client.orders if o["action"] == "buy" and o["ticker"] == "KXBTC15M-0"]
@@ -598,11 +605,106 @@ def test_reentry_up_to_six_while_the_market_is_profitable(tmp_path):
     assert loop.state.realized_pnl > 0.5
     # one entry only when configured so
     client2 = FakeClient({0: "yes"})
-    loop2 = _reentry_loop(tmp_path, client2, _Churner(sell_at=0.70), max_entries=1)
+    loop2 = _reentry_loop(
+        tmp_path, client2, _Churner(sell_at=0.70), max_entries=1, **NO_CHURN_CONTROL
+    )
     loop2.run(max_ticks=25)
     assert len([o for o in client2.orders if o["action"] == "buy"]) == 1
     with pytest.raises(ValueError):
         LoopConfig(max_entries=0).validate()
+    with pytest.raises(ValueError):
+        LoopConfig(min_hold_s=-1).validate()
+    with pytest.raises(ValueError):
+        LoopConfig(max_consecutive_losses=-1).validate()
+
+
+def test_min_hold_and_cooloff_slow_the_churn(tmp_path):
+    # the churner wants out every tick; with a 60 s hold and a 120 s cool-off a
+    # 30-second tick loop can make at most one round trip per three minutes
+    client = FakeClient({0: "yes"})
+    loop = _reentry_loop(
+        tmp_path,
+        client,
+        _Churner(sell_at=0.70),
+        max_entries=6,
+        min_hold_s=60,
+        reentry_cooloff_s=120,
+        max_consecutive_losses=0,
+    )
+    loop.run(max_ticks=25)
+    buys = [o for o in client.orders if o["action"] == "buy"]
+    sells = [o for o in client.orders if o["action"] == "sell"]
+    assert 3 <= len(buys) <= 5 and len(sells) == len(buys) - (loop.state.open_trades != [])
+    ss = loop.state.series["KXBTC15M"]
+    assert ss.last_exit_ts["KXBTC15M-0"] > 0
+    assert loop.state.loss_streak == 0
+
+
+class _Flipper(_Churner):
+    """Buys YES first, then wants NO on every later signal."""
+
+    def __init__(self, sell_at):
+        super().__init__(sell_at)
+        self.calls = 0
+
+    def signal(self, market, last_side, now):
+        from kalshi_bot.strategy import Signal
+
+        self.calls += 1
+        side = "yes" if self.calls == 1 else "no"
+        price = market.yes_ask if side == "yes" else market.no_ask
+        return Signal(side=side, price=price, reason="flip")
+
+
+def test_no_flip_within_a_market_unless_allowed(tmp_path):
+    client = FakeClient({0: "yes"})
+    loop = _reentry_loop(
+        tmp_path, client, _Flipper(sell_at=0.70), max_entries=6, **NO_CHURN_CONTROL
+    )
+    loop.run(max_ticks=25)
+    buys = [o for o in client.orders if o["action"] == "buy"]
+    assert len(buys) == 1 and buys[0]["side"] == "yes"
+    assert loop.state.series["KXBTC15M"].sides_traded["KXBTC15M-0"] == "yes"
+    client2 = FakeClient({0: "yes"})
+    loop2 = _reentry_loop(
+        tmp_path,
+        client2,
+        _Flipper(sell_at=0.70),
+        max_entries=6,
+        allow_flip=True,
+        **NO_CHURN_CONTROL,
+    )
+    loop2.run(max_ticks=25)
+    buys2 = [o for o in client2.orders if o["action"] == "buy"]
+    assert len(buys2) >= 2 and buys2[1]["side"] == "no"
+
+
+def test_consecutive_loss_breaker_pauses_entries(tmp_path):
+    # every settlement loses; after three in a row the loop stops entering for
+    # 30 minutes (two windows), then trades again
+    client = FakeClient({i: "no" for i in range(12)})
+    loop, _ = make(
+        tmp_path,
+        client,
+        loss_cap=100,
+        profit_target=None,
+        first_side="yes",
+        strategy="alternate",
+        max_consecutive_losses=3,
+        loss_pause_s=1800,
+    )
+    # alternate buys YES then NO; make the NO markets lose too
+    client.results = {i: ("no" if i % 2 == 0 else "yes") for i in range(12)}
+    loop.run(max_ticks=16 * 8)  # ~8 windows at one tick a minute
+    hist = loop.state.history
+    assert len(hist) >= 4 and all(not h["won"] for h in hist)
+    entered = sorted({h["ticker"] for h in hist})
+    # windows 0,1,2 trade, 3 and 4 are skipped by the breaker, 5 trades again
+    assert "KXBTC15M-3" not in entered and "KXBTC15M-4" not in entered
+    assert "KXBTC15M-5" in entered
+    texts = [a["text"] for a in _alerts(tmp_path)]
+    assert any("losses in a row" in t for t in texts) and any("breaker cleared" in t for t in texts)
+    assert loop.state.loss_streak >= 3
 
 
 def test_loop_uses_the_strategy_and_logs_decisions(tmp_path):
@@ -990,6 +1092,12 @@ def test_live_trade_cli_gates(monkeypatch, capsys):
     assert args.alerts == "state/alerts.jsonl" and args.pause_file == "state/PAUSE"
     cfg = cli._loop_config(args)
     assert cfg.reconcile_s == 0 and cfg.spot_source == "db" and cfg.alerts_path is not None
+    assert cfg.max_entries == 2 and cfg.free_entries == 1 and not cfg.allow_flip
+    assert cfg.min_hold_s == 60 and cfg.reentry_cooloff_s == 120 and cfg.spot_smooth_s == 10
+    assert cfg.max_consecutive_losses == 3 and cfg.loss_pause_s == 1800
+    args = parser.parse_args(["demo-trade", "--allow-flip", "--max-consecutive-losses", "0"])
+    cfg = cli._loop_config(args)
+    assert cfg.allow_flip and cfg.max_consecutive_losses == 0
 
 
 def test_dashboard_refuses_a_busy_port(dashboard):

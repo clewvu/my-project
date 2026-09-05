@@ -338,9 +338,23 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    * Deployment: `deploy/` has a Dockerfile and compose file (live,
      dashboard, recorder, learn) with a server guide; the image build is
      unverified (no Docker in the sandbox).
-   Not built: persisted daily loss cap with manual reset, consecutive-loss
-   breaker. The loss cap is cumulative realised loss per run-state, which
-   is what Cameron asked for.
+   Not built: persisted daily loss cap with manual reset. The loss cap is
+   cumulative realised loss per run-state, which is what Cameron asked for.
+10. Churn fix (2026-09-05 evening). The first live afternoon showed the
+   fair-value exit selling at a loss within a minute of entry and flipping
+   sides in the same market: the model's p swings ~13 points per 0.1% spot
+   move near the strike with 13 minutes left, the book lags, and every
+   round trip pays two fees plus the spread. Five NO positions also
+   settled YES in a rising hour (the driftless model versus a trending
+   market; not a bug, the unproven edge). Built, all default-on:
+   `min_hold_s` 60, `reentry_cooloff_s` 120, `allow_flip` False
+   (`SeriesState.sides_traded`), exit margin floored at the entry margin
+   (`FairValueStrategy.effective_exit_margin`), `spot_smooth_s` 10
+   (`SpotHistory.mean`; the model spot is the 10 s mean, the raw print is
+   logged as `spot_last`), CLI defaults `--max-entries 2 --free-entries
+   1`, and the consecutive-loss breaker (`DemoLoop._book_result`,
+   `LoopState.breaker_until`/`loss_streak`, `--max-consecutive-losses 3
+   --loss-pause 1800`; shown as a banner in the dashboard).
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across
