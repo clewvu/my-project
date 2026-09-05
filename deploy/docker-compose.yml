@@ -23,7 +23,8 @@ services:
       - ../state:/app/state
       - ../secrets:/secrets:ro
     command: >
-      --env prod live-trade --dollars ${TRADE_DOLLARS:-2} --loss-cap ${LOSS_CAP:-40}
+      --env prod live-trade --strategy ${STRATEGY:-fairvalue} --margin ${MARGIN:-0.03}
+      --dollars ${TRADE_DOLLARS:-5} --loss-cap ${LOSS_CAP:-50}
       --profit-target ${PROFIT_TARGET:-0} --real-money --yes
     restart: unless-stopped
 
@@ -41,4 +42,13 @@ services:
     volumes:
       - ../state:/app/state
     command: record
+    restart: unless-stopped
+
+  # the self-improvement loop: retrains hourly on the recorder's data, promotes
+  # parameters only past the gate, and lowers size or halts on live drift
+  learn:
+    image: kalshi-bot
+    volumes:
+      - ../state:/app/state
+    command: learn --every 3600
     restart: unless-stopped

@@ -257,6 +257,34 @@ that file with the recorder's `markets` table. Its edge is unproven until
 `kalshi-bot fairvalue` on recorded data says VIABLE; until then treat a live
 fair-value run as a paid experiment.
 
+### Self-improvement: `kalshi-bot learn`
+
+`kalshi_bot/learn.py` retrains on the recorder's data, promotes new
+parameters only past a gate, and lowers size or halts on live drift. It
+writes `state/params.json`, which the fair-value strategy reloads within a
+minute, and appends every evaluation to `state/learn_history.jsonl`.
+
+```bash
+kalshi-bot learn                 # one cycle, prints what it decided and why
+kalshi-bot learn --every 3600    # keep going, hourly (a third terminal, or the compose service)
+```
+
+Rules, from the research brief section 6a: no online learning; a candidate
+(volatility window, margin, probability calibration) is fitted on the first
+70% of markets and promoted only if its held-out net is at least +1 cent per
+contract with a confidence interval above zero and it beats the incumbent
+on the same windows; size is the only live knob and only moves down; a
+strategy whose live results fall three standard errors short of its own
+probabilities halts until a later cycle passes.
+
+### Exits
+
+The loop can sell before settlement. With `fairvalue`, a position is sold
+(immediate-or-cancel at the bid) when the bid exceeds the model's value of
+the position by the selling fee plus `--exit-margin` (default 2 cents). With
+`alternate`, `--take-profit` and `--stop-loss` set fixed levels in dollars
+per contract. `--no-exits` holds everything to settlement.
+
 ## Development
 
 ```bash

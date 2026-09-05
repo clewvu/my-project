@@ -89,6 +89,11 @@ class LoopConfig:
     vol_window: float = 1800.0  # fairvalue: seconds of spot history behind sigma
     spot_db: Path | None = Path("state/market_data.sqlite")  # seeds spot history if present
     decision_log: Path | None = Path("state/decisions.jsonl")
+    params_path: Path | None = Path("state/params.json")  # written by `kalshi-bot learn`
+    exits: bool = True  # let the strategy sell before settlement
+    exit_margin: float = 0.02  # fairvalue: sell when the bid beats model value by this
+    take_profit: float = 0.0  # alternate: sell when the bid is this far above entry (0 = off)
+    stop_loss: float = 0.0  # alternate: sell when the bid is this far below entry (0 = off)
 
     def validate(self) -> None:
         if self.strategy not in ("alternate", "fairvalue"):
@@ -112,10 +117,12 @@ class LoopConfig:
         if self.min_ttc < 0 or self.interval <= 0:
             raise ValueError("min_ttc must be >= 0 and interval > 0")
 
-    def size(self, price: float) -> int:
+    def size(self, price: float, scale: float = 1.0) -> int:
+        """Contracts for one trade. ``scale`` (0..1) is the learning loop's only live knob."""
+        scale = min(1.0, max(0.0, scale))
         if self.dollars is None:
-            return self.contracts
-        return max(1, math.floor(self.dollars / price + 1e-9))
+            return max(1, math.floor(self.contracts * scale + 1e-9))
+        return max(1, math.floor(self.dollars * scale / price + 1e-9))
 
 
 @dataclass
@@ -265,6 +272,10 @@ class DemoLoop:
             spot_db=config.spot_db,
             series=config.series,
             now=clock(),
+            params_path=config.params_path,
+            exit_margin=config.exit_margin,
+            take_profit=config.take_profit,
+            stop_loss=config.stop_loss,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name
@@ -352,7 +363,7 @@ class DemoLoop:
             )
             return
         side, price = outcome.side, outcome.price
-        count = self.cfg.size(price)
+        count = self.cfg.size(price, getattr(self.strategy, "size_scale", 1.0))
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
         order = self.client.create_order(
             market.ticker,
@@ -424,7 +435,11 @@ class DemoLoop:
 
     def _manage_open(self, name: str, now: float) -> None:
         trade = self.state.for_series(name).open
-        if trade is None or trade.filled:
+        if trade is None:
+            return
+        if trade.filled:
+            if self.cfg.exits and now < trade.close_ts:
+                self._maybe_exit(name, trade, now)
             return
         self._refresh_fills(trade)
         if trade.filled:
@@ -439,6 +454,115 @@ class DemoLoop:
             return
         if now >= trade.close_ts - self.cfg.min_ttc:
             self._cancel_open(name, "unfilled inside the no-entry window")
+
+    def _maybe_exit(self, name: str, trade: OpenTrade, now: float) -> None:
+        """Ask the strategy whether to sell the filled position now, and do it."""
+        try:
+            market = self.client.get_market(trade.ticker)
+        except Exception as exc:  # noqa: BLE001 - quotes can fail; try again next tick
+            log.warning("quote for %s failed: %s", trade.ticker, exc)
+            return
+        entry = trade.fill_price if trade.fill_price is not None else trade.limit_price
+        exit_rule = getattr(self.strategy, "exit", None)
+        decision = exit_rule(market, trade.side, entry, now) if exit_rule else None
+        if decision is None:
+            return
+        count = int(trade.filled_count)
+        if count < 1:
+            return
+        order = self.client.create_order(
+            trade.ticker,
+            side=trade.side,
+            action="sell",
+            count=count,
+            price=decision.price,
+            order_type="limit",
+            time_in_force="immediate_or_cancel",
+        )
+        if isinstance(order, DryRunOrder):
+            sold, sell_price, order_id = float(count), decision.price, None
+        else:
+            order_id = order.order_id
+            sold = max(0.0, order.count - order.remaining_count)
+            sell_price = order.price or decision.price
+            if sold <= 0:
+                fills = [
+                    f
+                    for f in self.client.get_fills(ticker=trade.ticker, order_id=order_id)
+                    if f.order_id == order_id
+                ]
+                sold = sum(f.count for f in fills)
+                if sold > 0:
+                    sell_price = sum(f.count * f.price for f in fills) / sold
+        self.decisions.record(
+            now=now,
+            strategy=self.strategy.name,
+            series=name,
+            market=market,
+            outcome=decision,
+            count=int(sold),
+            order_id=order_id,
+        )
+        if sold <= 0:
+            log.info(
+                "exit %s %s at %.3f did not fill; holding", trade.side, trade.ticker, decision.price
+            )
+            return
+        self._book_sale(name, trade, sold, sell_price, now, decision.reason)
+
+    def _book_sale(
+        self, name: str, trade: OpenTrade, sold: float, sell_price: float, now: float, why: str
+    ) -> None:
+        entry = trade.fill_price if trade.fill_price is not None else trade.limit_price
+        entry_fee_total = (
+            trade.fee_paid if trade.fee_paid is not None else order_fee(entry, trade.filled_count)
+        )
+        entry_fee = entry_fee_total * (sold / trade.filled_count)
+        sell_fee = order_fee(sell_price, sold)
+        gross = sold * (sell_price - entry)
+        net = gross - entry_fee - sell_fee
+        s = self.state
+        s.realized_pnl += net
+        s.fees_paid += entry_fee + sell_fee
+        s.wins += int(net > 0)
+        s.losses += int(net <= 0)
+        s.history.append(
+            {
+                "series": name,
+                "ticker": trade.ticker,
+                "side": trade.side,
+                "count": sold,
+                "price": entry,
+                "sold_at": sell_price,
+                "result": "sold",
+                "won": net > 0,
+                "net": round(net, 4),
+                "settled_ts": now,
+            }
+        )
+        del s.history[:-200]
+        ss = s.for_series(name)
+        remaining = trade.filled_count - sold
+        if remaining > 0.001:
+            trade.filled_count = remaining
+            trade.count = int(round(remaining))
+            if trade.fee_paid is not None:
+                trade.fee_paid = entry_fee_total - entry_fee
+        else:
+            ss.open = None
+        s.save(self.cfg.state_file)
+        log.info(
+            "%ssold %s x%.0f %s at %.3f (entry %.3f) -> %+.2f; %s; %s",
+            "REAL MONEY: " if self.live else "",
+            trade.side,
+            sold,
+            trade.ticker,
+            sell_price,
+            entry,
+            net,
+            why,
+            s.summary(),
+        )
 
     def _refresh_fills(self, trade: OpenTrade) -> None:
         if trade.order_id is None:

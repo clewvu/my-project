@@ -374,6 +374,45 @@ def cmd_whale(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
+    """Retrain on recorded data, gate promotion, check live drift; write state/params.json."""
+    try:
+        from . import learn
+    except ImportError:
+        sys.exit('learn needs pandas: pip install -e ".[research]"')
+    from pathlib import Path
+
+    def once() -> None:
+        params = learn.run_cycle(
+            db_path=args.db,
+            params_path=args.params,
+            history_path=args.history,
+            decisions_path=args.decisions or None,
+            live_state_path=args.live_state or None,
+        )
+        record = {}
+        try:
+            lines = Path(args.history).read_text(encoding="utf-8").splitlines()
+            record = json.loads(lines[-1]) if lines else {}
+        except (OSError, ValueError):
+            pass
+        print(learn.describe(params, record))
+
+    if not args.every:
+        once()
+        return 0
+    print(f"learning every {args.every:.0f}s; Ctrl-C to stop")
+    while True:
+        try:
+            once()
+        except Exception as exc:  # noqa: BLE001 - a bad cycle must not stop the schedule
+            logging.getLogger(__name__).warning("learn cycle failed: %s", exc)
+        try:
+            time.sleep(args.every)
+        except KeyboardInterrupt:
+            return 0
+
+
 def cmd_fairvalue(_: Settings, args: argparse.Namespace) -> int:
     """Test the realised-volatility fair-value model against the book (brief, section 3)."""
     try:
@@ -408,6 +447,11 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         vol_window=args.vol_window,
         spot_db=Path(args.spot_db) if args.spot_db else None,
         decision_log=Path(args.decision_log) if args.decision_log else None,
+        params_path=Path(args.params) if args.params else None,
+        exits=not args.no_exits,
+        exit_margin=args.exit_margin,
+        take_profit=args.take_profit,
+        stop_loss=args.stop_loss,
     )
     try:
         cfg.validate()
@@ -772,6 +816,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_fairvalue)
 
+    s = sub.add_parser("learn", help=cmd_learn.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB, help="recorder database to retrain on")
+    s.add_argument("--params", default="state/params.json", help="parameter file to write")
+    s.add_argument("--history", default="state/learn_history.jsonl")
+    s.add_argument("--decisions", default="state/decisions.jsonl", help="live decision log")
+    s.add_argument("--live-state", default="state/live_loop.json", help="live loop state")
+    s.add_argument(
+        "--every", type=float, default=0.0, help="repeat every N seconds (0 = run once and exit)"
+    )
+    s.set_defaults(func=cmd_learn)
+
     s = sub.add_parser("demo-trade", help=cmd_demo_trade.__doc__)
     _add_loop_args(s, state_file="state/demo_loop.json")
     s.set_defaults(func=cmd_demo_trade)
@@ -880,6 +935,31 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         default="state/decisions.jsonl",
         help="where every decision and its inputs are appended ('' to disable)",
     )
+    s.add_argument(
+        "--params",
+        default="state/params.json",
+        help="parameter file written by `kalshi-bot learn`; the strategy reloads it live "
+        "('' to ignore)",
+    )
+    s.add_argument("--no-exits", action="store_true", help="always hold to settlement")
+    s.add_argument(
+        "--exit-margin",
+        type=float,
+        default=0.02,
+        help="fairvalue: sell when the bid beats the model's value by this after fees",
+    )
+    s.add_argument(
+        "--take-profit",
+        type=float,
+        default=0.0,
+        help="alternate: sell when the bid is this far above entry (dollars; 0 = off)",
+    )
+    s.add_argument(
+        "--stop-loss",
+        type=float,
+        default=0.0,
+        help="alternate: sell when the bid is this far below entry (dollars; 0 = off)",
+    )
     s.add_argument("--state-file", default=state_file)
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--status", action="store_true", help="print the saved state and exit")
@@ -911,6 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         "spot-ws",
         "whale",
         "fairvalue",
+        "learn",
         "demo-ui",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)

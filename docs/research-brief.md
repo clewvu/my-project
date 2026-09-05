@@ -212,6 +212,44 @@ in contracts, never Kelly at full strength.
 Agreed: no news or search tools. Additions limited to exchange WebSockets, the
 existing SQLite store, Telegram, and the backtester with the clustered null.
 
+## 6a. Self-improvement loop (agreed 2026-09-04, built 2026-09-05)
+
+Cameron's section 6 proposal, reviewed and adopted with these rules, all
+implemented in `kalshi_bot/learn.py` and run by `kalshi-bot learn`:
+
+- **No online learning.** The live strategy never adjusts itself between
+  trades. It reads `state/params.json`; only the learning loop writes it.
+- **Scheduled retraining** on the recorder's data (hourly when run with
+  `--every 3600`). Each cycle refits a two-parameter probability calibration
+  (Platt scaling: p' = sigmoid(a + b logit p), the "simple residual model")
+  and chooses the volatility window and margin, on the first 70% of markets
+  by close time, by the lower confidence bound of held-out taker net.
+- **Candidates are judged paired on the same held-out windows** as the
+  incumbent, with the clustered bootstrap from section 3.
+- **Promotion gate.** Held-out taker net at least +1 cent per contract with a
+  95% interval above zero on at least 60 held-out trades, and strictly better
+  than the incumbent on those windows. Otherwise the incumbent stays; with
+  no incumbent the strategy keeps its command-line defaults.
+- **Size is the only live-adjustable parameter, and only downward.** Live
+  fills (decision log joined with the loop's settlements) are compared with
+  the model's own probabilities. Two standard errors short: size halves.
+  Three: the strategy halts until a later cycle passes. Recovery is gradual.
+- **Auto-revert on drift** is the halt above; nothing is unwound by hand.
+- **Everything is logged** to `state/learn_history.jsonl`, promoted or not.
+- **Claude as adversarial reviewer**: the history file and the decision log
+  are what a later session reads to challenge the promotions.
+- Dropped as agreed: funding features. Monthly cadence was agreed for
+  retraining; hourly is what runs, since each cycle is cheap and gated.
+- Sample-size reality (unchanged): distinguishing 2 cents per contract needs
+  about 9,800 windows per arm unpaired; 1 cent needs about 39,000. The gate
+  will say "not promoted" for a long time, and that is correct.
+
+**[added] Exits.** The live loop may sell before settlement. Fair value
+sells when the bid on the held side exceeds the model's value of the
+position by the selling fee plus `--exit-margin`; the alternate strategy
+has fixed take-profit and stop-loss levels. Exits are immediate-or-cancel
+at the bid, so an exit never rests.
+
 ## 7. Priorities
 
 1. Keep recording. Add `expiration_value` capture and the WebSocket spot

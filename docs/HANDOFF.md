@@ -298,6 +298,15 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    has started.
 6. Cameron's current live settings (2026-09-05): $5 per trade, $50 loss
    cap, no profit cap, balance about $140 after a $100 deposit.
+7. The self-improvement loop exists (`kalshi_bot/learn.py`, `kalshi-bot
+   learn [--every 3600]`, research brief section 6a) and exits exist
+   (`strategy.exit`, `DemoLoop._maybe_exit`, `--exit-margin`,
+   `--take-profit`, `--stop-loss`, `--no-exits`). The strategy reloads
+   `state/params.json` within a minute of a change. Cameron should run
+   `learn --every 3600` in a third window (or the compose `learn`
+   service). Expect "candidate failed the promotion gate" for days; that is
+   the gate. Sells use `time_in_force=immediate_or_cancel` on the V2
+   endpoint, untested against a real fill as of this note.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

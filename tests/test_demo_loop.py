@@ -278,6 +278,66 @@ def test_dry_run_simulates_fill(tmp_path):
     assert loop.state.history[0]["price"] == 0.55 and loop.state.config["env"] == "dry-run"
 
 
+def test_loop_sells_when_the_strategy_says_exit(tmp_path):
+    from kalshi_bot.strategy import Exit, Signal
+
+    class ExitAfterFill:
+        name = "exiter"
+        size_scale = 0.5  # the learning loop's knob: $2 at 0.55 would be 3, halved -> 1
+
+        def prepare(self, now):
+            pass
+
+        def signal(self, market, last_side, now):
+            return Signal(side="yes", price=market.yes_ask, reason="in")
+
+        def exit(self, market, side, entry_price, now):
+            return Exit(market.yes_bid, "take it", inputs={"bid": market.yes_bid})
+
+    client = FakeClient({0: "no"})  # would have lost at settlement
+    cfg = LoopConfig(
+        interval=1.0,
+        series=("KXBTC15M",),
+        dollars=2.0,
+        stop_file=tmp_path / "STOP",
+        state_file=tmp_path / "state.json",
+        decision_log=tmp_path / "decisions.jsonl",
+        spot_db=None,
+        loss_cap=100,
+        profit_target=None,
+        max_trades=1,
+    )
+
+    def sleep(s):
+        client.now += 60.0
+
+    loop = DemoLoop(client, cfg, clock=lambda: client.now, sleep=sleep, strategy=ExitAfterFill())
+    assert loop.run().startswith("max trades")
+    buys = [o for o in client.orders if o["action"] == "buy"]
+    sells = [o for o in client.orders if o["action"] == "sell"]
+    assert len(buys) == 1 and buys[0]["count"] == 1  # size halved by size_scale
+    assert len(sells) == 1 and sells[0]["price"] == 0.54 and sells[0]["count"] == 1
+    h = loop.state.history[-1]
+    assert h["result"] == "sold" and h["sold_at"] == 0.54 and h["price"] == 0.55
+    # bought at 0.55, sold at 0.54, two fees: a small loss, not the -0.55 settlement loss
+    assert -0.06 < h["net"] < 0 and loop.state.open_trades == []
+    rows = [json.loads(line) for line in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    assert [r["action"] for r in rows] == ["trade", "exit"]
+    # exits can be switched off
+    client2 = FakeClient({0: "no"})
+    cfg2 = dataclasses.replace(cfg, exits=False, state_file=tmp_path / "s2.json")
+    loop2 = DemoLoop(
+        client2,
+        cfg2,
+        clock=lambda: client2.now,
+        sleep=lambda s: setattr(client2, "now", client2.now + 60),
+        strategy=ExitAfterFill(),
+    )
+    loop2.run()
+    assert not [o for o in client2.orders if o["action"] == "sell"]
+    assert loop2.state.history[-1]["result"] == "no"
+
+
 def test_loop_uses_the_strategy_and_logs_decisions(tmp_path):
     from kalshi_bot.strategy import Signal, Skip
 

@@ -127,6 +127,73 @@ def test_fairvalue_strategy_trades_only_with_edge():
     assert isinstance(out, st.Skip) and "max_price" in out.reason
 
 
+def test_fairvalue_exit_sells_when_the_market_overpays():
+    hist = st.SpotHistory()
+    last = gbm("BTC-USD", hist, 3600, 8e-5)
+    s = st.FairValueStrategy(FakeFeed({}), history=hist, exit_margin=0.02)
+    # we hold YES bought at 0.50; spot now sits well below the strike, so the
+    # model values the position near zero, and a 0.30 bid is a gift
+    m = market(strike=last * 1.01, yes_ask=0.32, no_ask=0.70, now=T0)
+    ex = s.exit(m, "yes", 0.50, T0)
+    assert isinstance(ex, st.Exit) and ex.price == 0.31 and ex.inputs["sell_surplus"] > 0.02
+    # position the model still values highly: hold
+    m2 = market(strike=last * 0.99, yes_ask=0.90, no_ask=0.12, now=T0)
+    assert s.exit(m2, "yes", 0.50, T0) is None
+    # NO side symmetric: spot far above strike makes NO worthless, sell if bid is there
+    ex2 = s.exit(m2, "no", 0.50, T0)
+    assert isinstance(ex2, st.Exit) and ex2.price == 0.11
+    # no quote / stale data: hold
+    assert s.exit(market(strike=last, now=T0 + 100), "yes", 0.5, T0 + 100) is None
+
+
+def test_alternating_exit_take_profit_and_stop_loss():
+    s = st.AlternatingStrategy(take_profit=0.10, stop_loss=0.15)
+    assert s.exit(market(yes_ask=0.66), "yes", 0.50, T0).reason.startswith("take profit")
+    assert s.exit(market(yes_ask=0.60), "yes", 0.50, T0) is None
+    assert s.exit(market(yes_ask=0.35), "yes", 0.50, T0).reason.startswith("stop loss")
+    assert st.AlternatingStrategy().exit(market(yes_ask=0.90), "yes", 0.50, T0) is None
+
+
+def test_params_file_reloads_live(tmp_path):
+    from kalshi_bot.learn import Params
+
+    hist = st.SpotHistory()
+    last = gbm("BTC-USD", hist, 3600, 8e-5)
+    path = tmp_path / "params.json"
+    Params(margin=0.05, vol_window=3600, calib_a=0.2, calib_b=1.3, size_scale=0.5).save(path)
+    clock = {"t": T0}
+    s = st.FairValueStrategy(
+        FakeFeed({"BTC-USD": last}),
+        history=hist,
+        params_path=path,
+        params_reload_s=60,
+        clock=lambda: clock["t"],
+    )
+    assert s.margin == 0.05 and s.vol_window_s == 3600 and s.size_scale == 0.5
+    assert s.calib_a == 0.2 and s.calib_b == 1.3
+    ev = s.evaluate(market(strike=last, now=T0), T0)
+    assert "p_raw" in ev and ev["p_yes"] != ev["p_raw"]
+    # halt flag makes every signal a skip, and clears when the file changes back
+    Params(halt=True, note="drift z=-3.4").save(path)
+    import os
+
+    os.utime(path, (T0 + 100, T0 + 100))
+    clock["t"] = T0 + 120
+    s.prepare(clock["t"])
+    assert (
+        s.halt
+        and "halted by the learning loop" in s.signal(market(now=T0 + 120), None, T0 + 120).reason
+    )
+    Params(halt=False).save(path)
+    os.utime(path, (T0 + 200, T0 + 200))
+    clock["t"] = T0 + 240
+    s.prepare(clock["t"])
+    assert not s.halt and s.margin == 0.02 and s.size_scale == 1.0
+    # missing file: strategy keeps its constructor values
+    s2 = st.FairValueStrategy(FakeFeed({}), history=hist, params_path=tmp_path / "none.json")
+    assert s2.margin == 0.02 and s2.reload_params(force=True) is False
+
+
 def test_fairvalue_strategy_guards():
     hist = st.SpotHistory()
     last = gbm("BTC-USD", hist, 3600, 8e-5)
