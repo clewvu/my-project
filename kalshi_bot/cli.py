@@ -414,6 +414,14 @@ def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
             return 0
 
 
+def cmd_review(_: Settings, args: argparse.Namespace) -> int:
+    """Loss attribution over the live loop's results: where the P&L went and what to change."""
+    from .review import report
+
+    print(report(args.live_state, args.decisions or None))
+    return 0
+
+
 def cmd_fairvalue(_: Settings, args: argparse.Namespace) -> int:
     """Test the realised-volatility fair-value model against the book (brief, section 3)."""
     try:
@@ -465,6 +473,7 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         stop_value=args.stop_value,
         trend_window=args.trend_window,
         trend_bps=args.trend_bps,
+        min_confidence=args.min_confidence,
         min_hold_s=args.min_hold,
         reentry_cooloff_s=args.cooloff,
         allow_flip=args.allow_flip,
@@ -843,6 +852,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_fairvalue)
 
+    s = sub.add_parser("review", help=cmd_review.__doc__)
+    s.add_argument("--live-state", default="state/live_loop.json", help="loop state to read")
+    s.add_argument("--decisions", default="state/decisions.jsonl", help="decision log")
+    s.set_defaults(func=cmd_review)
+
     s = sub.add_parser("learn", help=cmd_learn.__doc__)
     s.add_argument("--db", default=DEFAULT_DB, help="recorder database to retrain on")
     s.add_argument("--params", default="state/params.json", help="parameter file to write")
@@ -1058,6 +1072,13 @@ def _add_loop_args(
         default=0.10,
         help="fairvalue: a sale below entry is only made when the model values the position "
         "at or under this (default 0.10; 0 = never sell at a loss, hold to settlement)",
+    )
+    s.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.65,
+        help="fairvalue: only buy a side the model gives at least this probability "
+        "(default 0.65; near a coin flip the fee is highest and the model noisiest)",
     )
     s.add_argument(
         "--trend-window",

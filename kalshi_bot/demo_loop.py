@@ -137,6 +137,7 @@ class LoopConfig:
     # position at or under this (0 = never sell at a loss; hold to settlement)
     trend_window: float = 300.0  # fairvalue: never fade a spot move over this window...
     trend_bps: float = 10.0  # ...of at least this many basis points (0 disables)
+    min_confidence: float = 0.65  # fairvalue: model probability required for the side bought
     # churn control: a position is held at least min_hold_s before an exit may
     # fire; a market sold out of waits reentry_cooloff_s before another entry;
     # allow_flip permits buying the other side of a market already traded
@@ -179,6 +180,8 @@ class LoopConfig:
             raise ValueError(
                 "min_hold_s, reentry_cooloff_s, loss_pause_s, spot_smooth_s must be >= 0"
             )
+        if not 0 <= self.min_confidence < 1:
+            raise ValueError("min_confidence must be between 0 and 1")
         if self.max_consecutive_losses < 0:
             raise ValueError("max_consecutive_losses must be >= 0 (0 disables the breaker)")
 
@@ -378,6 +381,7 @@ class DemoLoop:
             stop_value=config.stop_value,
             trend_window_s=config.trend_window,
             trend_min_bps=config.trend_bps,
+            min_confidence=config.min_confidence,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name

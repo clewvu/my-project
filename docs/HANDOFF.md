@@ -371,6 +371,11 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    two failure modes seen live (fee churn near the strike, fading a trend),
    not evidence of an edge. `fairvalue.backtest` should grow the same
    rules so the gate judges what actually runs.
+   Then "why so many losses; optimize": `kalshi_bot/review.py` and
+   `kalshi-bot review` (loss attribution by exit type, side, confidence,
+   time to close, strike distance, fee share, with suggested settings) and
+   `--min-confidence` 0.65 (skip near-coin-flip markets, where fees peak
+   and the model is noisiest). Cameron should paste the `review` output.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

@@ -415,7 +415,11 @@ class FairValueStrategy:
         stop_value: float = 0.10,
         trend_window_s: float = 300.0,
         trend_min_bps: float = 10.0,
+        min_confidence: float = 0.65,
     ) -> None:
+        # only buy a side the model gives at least this probability: near a coin
+        # flip the fee is highest and the model's error is largest
+        self.min_confidence = min_confidence
         # never fade a move: a signal against a spot move of at least
         # trend_min_bps over the last trend_window_s is skipped (0 disables)
         self.trend_window_s = trend_window_s
@@ -628,6 +632,12 @@ class FairValueStrategy:
             return Skip(f"best edge {edge:+.3f} ({side}) below margin {self.margin:.3f}", inputs=ev)
         if ask > self.max_price:
             return Skip(f"{side} ask {ask:.3f} above max_price {self.max_price}", inputs=ev)
+        p_side = ev["p_yes"] if side == "yes" else 1 - ev["p_yes"]
+        if p_side < self.min_confidence:
+            return Skip(
+                f"{side} confidence {p_side:.3f} below min_confidence {self.min_confidence:.2f}",
+                inputs=ev,
+            )
         symbol = SPOT_SYMBOLS.get(market.series_ticker)
         trend = (
             self.history.trend_bps(symbol, self.trend_window_s, now)
@@ -727,6 +737,7 @@ def build_strategy(
     stop_value: float = 0.10,
     trend_window_s: float = 300.0,
     trend_min_bps: float = 10.0,
+    min_confidence: float = 0.65,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -758,6 +769,7 @@ def build_strategy(
             stop_value=stop_value,
             trend_window_s=trend_window_s,
             trend_min_bps=trend_min_bps,
+            min_confidence=min_confidence,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())

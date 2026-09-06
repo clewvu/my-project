@@ -257,6 +257,15 @@ that file with the recorder's `markets` table. Its edge is unproven until
 `kalshi-bot fairvalue` on recorded data says VIABLE; until then treat a live
 fair-value run as a paid experiment.
 
+### Where the money went: `kalshi-bot review`
+
+`kalshi-bot review` joins every booked result in `state/live_loop.json`
+with the entry decision that produced it in `state/decisions.jsonl` and
+cuts the P&L by how the position ended, side, series, the model's
+confidence at entry, seconds to close, and distance from the strike, with
+an estimate of how much was fees. It ends with the settings the numbers
+support. Run it after a losing stretch before changing anything.
+
 ### Self-improvement: `kalshi-bot learn`
 
 `kalshi_bot/learn.py` retrains on the recorder's data, promotes new
@@ -317,6 +326,11 @@ Four rules hold it back, all on by default:
 `--spot-smooth` (10 s) feeds the model the mean spot over the last ten
 seconds instead of the last print, so a single tick cannot trigger a trade.
 The raw print is still logged as `spot_last`.
+
+**Confidence floor.** `--min-confidence` (0.65) only buys a side the model
+gives at least that probability. Near a coin flip the fee is at its
+highest and the model's error is largest, so those markets are skipped
+even when the ask looks cheap.
 
 **Never fade a move.** The model assumes no drift, so in a trending hour
 it keeps buying the side the trend is running over. With `--trend-bps`
