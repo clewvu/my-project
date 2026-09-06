@@ -223,13 +223,13 @@ research supports it.
 
 ```bash
 # .env: production API key, KALSHI_DRY_RUN=false
-kalshi-bot --env prod live-trade --dollars 2 --loss-cap 40 --real-money
+kalshi-bot --env prod live-trade --dollars 5 --real-money   # fair value, $50 cap, no profit cap
 kalshi-bot demo-ui --state-file state/live_loop.json
 ```
 
 Gates, all required: `--env prod` on the command line, `KALSHI_DRY_RUN=false`,
 `--real-money`, `--dollars` of at most $20 per trade, a loss cap of at most
-$50 (default $40), and typing `TRADE` at the prompt (`--yes` skips the prompt
+$50 (the default), and typing `TRADE` at the prompt (`--yes` skips the prompt
 for unattended runs). The command prints your balance and the expected fee
 drag first. State goes to `state/live_loop.json`; the stop file and the
 dashboard button work the same way.
@@ -317,6 +317,16 @@ Four rules hold it back, all on by default:
 `--spot-smooth` (10 s) feeds the model the mean spot over the last ten
 seconds instead of the last print, so a single tick cannot trigger a trade.
 The raw print is still logged as `spot_last`.
+
+**Never fade a move.** The model assumes no drift, so in a trending hour
+it keeps buying the side the trend is running over. With `--trend-bps`
+(10) and `--trend-window` (300 s) a signal against a spot move of at least
+10 basis points over the last five minutes is skipped and logged as
+"against the trend". `--trend-bps 0` disables the filter.
+
+`live-trade` defaults to all of this: `--strategy fairvalue --margin 0.03
+--loss-cap 50 --profit-target 0`, so only `--dollars` and `--real-money`
+need to be given. `demo-trade` keeps the alternate strategy by default.
 
 The consecutive-loss breaker holds the line on a bad hour: after
 `--max-consecutive-losses` (3) losing results in a row, sales and

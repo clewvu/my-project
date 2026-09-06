@@ -463,6 +463,8 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         spot_source=args.spot_source,
         spot_smooth_s=args.spot_smooth,
         stop_value=args.stop_value,
+        trend_window=args.trend_window,
+        trend_bps=args.trend_bps,
         min_hold_s=args.min_hold,
         reentry_cooloff_s=args.cooloff,
         allow_flip=args.allow_flip,
@@ -858,7 +860,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_demo_trade)
 
     s = sub.add_parser("live-trade", help=cmd_live_trade.__doc__)
-    _add_loop_args(s, state_file="state/live_loop.json", loss_cap=40.0)
+    _add_loop_args(
+        s,
+        state_file="state/live_loop.json",
+        loss_cap=50.0,
+        profit_target=0.0,
+        strategy="fairvalue",
+    )
     s.add_argument(
         "--real-money",
         action="store_true",
@@ -900,7 +908,14 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: float = 5.0) -> None:
+def _add_loop_args(
+    s: argparse.ArgumentParser,
+    *,
+    state_file: str,
+    loss_cap: float = 5.0,
+    profit_target: float = 10.0,
+    strategy: str = "alternate",
+) -> None:
     s.add_argument(
         "--series",
         action="append",
@@ -928,8 +943,9 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
     s.add_argument(
         "--profit-target",
         type=float,
-        default=10.0,
-        help="stop when realised P&L reaches X dollars; 0 means no profit cap",
+        default=profit_target,
+        help=f"stop when realised P&L reaches X dollars; 0 means no profit cap "
+        f"(default {profit_target:g})",
     )
     s.add_argument("--max-trades", type=int, default=None, help="stop after N trades")
     s.add_argument(
@@ -940,12 +956,15 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
     s.add_argument(
         "--strategy",
         choices=["alternate", "fairvalue"],
-        default="alternate",
+        default=strategy,
         help="alternate: YES/NO in turn (no edge). fairvalue: the research brief's model; "
-        "trades only when fair value beats the ask by the fee plus --margin",
+        f"trades only when fair value beats the ask by the fee plus --margin (default {strategy})",
     )
     s.add_argument(
-        "--margin", type=float, default=0.02, help="fairvalue: required edge beyond the fee"
+        "--margin",
+        type=float,
+        default=0.03,
+        help="fairvalue: required edge beyond the fee (default 0.03)",
     )
     s.add_argument(
         "--vol-window",
@@ -1039,6 +1058,18 @@ def _add_loop_args(s: argparse.ArgumentParser, *, state_file: str, loss_cap: flo
         default=0.10,
         help="fairvalue: a sale below entry is only made when the model values the position "
         "at or under this (default 0.10; 0 = never sell at a loss, hold to settlement)",
+    )
+    s.add_argument(
+        "--trend-window",
+        type=float,
+        default=300.0,
+        help="fairvalue: never fade a spot move over this many seconds (default 300)",
+    )
+    s.add_argument(
+        "--trend-bps",
+        type=float,
+        default=10.0,
+        help="fairvalue: ...of at least this many basis points (default 10; 0 disables)",
     )
     s.add_argument(
         "--spot-smooth",

@@ -135,6 +135,8 @@ class LoopConfig:
     spot_smooth_s: float = 10.0  # fairvalue: model spot is the mean over this many seconds
     stop_value: float = 0.10  # fairvalue: sell at a loss only when the model values the
     # position at or under this (0 = never sell at a loss; hold to settlement)
+    trend_window: float = 300.0  # fairvalue: never fade a spot move over this window...
+    trend_bps: float = 10.0  # ...of at least this many basis points (0 disables)
     # churn control: a position is held at least min_hold_s before an exit may
     # fire; a market sold out of waits reentry_cooloff_s before another entry;
     # allow_flip permits buying the other side of a market already traded
@@ -374,6 +376,8 @@ class DemoLoop:
             stop_loss=config.stop_loss,
             spot_smooth_s=config.spot_smooth_s,
             stop_value=config.stop_value,
+            trend_window_s=config.trend_window,
+            trend_min_bps=config.trend_bps,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name

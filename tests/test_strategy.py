@@ -112,7 +112,9 @@ def test_fairvalue_strategy_trades_only_with_edge():
     hist = st.SpotHistory()
     last = gbm("BTC-USD", hist, 3600, 8e-5)
     feed = FakeFeed({"BTC-USD": last})
-    s = st.FairValueStrategy(feed, margin=0.02, history=hist, max_price=0.95, spot_smooth_s=0)
+    s = st.FairValueStrategy(
+        feed, margin=0.02, history=hist, max_price=0.95, spot_smooth_s=0, trend_min_bps=0
+    )
     s.prepare(T0)
     assert feed.calls == 1 and hist.latest("BTC-USD")[0] == T0
     # strike far below spot: YES is nearly certain; a 50c ask is a big edge
@@ -178,6 +180,29 @@ def test_spot_smoothing_and_exit_margin_floor():
     assert s.effective_exit_margin == 0.03
     s.exit_margin = 0.05
     assert s.effective_exit_margin == 0.05
+
+
+def test_trend_filter_never_fades_a_move():
+    hist = st.SpotHistory()
+    for i in range(720):  # an hour of 5 s ticks, flat then a 30 bps climb in the last 5 min
+        t = T0 - 3600 + i * 5
+        price = 100.0 if t < T0 - 300 else 100.0 * (1 + 0.003 * (t - (T0 - 300)) / 300)
+        hist.push("BTC-USD", t + 0.0, price + 0.0001 * (i % 3))  # tiny jitter keeps sigma > 0
+    assert hist.trend_bps("BTC-USD", 300.0, T0) == pytest.approx(30, abs=1.5)
+    assert hist.trend_bps("BTC-USD", 0.0, T0) is None and hist.trend_bps("X", 300.0, T0) is None
+    s = st.FairValueStrategy(FakeFeed({}), history=hist, margin=0.0, max_price=0.99)
+    spot = hist.mean("BTC-USD", 10.0, T0)
+    # strike well above spot: the model wants NO, but spot is climbing: skip
+    out = s.signal(market(strike=spot * 1.01, yes_ask=0.50, no_ask=0.50, now=T0), None, T0)
+    assert isinstance(out, st.Skip) and "against the trend" in out.reason
+    assert out.inputs["trend_bps"] > 10
+    # with the trend: YES on a strike below spot is fine
+    sig = s.signal(market(strike=spot * 0.99, yes_ask=0.50, no_ask=0.50, now=T0), None, T0)
+    assert isinstance(sig, st.Signal) and sig.side == "yes"
+    # filter off: NO is allowed again
+    s.trend_min_bps = 0.0
+    sig = s.signal(market(strike=spot * 1.01, yes_ask=0.50, no_ask=0.50, now=T0), None, T0)
+    assert isinstance(sig, st.Signal) and sig.side == "no"
 
 
 def test_alternating_exit_take_profit_and_stop_loss():

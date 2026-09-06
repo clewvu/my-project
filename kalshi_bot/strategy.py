@@ -164,6 +164,18 @@ class SpotHistory:
             n += 1
         return total / n if n else q[-1][1]
 
+    def trend_bps(self, symbol: str, window_s: float, now: float) -> float | None:
+        """Move over the last ``window_s`` seconds in basis points: the latest
+        price against the first price inside the window. None without both."""
+        q = self._points.get(symbol)
+        if not q or window_s <= 0:
+            return None
+        start = now - window_s
+        first = next((p for t, p in q if t >= start), None)
+        if first is None or q[-1][0] < start:
+            return None
+        return (q[-1][1] / first - 1.0) * 1e4
+
     def sigma(
         self,
         symbol: str,
@@ -401,7 +413,13 @@ class FairValueStrategy:
         params_reload_s: float = 60.0,
         spot_smooth_s: float = 10.0,
         stop_value: float = 0.10,
+        trend_window_s: float = 300.0,
+        trend_min_bps: float = 10.0,
     ) -> None:
+        # never fade a move: a signal against a spot move of at least
+        # trend_min_bps over the last trend_window_s is skipped (0 disables)
+        self.trend_window_s = trend_window_s
+        self.trend_min_bps = trend_min_bps
         self.feed = spot_feed
         self.margin = margin
         self.spot_smooth_s = spot_smooth_s  # model spot = mean over this many seconds
@@ -610,6 +628,23 @@ class FairValueStrategy:
             return Skip(f"best edge {edge:+.3f} ({side}) below margin {self.margin:.3f}", inputs=ev)
         if ask > self.max_price:
             return Skip(f"{side} ask {ask:.3f} above max_price {self.max_price}", inputs=ev)
+        symbol = SPOT_SYMBOLS.get(market.series_ticker)
+        trend = (
+            self.history.trend_bps(symbol, self.trend_window_s, now)
+            if symbol and self.trend_min_bps > 0
+            else None
+        )
+        if trend is not None:
+            ev["trend_bps"] = round(trend, 1)
+            against = (side == "no" and trend >= self.trend_min_bps) or (
+                side == "yes" and trend <= -self.trend_min_bps
+            )
+            if against:
+                return Skip(
+                    f"{side} is against the trend: spot {trend:+.0f} bps over "
+                    f"{self.trend_window_s / 60:.0f} min",
+                    inputs=ev,
+                )
         return Signal(
             side=side,
             price=ask,
@@ -690,6 +725,8 @@ def build_strategy(
     stop_loss: float = 0.0,
     spot_smooth_s: float = 10.0,
     stop_value: float = 0.10,
+    trend_window_s: float = 300.0,
+    trend_min_bps: float = 10.0,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -719,6 +756,8 @@ def build_strategy(
             exit_margin=exit_margin,
             spot_smooth_s=spot_smooth_s,
             stop_value=stop_value,
+            trend_window_s=trend_window_s,
+            trend_min_bps=trend_min_bps,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())

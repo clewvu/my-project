@@ -361,6 +361,16 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    sets `stop=True` only when its value of the position is at or under
    `stop_value` (`--stop-value`, 0.10; 0 = never sell at a loss);
    alternate's `--stop-loss` is a stop. Take-profit exits are unchanged.
+   Then "set new and improved strategy": a trend filter
+   (`SpotHistory.trend_bps`, `--trend-window 300 --trend-bps 10`; a signal
+   against a >=10 bps move over 5 min is skipped) and `live-trade`
+   defaults of `--strategy fairvalue --margin 0.03 --loss-cap 50
+   --profit-target 0`, so the restart command is
+   `kalshi-bot --env prod live-trade --dollars 5 --real-money`. None of
+   these rules has a backtest behind it yet; they are guards against the
+   two failure modes seen live (fee churn near the strike, fading a trend),
+   not evidence of an edge. `fairvalue.backtest` should grow the same
+   rules so the gate judges what actually runs.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

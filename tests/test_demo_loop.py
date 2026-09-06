@@ -1095,7 +1095,9 @@ def test_live_trade_cli_gates(monkeypatch, capsys):
 
     parser = cli.build_parser()
     args = parser.parse_args(["live-trade", "--dollars", "2"])
-    assert args.loss_cap == 40.0 and args.state_file == "state/live_loop.json"
+    assert args.loss_cap == 50.0 and args.state_file == "state/live_loop.json"
+    assert args.strategy == "fairvalue" and args.profit_target == 0 and args.margin == 0.03
+    assert cli.build_parser().parse_args(["demo-trade"]).strategy == "alternate"
     demo = cli.Settings.from_env("/nonexistent")
     with pytest.raises(SystemExit):
         cli.cmd_live_trade(demo, args)  # env is demo
