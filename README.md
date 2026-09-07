@@ -267,13 +267,32 @@ that file with the recorder's `markets` table. Its edge is unproven until
 `kalshi-bot fairvalue` on recorded data says VIABLE; until then treat a live
 fair-value run as a paid experiment.
 
+### The maker pivot: `kalshi-bot quote-test`
+
+The directional trade has now been measured on recorded data and on real
+money, and the published large-sample studies of these 15-minute binaries
+agree: takers lose to a market that is faster than a spot model, makers
+lose far less, and the crypto series charge no maker fee. `kalshi-bot
+quote-test` backtests the pivot on the recorder's snapshots and trade
+prints: rest a YES bid and a NO bid a `spread` under the model's fair
+value (already TWAP-aware through `effective_tau`), requote every
+snapshot, fill only when a public print crosses the quote (`--fill cross`,
+conservative; `touch` for at-price fills), hold fills to settlement, count
+a market that fills both sides as locked. It reports fills, win rate,
+adverse selection (fair value when quoted against what settled), net per
+contract with a clustered bootstrap, a cut by seconds to close, and a
+time-ordered held-out verdict. Nothing quotes live until that verdict
+says VIABLE; the live quoting engine is the next build after it does.
+
 ### Where the money went: `kalshi-bot review`
 
 `kalshi-bot review` joins every booked result in `state/live_loop.json`
 with the entry decision that produced it in `state/decisions.jsonl` and
-cuts the P&L by how the position ended, side, series, the model's
-confidence at entry, seconds to close, and distance from the strike, with
-an estimate of how much was fees. It ends with the settings the numbers
+cuts the P&L by how the position ended, entry type (maker or taker, with
+the fee per contract actually booked, so the zero-maker-fee claim can be
+checked on your own fills), side, series, the model's confidence at entry,
+seconds to close, and distance from the strike, with an estimate of how
+much was fees. It ends with the settings the numbers
 support. Run it after a losing stretch before changing anything.
 
 ### Self-improvement: `kalshi-bot learn`
@@ -409,11 +428,21 @@ next check the loop halts, because its P&L can no longer be trusted, and
 says why in the dashboard. Markets the loop has already booked are ignored
 while Kalshi settles them. `--reconcile 0` disables the check.
 
-### Dashboard: pause, events, heartbeat
+### Dashboard: the Lewis Wealth Global desk
 
-`kalshi-bot demo-ui` shows the running loop (it reads whichever of
-`state/live_loop.json` and `state/demo_loop.json` is fresher, or the
-`--state-file` you give it) and offers three controls:
+`kalshi-bot demo-ui` serves a single-page desk on localhost (navy and
+gold, dark and light, a theme toggle in the masthead) that reads whichever
+of `state/live_loop.json`, `state/paper_loop.json` and
+`state/demo_loop.json` is freshest, or the `--state-file` you give it.
+Four views: **Overview** (realised P&L against the cap, results, win rate,
+fees, stake, heartbeat, the equity curve, open positions, by series);
+**Trades** (every booked result, sortable by any column, filterable by
+series, side and how it ended; click a row to open the decision-log record
+behind it: model probability, edge, spot, strike, trend, volatility raw
+and clamped, the asks, the stake, the fee booked, and any exit);
+**Analysis** (the review's cuts as tables whose rows filter the trades, the
+confidence tiers that gate sizing, and what the numbers support);
+**Activity** (the event feed). Three controls sit in the masthead:
 
 * **Pause entries** writes `state/PAUSE`: the loop keeps ticking, manages
   and settles what it holds, but opens nothing new. **Resume** removes it.
@@ -425,9 +454,18 @@ while Kalshi settles them. `--reconcile 0` disables the check.
   drift halts. A loop that stops ticking for 90 seconds without saying why
   is flagged as having no heartbeat, in the pill and in a banner.
 
-There are no push alerts by design; the page is the alert channel. On a
-server, bind it with `--host 0.0.0.0` behind your own access control (see
-`deploy/README.md`).
+There are no push alerts by design; the page is the alert channel.
+
+**From a phone.** Any `--host` other than the local machine requires
+`--password` (or `DASHBOARD_PASSWORD` in the environment); the page then
+asks for it, any username. On the same Wi-Fi, `kalshi-bot demo-ui --host
+0.0.0.0 --password ...` and the laptop's address work. For a server that
+runs with the laptop off, and a private network so the page is reachable
+from the phone anywhere but never from the public internet, follow
+`deploy/README.md` (Docker, Tailscale, a bootstrap script). When both the
+live and the paper loop are running, a selector in the subline switches
+between them; the live loop is shown by default while its heartbeat is
+fresh.
 
 ### Spot source
 
@@ -439,7 +477,17 @@ research uses when the recorder is running alongside it. `--spot-source db`
 never falls back to REST (a stale feed then means no trades); `--spot-source
 rest` ignores the database.
 
-## Sports (kalshi-sports)
+## Sports research: a separate project in this repository
+
+Everything above this heading is the **crypto 15-minute desk**: package
+`kalshi_bot/`, command `kalshi-bot`, state in `state/live_loop.json`,
+`state/paper_loop.json`, `state/decisions.jsonl`, `state/alerts.jsonl`,
+`state/params.json` and `state/market_data.sqlite`, docs in
+`docs/HANDOFF.md`, `docs/research-brief.md` and `docs/PHONE_AND_SERVER.md`,
+tests in `tests/test_*.py` except the `test_sports_*` files. The two
+projects share only the Kalshi client, the models, the fee model, the
+`.env` file and the server deployment. `docs/PROJECT_MAP.md` lists every
+file by project.
 
 A second package, `kalshi_sports/`, applies the same research-first approach
 to Kalshi's game markets on MLB, NFL, NBA, college football and college

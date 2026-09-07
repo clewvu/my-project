@@ -146,6 +146,7 @@ class LoopConfig:
     # has earned it (MIN_TIER_RESULTS results with positive net, live + paper)
     scale_by_confidence: bool = True
     paper_state: Path | None = Path("state/paper_loop.json")  # paper results count too
+    paper_decisions: Path | None = Path("state/paper_decisions.jsonl")
     record_refresh_s: float = 300.0
     # churn control: a position is held at least min_hold_s before an exit may
     # fire; a market sold out of waits reentry_cooloff_s before another entry;
@@ -433,11 +434,13 @@ class DemoLoop:
         if self._record_ts is not None and now - self._record_ts < self.cfg.record_refresh_s:
             return
         self._record_ts = now
-        paths: list[str | Path] = [self.cfg.state_file]
+        sources: list[tuple[str | Path, str | Path | None]] = [
+            (self.cfg.state_file, self.cfg.decision_log)
+        ]
         if self.cfg.paper_state and Path(self.cfg.paper_state) != Path(self.cfg.state_file):
-            paths.append(self.cfg.paper_state)
+            sources.append((self.cfg.paper_state, self.cfg.paper_decisions))
         try:
-            self.record = TrackRecord.load(paths, self.cfg.decision_log, now=now)
+            self.record = TrackRecord.load(sources, now=now)
         except Exception as exc:  # noqa: BLE001 - sizing falls back to the base stake
             log.warning("track record refresh failed: %s", exc)
             return
@@ -794,7 +797,14 @@ class DemoLoop:
             try:
                 self.client.cancel_order(trade.order_id, ticker=trade.ticker)
             except Exception as exc:  # noqa: BLE001
-                log.warning("cancel maker %s failed: %s", trade.order_id, exc)
+                # the resting order may still be live: sending a taker order now
+                # could fill both and double the position. Retry next tick.
+                log.warning(
+                    "cancel maker %s failed (%s); keeping it, retrying next tick",
+                    trade.order_id,
+                    exc,
+                )
+                return
             self._refresh_fills(trade)
             if trade.filled:
                 log.info("maker order %s filled before cancel; holding", trade.order_id)
@@ -944,6 +954,9 @@ class DemoLoop:
                 "won": net > 0,
                 "net": round(net, 4),
                 "settled_ts": now,
+                "maker": trade.maker,
+                "fee": round(entry_fee + sell_fee, 4),
+                "fee_reported": trade.fee_paid is not None,
             }
         )
         del s.history[:-200]
@@ -1049,6 +1062,9 @@ class DemoLoop:
                 "won": won,
                 "net": round(net, 4),
                 "settled_ts": now,
+                "maker": trade.maker,
+                "fee": round(fee, 4),
+                "fee_reported": trade.fee_paid is not None,
             }
         )
         del s.history[:-200]

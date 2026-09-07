@@ -181,6 +181,11 @@ class SportsTrader:
 
     # ------------------------------------------------------------ startup
 
+    def _sports_league(self, ticker: str) -> str | None:
+        """League key if the ticker is one of the configured sports series, else None."""
+        lg = leagues.league_for_series(ticker.split("-", 1)[0])
+        return lg.key if lg is not None and lg.key in self.cfg.leagues else None
+
     def reconcile(self, now: float) -> list[str]:
         """Compare open positions with the exchange (live only). Returns warnings."""
         if self.cfg.mode != "live":
@@ -196,9 +201,19 @@ class SportsTrader:
             notes.append(f"reconcile: positions call failed: {exc}")
             return notes
         ours = {r["ticker"]: r for r in self.store.positions(status="open", mode="live")}
+        # Positions adopted from the exchange in the past that turn out not to be sports
+        # markets (the crypto loop's, for instance) are voided, not counted as exposure.
+        for ticker, row in list(ours.items()):
+            if row["order_id"] == "adopted" and self._sports_league(ticker) is None:
+                self.store.settle_position(row["id"], status="void", result=None, net=0.0, now=now)
+                notes.append(f"{ticker}: not a sports market; dropped the adopted row")
+                del ours[ticker]
         for ticker, p in exchange.items():
             if ticker in ours:
                 continue
+            league = self._sports_league(ticker)
+            if league is None:
+                continue  # another loop's position (crypto); not ours to track
             side = p.side or "yes"
             contracts = int(abs(p.position))
             price = abs(p.total_cost) / contracts if contracts else 0.0
@@ -207,7 +222,7 @@ class SportsTrader:
                     "mode": "live",
                     "ticker": ticker,
                     "event_ticker": p.event_ticker,
-                    "league": None,
+                    "league": league,
                     "side": side,
                     "side_team": None,
                     "contracts": contracts,
@@ -425,7 +440,9 @@ class SportsTrader:
             cons = self._consensus_for(league, cand["event_ticker"], at=now)
             ctx = self._context(cand, quotes, cons, now)
             pre = self.strategy.evaluate(ctx)
-            wants_fresh = pre.is_entry or pre.reason == "odds stale"
+            # pull fresh odds when a signal needs confirming, when the odds we have are
+            # stale, or when the recorder has none for this league at all
+            wants_fresh = pre.is_entry or pre.reason in ("odds stale", "no consensus")
             if wants_fresh and league not in refreshed:
                 if cons is None or cons.age_s > self.cfg.confirm_age_s:
                     if self._refresh_odds(league, now, res):

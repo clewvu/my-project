@@ -78,9 +78,9 @@ def _files(tmp_path, n, p_yes, net):
 
 def test_track_record_loads_live_and_paper_without_double_counting(tmp_path):
     paths, dec = _files(tmp_path, 24, 0.72, 2.0)
-    rec = sizing.TrackRecord.load(paths, dec, now=T0)
+    rec = sizing.TrackRecord.load([(p, dec) for p in paths], now=T0)
     assert rec.results == 24 and rec.tiers["0.65-0.75"].n == 24
     assert rec.allows_scaling(0.70)
-    again = sizing.TrackRecord.load(paths + [paths[0]], dec, now=T0)
+    again = sizing.TrackRecord.load([(p, dec) for p in paths + [paths[0]]], now=T0)
     assert again.results == 24  # the same file twice is not twice the evidence
-    assert sizing.TrackRecord.load([tmp_path / "missing.json"], None, now=T0).results == 0
+    assert sizing.TrackRecord.load([(tmp_path / "missing.json", None)], now=T0).results == 0

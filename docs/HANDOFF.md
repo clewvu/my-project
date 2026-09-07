@@ -398,6 +398,60 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    10`); the live ceiling stays $20 and the cap $50. Not built yet: the
    learned model on recorded data (logistic on z-score, trend, ttc,
    market-implied p) and the extra series (ETH, SOL, XRP).
+11. Cameron shared a research summary (2026-09-07) with three claims:
+   settlement is a 60 s trimmed average (our `effective_tau` already
+   prices the averaging; brief section 3), the crypto maker fee is zero
+   (`fees.MAKER_RATE` is already 0; the loop's entry threshold still uses
+   the taker fee, conservative; history rows now carry `maker`, `fee`,
+   `fee_reported` and `review` prints fee per contract by entry type so
+   the claim is checked on real fills), and a 727M-row study finds the
+   spot-model directional trade nets -0.116 per trade with a 16 ms
+   lead-lag (matches our live result). The pivot it recommends, passive
+   TWAP-aware quoting, is now backtestable: `kalshi_bot/quoting.py`,
+   `kalshi-bot quote-test [--fill cross|touch] [--min-ttc]` (quotes both
+   sides `spread` under fair value per snapshot, fills on crossing prints
+   with taker_side, one fill per side per market, locked when both fill,
+   clustered bootstrap, held-out verdict). Next if VIABLE: a live quoting
+   engine (two resting orders per market, requote on fair-value moves,
+   inventory cap, pull quotes on a spot jump; 1 s ticks). Cameron also
+   asked for the system to be "an expert in BTC and DOGE prediction and
+   evaluation": evaluation exists (`fairvalue` Brier vs market and basis
+   tables, `review`, the track record); prediction beyond the driftless
+   model is the learned-model item above and needs the recorder's data.
+12. Dashboard redesign (2026-09-07, Cameron's ask): Lewis Wealth Global
+   branding with an inline SVG monogram and favicon, the creed "Faith
+   without Works is Dead. God Move." in the masthead and footer, navy and
+   gold palette in dark and light with a toggle (localStorage), tabs
+   Overview / Trades / Analysis / Activity. New endpoints in `demo_ui`:
+   `/api/analysis` (review cuts, tiers, suggestions, every result row with
+   entry inputs, from `review.attribute`) and `/api/decisions?ticker=`
+   (decision-log rows for one market, cached on file mtime/size);
+   `--decisions` flag. Rendered and checked in Chromium in both themes.
+13. Phone and 24/7 (2026-09-07): `demo_ui` requires `--password`
+   (`DASHBOARD_PASSWORD`) for any non-local `--host` and enforces HTTP
+   Basic auth on every route; `resolve(name)` prefers the first candidate
+   with a live heartbeat (live before paper), `?file=` selects one, the
+   page has a selector when more than one state file exists; the paper
+   loop keeps `state/paper_decisions.jsonl` and `paper_alerts.jsonl` so
+   its results never mix with live ones (`companions`); `TrackRecord.load`
+   takes (state, decisions) pairs. `deploy/`: compose adds a `paper`
+   service, `DASHBOARD_BIND` and `DASHBOARD_PASSWORD`, `TRADE_DOLLARS=10`;
+   `deploy/setup.sh` bootstraps Ubuntu (Docker, Tailscale, ufw allowing
+   SSH and tailscale0 only, clone, folders); README walks through a VPS,
+   Tailscale on server and phone, `DASHBOARD_BIND` = the 100.x address.
+   Unverified in the sandbox: the Docker build and the Tailscale steps.
+14. Reconciliation halt (2026-09-07 evening): "KXBTC15M-26SEP071815-15:
+   loop has -9, exchange -18". Two credible causes, both now guarded:
+   (a) the maker-to-taker fallback sent the taker order even when the
+   cancel of the resting maker order had raised, so both could fill
+   (`_maker_to_taker` now returns and retries next tick on a failed
+   cancel); (b) two loops on one state file, after a window was closed
+   and the loop restarted while the old process still lived
+   (`_loop_housekeeping` refuses to start while the state file's
+   heartbeat is under 30 s unless `--force`). A persisted halt now stops
+   the CLI at start-up with the reason; `--clear-halt` clears it and the
+   breaker while keeping history and the cap. Tests run in isolated cwd
+   (`tests/conftest.py`) after the suite polluted the real alerts file.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

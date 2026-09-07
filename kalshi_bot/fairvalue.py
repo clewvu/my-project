@@ -186,7 +186,7 @@ def load(
     ds = analysis.load(db_path, series=series)
     con = sqlite3.connect(db_path)
     try:
-        trades = pd.read_sql("SELECT ticker, ts, yes_price, no_price FROM trades", con)
+        trades = pd.read_sql("SELECT ticker, ts, yes_price, no_price, taker_side FROM trades", con)
     finally:
         con.close()
     trades = trades[trades["ticker"].isin(ds.markets["ticker"])].dropna(subset=["ts"])

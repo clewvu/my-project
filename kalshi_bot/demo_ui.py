@@ -12,20 +12,33 @@ leaves the machine.
 
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import logging
+import os
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from . import alerts as alertmod
-from .dashboard_page import PAGE
+from . import review, sizing
+from .dashboard_page import FAVICON, PAGE
 
 log = logging.getLogger(__name__)
 
 ALIVE_WITHIN_S = 30.0
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+PASSWORD_ENV = "DASHBOARD_PASSWORD"
+
+
+def password_from_env() -> str | None:
+    return os.environ.get(PASSWORD_ENV) or None
+
+
 STALE_AFTER_S = 90.0  # a running loop that has not ticked for this long is presumed dead
 ALERTS_SHOWN = 40
 
@@ -43,6 +56,7 @@ class Dashboard:
         stop_file: Path,
         pause_file: Path | None = None,
         alerts_file: Path | None = None,
+        decisions_file: Path | None = None,
         sports_dir: Path | None = None,
     ) -> None:
         files = state_file if isinstance(state_file, list) else [state_file]
@@ -50,6 +64,8 @@ class Dashboard:
         self.stop_file = Path(stop_file)
         self.pause_file = Path(pause_file) if pause_file else self.stop_file.with_name("PAUSE")
         self.alerts_file = Path(alerts_file) if alerts_file else None
+        self.decisions_file = Path(decisions_file) if decisions_file else None
+        self._decisions_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
         # The sports desk (kalshi-sports) keeps its own files in the same state directory,
         # all prefixed so nothing is shared with the crypto loop: status JSON per mode,
         # its own alert log, its own database, and its own stop and pause files.
@@ -60,22 +76,68 @@ class Dashboard:
         self.sports_stop_file = sd / "SPORTS_STOP"
         self.sports_pause_file = sd / "SPORTS_PAUSE"
 
-    @property
-    def state_file(self) -> Path:
+    @staticmethod
+    def _read(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except ValueError:
+            return None  # mid-write; the next poll will get it
+
+    def resolve(self, name: str | None = None) -> Path:
+        """The state file to show: the one asked for by basename, else the first
+        candidate with a live heartbeat (the live loop comes first), else the
+        most recently written."""
+        if name:
+            for f in self.state_files:
+                if f.name == name:
+                    return f
+        now = time.time()
+        for f in self.state_files:
+            st = self._read(f) or {}
+            last = st.get("last_tick_ts")
+            if last is not None and now - float(last) <= ALIVE_WITHIN_S:
+                return f
         existing = [f for f in self.state_files if f.exists()]
         if not existing:
             return self.state_files[0]
         return max(existing, key=lambda f: f.stat().st_mtime)
 
-    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+    @property
+    def state_file(self) -> Path:
+        return self.resolve()
+
+    def companions(self, state_file: Path) -> tuple[Path | None, Path | None]:
+        """(decisions, alerts) for a state file: the paper loop keeps its own."""
+        if state_file.name.startswith("paper_"):
+            return (
+                state_file.with_name("paper_decisions.jsonl"),
+                state_file.with_name("paper_alerts.jsonl"),
+            )
+        return self.decisions_file, self.alerts_file
+
+    def files(self, now: float) -> list[dict[str, Any]]:
+        out = []
+        for f in self.state_files:
+            st = self._read(f)
+            if st is None and not f.exists():
+                continue
+            last = (st or {}).get("last_tick_ts")
+            out.append(
+                {
+                    "name": f.name,
+                    "alive": last is not None and now - float(last) <= ALIVE_WITHIN_S,
+                    "env": ((st or {}).get("config") or {}).get("env"),
+                }
+            )
+        return out
+
+    def snapshot(self, now: float | None = None, name: str | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
-        state: dict[str, Any] | None = None
-        state_file = self.state_file
-        if state_file.exists():
-            try:
-                state = json.loads(state_file.read_text())
-            except ValueError:
-                state = None  # mid-write; the next poll will get it
+        state_file = self.resolve(name)
+        state = self._read(state_file)
+        _decisions_file, alerts_file = self.companions(state_file)
         st = state or {}
         last = st.get("last_tick_ts")
         alive = bool(state) and last is not None and now - float(last) <= ALIVE_WITHIN_S
@@ -93,7 +155,7 @@ class Dashboard:
             heartbeat = "stale"
         else:
             heartbeat = "quiet"
-        rows = alertmod.tail(self.alerts_file, ALERTS_SHOWN)
+        rows = alertmod.tail(alerts_file, ALERTS_SHOWN)
         if heartbeat == "stale":
             rows.append(
                 {
@@ -112,11 +174,77 @@ class Dashboard:
             "stop_file_present": self.stop_file.exists(),
             "pause_file": str(self.pause_file),
             "pause_file_present": self.pause_file.exists(),
-            "alerts_file": str(self.alerts_file) if self.alerts_file else None,
+            "alerts_file": str(alerts_file) if alerts_file else None,
+            "files": self.files(now),
             "alerts": rows,
             "heartbeat": heartbeat,
             "alive": alive and not st.get("halted"),
         }
+
+    # ------------------------------------------------------------ analysis
+
+    def _decisions(self, path: Path | None) -> list[dict[str, Any]]:
+        """Decision rows, re-read only when the file changes."""
+        if path is None or not path.exists():
+            return []
+        st = path.stat()
+        cached = self._decisions_cache.get(str(path))
+        if cached and cached[:2] == (st.st_mtime, st.st_size):
+            return cached[2]
+        rows = review.load_decisions(path)
+        self._decisions_cache[str(path)] = (st.st_mtime, st.st_size, rows)
+        return rows
+
+    def analysis(self, name: str | None = None) -> dict[str, Any]:
+        """The review's cuts as JSON for the Analysis tab, plus every result row
+        with its entry inputs for the Trades tab."""
+        state_file = self.resolve(name)
+        decisions_file, _alerts = self.companions(state_file)
+        history = review.load_history(state_file)
+        rows = review.attribute(history, self._decisions(decisions_file))
+        for i, r in enumerate(rows):
+            r["id"] = i
+        rec = sizing.TrackRecord()
+        for r in rows:
+            rec.add(r.get("p_side"), r["net"])
+        gross, fees = review.fee_share(rows)
+
+        def cuts(key: str, edges=None):
+            return [{"bucket": label, **stats} for label, stats in review.cut(rows, key, edges)]
+
+        tiers = [
+            {
+                "tier": label,
+                "n": t.n,
+                "win_rate": t.win_rate,
+                "net": t.net,
+                "scaling": t.n >= sizing.MIN_TIER_RESULTS and t.net > 0,
+            }
+            for label, t in sorted(rec.tiers.items())
+        ]
+        return {
+            "rows": rows,
+            "gross": gross,
+            "fees": fees,
+            "cuts": {
+                "how": cuts("how"),
+                "side": cuts("side"),
+                "series": cuts("series"),
+                "confidence": cuts("p_side", review.CONFIDENCE),
+                "ttc": cuts("secs_to_close", review.TTC),
+                "distance": cuts("strike_bps", review.DISTANCE),
+            },
+            "tiers": tiers,
+            "min_tier_results": sizing.MIN_TIER_RESULTS,
+            "suggestions": review.suggest(rows) if rows else [],
+        }
+
+    def decisions_for(
+        self, ticker: str, limit: int = 60, name: str | None = None
+    ) -> list[dict[str, Any]]:
+        decisions_file, _alerts = self.companions(self.resolve(name))
+        rows = [d for d in self._decisions(decisions_file) if d.get("ticker") == ticker]
+        return rows[-limit:]
 
     def stop(self) -> None:
         self.stop_file.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +269,7 @@ class Dashboard:
     # ------------------------------------------------------------ sports desk
 
     def sports_snapshot(self, now: float | None = None) -> dict[str, Any]:
-        """Everything the Sports panel shows; independent of the crypto loop's state."""
+        """Everything the Sports tab shows; independent of the crypto loop's state."""
         now = time.time() if now is None else now
         existing = [f for f in self.sports_status_files if f.exists()]
         status_file = (
@@ -149,12 +277,7 @@ class Dashboard:
             if existing
             else self.sports_status_files[0]
         )
-        status: dict[str, Any] | None = None
-        if status_file.exists():
-            try:
-                status = json.loads(status_file.read_text())
-            except ValueError:
-                status = None
+        status = self._read(status_file) if status_file.exists() else None
         ts = (status or {}).get("ts")
         if not status:
             heartbeat = "none"
@@ -170,8 +293,9 @@ class Dashboard:
                 mode = (status or {}).get("mode") or "paper"
                 with SportsDataStore(self.sports_db) as store:
                     positions["open"] = [dict(r) for r in store.positions("open", mode)]
-                    positions["settled"] = [dict(r) for r in store.positions("settled", mode)][-40:]
-            except Exception as exc:  # noqa: BLE001 - the panel must not take the page down
+                    settled = [dict(r) for r in store.positions("settled", mode)]
+                    positions["settled"] = settled[-40:]
+            except Exception as exc:  # noqa: BLE001 - the tab must not take the page down
                 log.warning("sports positions unavailable: %s", exc)
         rows = alertmod.tail(self.sports_alerts_file, ALERTS_SHOWN)
         return {
@@ -208,10 +332,40 @@ class Dashboard:
         return True
 
 
-def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
+def _query(path: str, key: str) -> str | None:
+    values = parse_qs(urlparse(path).query).get(key) or []
+    return values[0] or None if values else None
+
+
+def make_handler(dash: Dashboard, password: str | None = None) -> type[BaseHTTPRequestHandler]:
+    """``password`` (any username) is required on every request when set; it is
+    what makes the page safe to reach from a phone over a private network."""
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:  # quieter than the default
             log.debug(fmt, *args)
+
+        def _authorised(self) -> bool:
+            if not password:
+                return True
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                return False
+            try:
+                raw = base64.b64decode(header[6:].strip()).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return False
+            _user, _, given = raw.partition(":")
+            return hmac.compare_digest(given, password)
+
+        def _challenge(self) -> None:
+            body = b"password required"
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("WWW-Authenticate", 'Basic realm="Lewis Wealth Global"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send(self, status: HTTPStatus, body: bytes, ctype: str) -> None:
             self.send_response(status)
@@ -222,18 +376,36 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802 - http.server API
+            if not self._authorised():
+                self._challenge()
+                return
             if self.path in ("/", "/index.html"):
                 self._send(HTTPStatus.OK, PAGE.encode(), "text/html; charset=utf-8")
-            elif self.path == "/api/state":
-                body = json.dumps(dash.snapshot()).encode()
+            elif self.path in ("/favicon.svg", "/favicon.ico"):
+                self._send(HTTPStatus.OK, FAVICON.encode(), "image/svg+xml")
+            elif self.path.startswith("/api/state"):
+                name = _query(self.path, "file")
+                body = json.dumps(dash.snapshot(name=name)).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
-            elif self.path == "/api/sports":
+            elif self.path.startswith("/api/analysis"):
+                name = _query(self.path, "file")
+                body = json.dumps(dash.analysis(name=name), default=str).encode()
+                self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path.startswith("/api/decisions"):
+                ticker = _query(self.path, "ticker") or ""
+                name = _query(self.path, "file")
+                body = json.dumps(dash.decisions_for(ticker, name=name), default=str).encode()
+                self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path.startswith("/api/sports"):
                 body = json.dumps(dash.sports_snapshot(), default=str).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
+            if not self._authorised():
+                self._challenge()
+                return
             if self.path.startswith("/api/sports/"):
                 if dash.sports_control(self.path.rsplit("/", 1)[1]):
                     body = json.dumps(dash.sports_snapshot(), default=str).encode()
@@ -272,11 +444,29 @@ def serve(
     port: int = 8765,
     pause_file: Path | None = None,
     alerts_file: Path | None = None,
+    decisions_file: Path | None = None,
+    password: str | None = None,
 ) -> ThreadingHTTPServer:
-    """Bind and return the server; call ``serve_forever`` on it."""
-    dash = Dashboard(state_file, stop_file, pause_file=pause_file, alerts_file=alerts_file)
+    """Bind and return the server; call ``serve_forever`` on it.
+
+    Binding to anything but the local machine requires a password: the page
+    can stop and pause a live loop, so it must never be open to whoever finds
+    the port.
+    """
+    if host not in LOCAL_HOSTS and not password:
+        raise ValueError(
+            f"binding to {host} exposes the dashboard beyond this machine; pass --password "
+            "(or set DASHBOARD_PASSWORD) so a phone can reach it but a stranger cannot"
+        )
+    dash = Dashboard(
+        state_file,
+        stop_file,
+        pause_file=pause_file,
+        alerts_file=alerts_file,
+        decisions_file=decisions_file,
+    )
     try:
-        return _Server((host, port), make_handler(dash))
+        return _Server((host, port), make_handler(dash, password))
     except OSError as exc:
         raise OSError(
             f"port {port} is already in use, probably by an earlier dashboard window; "

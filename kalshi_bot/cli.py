@@ -414,6 +414,17 @@ def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
             return 0
 
 
+def cmd_quote_test(_: Settings, args: argparse.Namespace) -> int:
+    """Backtest passive two-sided quoting around fair value on recorded prints."""
+    try:
+        from . import fairvalue, quoting
+    except ImportError:
+        sys.exit('quote-test needs pandas: pip install -e ".[research]"')
+    data = fairvalue.load(args.db, series=args.series or None)
+    print(quoting.report(data, min_ttc=args.min_ttc, fill=args.fill))
+    return 0
+
+
 def cmd_review(_: Settings, args: argparse.Namespace) -> int:
     """Loss attribution over the live loop's results: where the P&L went and what to change."""
     from .review import report
@@ -517,6 +528,31 @@ def _loop_housekeeping(cfg, args: argparse.Namespace) -> bool:
         return True
     if cfg.stop_file.exists():
         sys.exit(f"{cfg.stop_file} exists; delete it (or use --reset) to start")
+    state = LoopState.load(cfg.state_file)
+    # one loop per state file: two would trade the same account twice over
+    last = state.last_tick_ts
+    if last is not None and not getattr(args, "force", False):
+        age = time.time() - float(last)
+        if age < HEARTBEAT_LIVE_S:
+            sys.exit(
+                f"another loop wrote {cfg.state_file} {age:.0f}s ago and looks alive. Stop it "
+                "first (Ctrl-C in its window, or the dashboard's Stop then Clear stop file). "
+                "If you are sure it is dead, add --force."
+            )
+    if state.halted:
+        if getattr(args, "clear_halt", False):
+            print(f"clearing the earlier halt: {state.halted}")
+            state.halted = None
+            state.breaker_until = None
+            state.loss_streak = 0
+            state.save(cfg.state_file)
+        else:
+            sys.exit(
+                f"the loop halted earlier: {state.halted}\n"
+                "Look into it (kalshi-bot --env prod status shows the exchange's positions), "
+                "then start again with --clear-halt to keep the history and the cap, or "
+                "--reset to start from zero."
+            )
     return False
 
 
@@ -542,12 +578,15 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+HEARTBEAT_LIVE_S = 30.0  # a state file written this recently belongs to a running loop
 LIVE_MAX_DOLLARS = 20.0
 LIVE_MAX_LOSS_CAP = 50.0
 
 
 def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     """The live strategy on production quotes with simulated fills: no orders, no money."""
+    from pathlib import Path
+
     from .demo_loop import DemoLoop
 
     if settings.env != "prod":
@@ -555,6 +594,11 @@ def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     settings = dataclasses.replace(settings, dry_run=True)  # whatever .env says
     cfg = _loop_config(args)
     cfg.entry = "taker"  # a simulated maker fill would flatter the result
+    # paper results must not be mistaken for live ones: separate logs by default
+    if args.decision_log == "state/decisions.jsonl":
+        cfg.decision_log = Path("state/paper_decisions.jsonl")
+    if args.alerts == "state/alerts.jsonl":
+        cfg.alerts_path = Path("state/paper_alerts.jsonl")
     if _loop_housekeeping(cfg, args):
         return 0
     print("PAPER. Production quotes and settlements; fills simulated at the ask; nothing sent.")
@@ -567,7 +611,7 @@ def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Strategy: {cfg.strategy}{detail}; {size} per trade")
     print(
         f"State: {cfg.state_file}   Stop file: {cfg.stop_file}   "
-        f"Review: kalshi-bot review --live-state {cfg.state_file}"
+        f"Review: kalshi-bot review --live-state {cfg.state_file} --decisions {cfg.decision_log}"
     )
     with _client(settings, need_auth=settings.has_credentials) as client:
         loop = DemoLoop(client, cfg, allow_production=True)
@@ -748,8 +792,9 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
     """Local web dashboard for the demo loop (reads its state file; can stop it)."""
     from pathlib import Path
 
-    from .demo_ui import serve
+    from .demo_ui import password_from_env, serve
 
+    password = args.password or password_from_env()
     files = (
         [Path(args.state_file)]
         if args.state_file
@@ -759,15 +804,22 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
             Path("state/demo_loop.json"),
         ]
     )
-    server = serve(
-        files,
-        Path(args.stop_file),
-        host=args.host,
-        port=args.port,
-        pause_file=Path(args.pause_file),
-        alerts_file=Path(args.alerts) if args.alerts else None,
-    )
+    try:
+        server = serve(
+            files,
+            Path(args.stop_file),
+            host=args.host,
+            port=args.port,
+            pause_file=Path(args.pause_file),
+            alerts_file=Path(args.alerts) if args.alerts else None,
+            decisions_file=Path(args.decisions) if args.decisions else None,
+            password=password,
+        )
+    except (ValueError, OSError) as exc:
+        sys.exit(f"error: {exc}")
     print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
+    if password:
+        print("password protected: any username, the password you set")
     print("showing whichever of these was updated most recently: " + ", ".join(map(str, files)))
     try:
         server.serve_forever()
@@ -891,6 +943,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_fairvalue)
 
+    s = sub.add_parser("quote-test", help=cmd_quote_test.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--series", nargs="*", default=None, help="restrict to these series")
+    s.add_argument("--min-ttc", type=float, default=120.0, help="no quotes inside this of close")
+    s.add_argument(
+        "--fill",
+        choices=["cross", "touch"],
+        default="cross",
+        help="cross: a print must trade through our price (conservative). touch: at it",
+    )
+    s.set_defaults(func=cmd_quote_test)
+
     s = sub.add_parser("review", help=cmd_review.__doc__)
     s.add_argument("--live-state", default="state/live_loop.json", help="loop state to read")
     s.add_argument("--decisions", default="state/decisions.jsonl", help="decision log")
@@ -963,6 +1027,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--pause-file", default="state/PAUSE")
     s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed to show")
+    s.add_argument("--decisions", default="state/decisions.jsonl", help="decision log to show")
+    s.add_argument(
+        "--password",
+        default=None,
+        help="require this password (any username); needed with any --host other than "
+        "127.0.0.1, or set DASHBOARD_PASSWORD in the environment",
+    )
     s.set_defaults(func=cmd_demo_ui)
 
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)
@@ -1211,6 +1282,17 @@ def _add_loop_args(
     )
     s.add_argument(
         "--run-after-reset", action="store_true", help="with --reset: start the loop afterwards"
+    )
+    s.add_argument(
+        "--clear-halt",
+        action="store_true",
+        help="start even though the loop halted last time (cap, breaker, reconciliation); "
+        "keeps the history and the cap",
+    )
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="start even though the state file has a fresh heartbeat from another loop",
     )
 
 

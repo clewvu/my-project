@@ -1,16 +1,23 @@
-# Runs the live loop, the dashboard, and the market-data recorder on a server.
+# Runs the live loop, the paper loop, the dashboard, the market-data recorder
+# and the learner on a server. See deploy/README.md for the walk-through.
 #
-#   cp deploy/.env.server .env      # then fill in the key id
+#   cp deploy/.env.server .env      # then fill in the key id and a dashboard password
 #   mkdir -p secrets && cp /path/to/key.txt secrets/kalshi-key.txt
 #   docker compose -f deploy/docker-compose.yml up -d
 #
 # Watch:   docker compose -f deploy/docker-compose.yml logs -f live
 # Stop:    docker compose -f deploy/docker-compose.yml stop live
 #          (or touch state/STOP; the loop exits and the container stays down)
-# Dashboard is bound to localhost only; reach it with an SSH tunnel:
-#   ssh -L 8765:127.0.0.1:8765 user@server   then open http://127.0.0.1:8765
+# Dashboard: published on DASHBOARD_BIND (default localhost only). With
+# Tailscale, set DASHBOARD_BIND to the server's Tailscale IP so only your own
+# devices can reach it; DASHBOARD_PASSWORD is required either way.
 
 services:
+  # ==========================================================================
+  # CRYPTO 15-MINUTE DESK (kalshi-bot, package kalshi_bot/)
+  # State: state/live_loop.json, state/paper_loop.json, state/decisions.jsonl,
+  # state/alerts.jsonl, state/params.json, state/market_data.sqlite
+  # ==========================================================================
   live:
     build:
       context: ..
@@ -24,17 +31,33 @@ services:
       - ../secrets:/secrets:ro
     command: >
       --env prod live-trade --strategy ${STRATEGY:-fairvalue} --margin ${MARGIN:-0.03}
-      --dollars ${TRADE_DOLLARS:-5} --loss-cap ${LOSS_CAP:-50}
+      --dollars ${TRADE_DOLLARS:-10} --loss-cap ${LOSS_CAP:-50}
       --profit-target ${PROFIT_TARGET:-0} --real-money --yes
+    restart: unless-stopped
+
+  # the same strategy on production quotes with simulated fills: its results
+  # count toward the confidence tiers that gate sizing, at no cost
+  paper:
+    image: kalshi-bot
+    env_file: ../.env
+    environment:
+      KALSHI_PRIVATE_KEY_PATH: /secrets/kalshi-key.txt
+    volumes:
+      - ../state:/app/state
+      - ../secrets:/secrets:ro
+    command: >
+      --env prod paper-trade --strategy ${STRATEGY:-fairvalue} --margin ${MARGIN:-0.03}
+      --dollars ${TRADE_DOLLARS:-10} --loss-cap 1000 --profit-target 0
     restart: unless-stopped
 
   dashboard:
     image: kalshi-bot
+    env_file: ../.env
     volumes:
       - ../state:/app/state
     command: demo-ui --host 0.0.0.0 --port 8765
     ports:
-      - "127.0.0.1:8765:8765"
+      - "${DASHBOARD_BIND:-127.0.0.1}:8765:8765"
     restart: unless-stopped
 
   recorder:
@@ -53,9 +76,13 @@ services:
     command: learn --every 3600
     restart: unless-stopped
 
-  # sports research recorder (kalshi-sports): Kalshi books and trades on MLB,
-  # NFL, NBA and college markets plus sportsbook odds and ESPN game state.
-  # Needs ODDS_API_KEY in .env for the odds; runs without it (Kalshi + ESPN only).
+  # ==========================================================================
+  # SPORTS RESEARCH (kalshi-sports, package kalshi_sports/): a separate project.
+  # Research only, places no orders. State: state/sports_data.sqlite.
+  # Kalshi books and trades on MLB, NFL, NBA and college markets plus
+  # sportsbook odds and ESPN game state. Needs ODDS_API_KEY in .env for the
+  # odds; runs without it (Kalshi + ESPN only).
+  # ==========================================================================
   sports-recorder:
     image: kalshi-bot
     env_file: ../.env

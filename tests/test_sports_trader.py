@@ -354,6 +354,21 @@ def test_stale_odds_trigger_a_confirming_pull_then_trade(tmp_path):
     assert "odds stale" in reasons
 
 
+def test_no_recorded_odds_triggers_a_pull_too(tmp_path):
+    """A recorder started before the odds key was set has no quotes; the trader fetches."""
+    store = SportsDataStore()
+    seed_game(store)
+    store._conn.execute("DELETE FROM odds")
+    store._conn.commit()
+    odds = FakeOdds(CONS_NOW)
+    trader, _ = make_trader(store, tmp_path, odds=odds)
+    res = trader.tick(CONS_NOW)
+    assert odds.calls == 1 and res.odds_pulls == 1 and res.entries == 1
+    # the per-league rate limit holds: a second tick does not pull again
+    res2 = trader.tick(CONS_NOW + 30)
+    assert odds.calls == 1 and res2.odds_pulls == 0
+
+
 def test_live_book_can_veto_the_prescreen(tmp_path):
     store = SportsDataStore()
     seed_game(store)
@@ -506,12 +521,44 @@ def test_reconcile_adopts_exchange_positions_in_live_mode(tmp_path):
             }
         )
     ]
+    # the crypto loop's position sits on the same account and must be ignored
+    client.positions.append(
+        Position.from_dict(
+            {"ticker": "KXBTC15M-26SEP071830-30", "position": -8, "total_traded": 456}
+        )
+    )
     trader, _ = make_trader(store, tmp_path, mode="live", client=client)
     notes = trader.reconcile(NOW)
-    assert any("adopted" in n for n in notes)
-    row = store.positions(status="open", mode="live")[0]
+    assert any("adopted" in n for n in notes) and not any("KXBTC" in n for n in notes)
+    rows = store.positions(status="open", mode="live")
+    assert len(rows) == 1
+    row = rows[0]
     assert row["ticker"] == T_BOS and row["contracts"] == 4 and row["price"] == pytest.approx(0.60)
-    assert row["order_id"] == "adopted"
+    assert row["order_id"] == "adopted" and row["league"] == "mlb"
+    # an adopted non-sports row left over from an earlier run is voided on the next start
+    store.open_position(
+        {
+            "mode": "live",
+            "ticker": "KXBTC15M-26SEP071830-30",
+            "event_ticker": None,
+            "league": None,
+            "side": "no",
+            "side_team": None,
+            "contracts": 8,
+            "price": 0.57,
+            "fee": 0.0,
+            "dollars": 4.56,
+            "order_id": "adopted",
+            "opened_ts": NOW,
+            "start_ts": None,
+            "p_entry": None,
+            "edge_entry": None,
+        }
+    )
+    notes = trader.reconcile(NOW + 1)
+    assert any("not a sports market" in n for n in notes)
+    assert [r["ticker"] for r in store.positions(status="open", mode="live")] == [T_BOS]
+    assert store.positions(status="void", mode="live")[0]["ticker"].startswith("KXBTC")
     # paper mode never touches the exchange
     trader_p, _ = make_trader(SportsDataStore(), tmp_path, mode="paper", client=client)
     assert trader_p.reconcile(NOW) == []

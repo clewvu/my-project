@@ -217,7 +217,13 @@ def suggest(rows: list[dict[str, Any]]) -> list[str]:
                 "trending against them; the trend filter is the guard, not a side ban"
             )
     if not tips:
-        tips.append("no single cut explains the losses; this looks like variance plus fees")
+        if total > 0:
+            tips.append(
+                f"net positive ({total:+.2f} over {len(rows)} results) with no losing cut; "
+                "keep the rules as they are and let the sample grow"
+            )
+        else:
+            tips.append("no single cut explains the losses; this looks like variance plus fees")
     return tips
 
 
@@ -255,6 +261,21 @@ def report(state_path: str | Path, decisions_path: str | Path | None) -> str:
             )
 
     table("how it ended", cut(rows, "how"))
+    entry_rows = [r for r in rows if r.get("maker") is not None]
+    if entry_rows:
+        lines.append("\n-- entry type (fee per contract as booked; 'reported' = from the exchange)")
+        for kind in ("maker", "taker"):
+            sub = [r for r in entry_rows if bool(r.get("maker")) == (kind == "maker")]
+            if not sub:
+                continue
+            contracts = sum(r["count"] for r in sub) or 1.0
+            fees = sum(float(r.get("fee") or 0.0) for r in sub)
+            reported = sum(1 for r in sub if r.get("fee_reported"))
+            st = _stats(sub)
+            lines.append(
+                f"{kind:<8}{st['n']:>5}{st['net']:>+10.2f}{st['win_rate']:>7.0%}"
+                f"   fee/contract {fees / contracts:.4f} ({reported}/{st['n']} reported)"
+            )
     table("side", cut(rows, "side"))
     table("series", cut(rows, "series"))
     table("model confidence for the side bought", cut(rows, "p_side", CONFIDENCE))

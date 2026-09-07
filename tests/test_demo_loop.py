@@ -460,6 +460,72 @@ def test_maker_falls_back_to_taker_after_the_wait(tmp_path):
     assert t.maker is False and t.limit_price == 0.58 and t.order_id == "o2"
 
 
+def test_maker_fallback_waits_when_the_cancel_fails(tmp_path):
+    # a cancel that errors may have left the maker order live; sending a taker
+    # order on top could fill both, so the fallback retries next tick instead
+    client = FakeClient({0: "yes"}, fill=False)
+    wide = Market.from_dict(
+        {
+            "ticker": "KXBTC15M-0",
+            "series_ticker": "KXBTC15M",
+            "status": "open",
+            "close_time": T0 + 900,
+            "yes_ask_dollars": "0.580",
+            "yes_bid_dollars": "0.550",
+            "no_ask_dollars": "0.450",
+            "no_bid_dollars": "0.420",
+        }
+    )
+    client.get_markets = lambda **kw: [wide]
+    client.get_market = lambda ticker: wide
+    attempts = []
+
+    def flaky_cancel(order_id, *, ticker=None):
+        attempts.append(order_id)
+        if len(attempts) < 3:
+            raise RuntimeError("exchange timeout")
+        client.cancelled.append(order_id)
+
+    client.cancel_order = flaky_cancel
+    loop = _maker_loop(tmp_path, client)
+    loop.run(max_ticks=6)  # ticks at 0..50 s: fallback attempts from 20 s on
+    assert attempts == ["o1", "o1", "o1"]  # two failures, then success
+    assert [o["price"] for o in client.orders] == [0.56, 0.58]  # one taker order, not three
+    assert client.cancelled == ["o1"]
+
+
+def test_startup_refuses_a_live_twin_and_a_stale_halt(tmp_path, monkeypatch, capsys):
+    import time as _time
+
+    import kalshi_bot.cli as cli
+
+    monkeypatch.chdir(tmp_path)
+    parser = cli.build_parser()
+
+    def run(*extra):
+        args = parser.parse_args(
+            ["demo-trade", "--state-file", "s.json", "--stop-file", "STOP", *extra]
+        )
+        return cli._loop_housekeeping(cli._loop_config(args), args)
+
+    assert run() is False  # no state yet
+    LoopState(last_tick_ts=_time.time() - 5).save(tmp_path / "s.json")
+    with pytest.raises(SystemExit) as exc:
+        run()
+    assert "looks alive" in str(exc.value)
+    assert run("--force") is False
+    LoopState(last_tick_ts=_time.time() - 600, halted="reconciliation mismatch: x").save(
+        tmp_path / "s.json"
+    )
+    with pytest.raises(SystemExit) as exc:
+        run()
+    assert "halted earlier" in str(exc.value) and "--clear-halt" in str(exc.value)
+    assert run("--clear-halt") is False
+    assert "clearing the earlier halt" in capsys.readouterr().out
+    reloaded = LoopState.load(tmp_path / "s.json")
+    assert reloaded.halted is None and reloaded.loss_streak == 0
+
+
 def test_fixed_fraction_sizing_uses_the_shard_balance(tmp_path):
     from kalshi_bot.models import Balance
     from kalshi_bot.strategy import Signal
@@ -1067,9 +1133,116 @@ def test_dashboard_pause_resume_and_events(tmp_path):
         assert not (tmp_path / "PAUSE").exists()
         page = _get(server, "/")[1].decode()
         assert "Pause entries" in page and "Activity" in page and "/api/resume" in page
+        assert "Lewis Wealth Global" in page and "Faith without Works is Dead. God Move." in page
+        status, body = _get(server, "/favicon.svg")
+        assert status == 200 and body.startswith(b"<svg")
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_dashboard_analysis_and_decisions_endpoints(tmp_path):
+    state = LoopState()
+    for i in range(3):
+        state.history.append(
+            {
+                "series": "KXBTC15M",
+                "ticker": f"KXBTC15M-{i}",
+                "side": "yes",
+                "count": 10,
+                "price": 0.45,
+                "result": "yes",
+                "won": True,
+                "net": 4.0,
+                "settled_ts": T0 + i * 900 + 800,
+                "maker": True,
+                "fee": 0.3,
+            }
+        )
+    state.save(tmp_path / "state.json")
+    dec = tmp_path / "decisions.jsonl"
+    with dec.open("w") as fh:
+        for i in range(3):
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": T0 + i * 900,
+                        "action": "trade",
+                        "ticker": f"KXBTC15M-{i}",
+                        "side": "yes",
+                        "reason": "fair value",
+                        "inputs": {"p_yes": 0.72, "secs_to_close": 600},
+                    }
+                )
+                + "\n"
+            )
+        fh.write(json.dumps({"ts": T0 + 100, "action": "skip", "ticker": "KXBTC15M-9"}) + "\n")
+    server = demo_ui.serve(tmp_path / "state.json", tmp_path / "STOP", port=0, decisions_file=dec)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        data = json.loads(_get(server, "/api/analysis")[1])
+        assert len(data["rows"]) == 3 and data["rows"][0]["p_side"] == 0.72
+        assert data["cuts"]["confidence"][0]["bucket"] == "0.65-0.80"
+        assert data["tiers"][0]["tier"] == "0.65-0.75" and not data["tiers"][0]["scaling"]
+        assert data["suggestions"]
+        rows = json.loads(_get(server, "/api/decisions?ticker=KXBTC15M-1")[1])
+        assert len(rows) == 1 and rows[0]["ticker"] == "KXBTC15M-1"
+        assert json.loads(_get(server, "/api/decisions?ticker=nope")[1]) == []
+        # the cache follows the file
+        with dec.open("a") as fh:
+            fh.write(json.dumps({"ts": T0 + 5000, "action": "exit", "ticker": "KXBTC15M-1"}) + "\n")
+        rows = json.loads(_get(server, "/api/decisions?ticker=KXBTC15M-1")[1])
+        assert len(rows) == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_password_and_remote_binding(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="password"):
+        demo_ui.serve(tmp_path / "s.json", tmp_path / "STOP", host="0.0.0.0", port=0)
+    server = demo_ui.serve(tmp_path / "s.json", tmp_path / "STOP", port=0, password="opensesame")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(server, "/")
+        assert exc.value.code == 401 and "Basic" in exc.value.headers.get("WWW-Authenticate", "")
+        with pytest.raises(urllib.error.HTTPError):
+            _get(server, "/api/stop", method="POST")
+        assert not (tmp_path / "STOP").exists()
+        import base64
+
+        for user, pw, ok in (
+            ("cam", "opensesame", True),
+            ("cam", "wrong", False),
+            ("", "opensesame", True),
+        ):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state")
+            req.add_header(
+                "Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+            )
+            if ok:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    assert resp.status == 200
+            else:
+                with pytest.raises(urllib.error.HTTPError):
+                    urllib.request.urlopen(req, timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "fromenv")
+    assert demo_ui.password_from_env() == "fromenv"
+    monkeypatch.delenv("DASHBOARD_PASSWORD")
+    assert demo_ui.password_from_env() is None
+    import kalshi_bot.cli as cli
+
+    args = cli.build_parser().parse_args(["demo-ui", "--host", "0.0.0.0", "--port", "0"])
+    with pytest.raises(SystemExit) as exc2:
+        cli.cmd_demo_ui(None, args)
+    assert "password" in str(exc2.value)
 
 
 def test_dashboard_heartbeat_states(tmp_path):
@@ -1176,3 +1349,31 @@ def test_dashboard_prefers_freshest_state_file(tmp_path):
     assert dash.snapshot(now=T0)["state"]["trades"] == 7
     os.utime(demo, (T0 + 20, T0 + 20))
     assert dash.snapshot(now=T0)["state"]["trades"] == 1
+
+
+def test_dashboard_prefers_the_live_heartbeat_and_switches_files(tmp_path):
+    import os
+    import time as _time
+
+    now = _time.time()
+    live, paper = tmp_path / "live_loop.json", tmp_path / "paper_loop.json"
+    dash = demo_ui.Dashboard(
+        [live, paper],
+        tmp_path / "STOP",
+        alerts_file=tmp_path / "alerts.jsonl",
+        decisions_file=tmp_path / "decisions.jsonl",
+    )
+    LoopState(trades=3, last_tick_ts=now - 2).save(live)
+    LoopState(trades=9, last_tick_ts=now - 1).save(paper)
+    os.utime(paper, (now + 5, now + 5))  # paper written more recently, but live is alive too
+    snap = dash.snapshot(now=now)
+    assert snap["state"]["trades"] == 3 and len(snap["files"]) == 2
+    assert snap["files"][1]["name"] == "paper_loop.json" and snap["files"][1]["alive"]
+    # asked for by name: the paper loop, with its own companion logs
+    assert dash.snapshot(now=now, name="paper_loop.json")["state"]["trades"] == 9
+    assert dash.companions(paper)[0] == tmp_path / "paper_decisions.jsonl"
+    assert dash.companions(live)[0] == tmp_path / "decisions.jsonl"
+    assert dash.analysis(name="paper_loop.json")["rows"] == []
+    # live gone quiet: the running paper loop is shown instead
+    LoopState(trades=3, last_tick_ts=now - 600).save(live)
+    assert dash.snapshot(now=now)["state"]["trades"] == 9

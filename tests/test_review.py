@@ -115,6 +115,8 @@ def test_paper_trade_cli(monkeypatch, capsys):
             seen["dry_run"] = client.dry_run
             seen["entry"] = cfg.entry
             seen["allow"] = allow_production
+            seen["decisions"] = str(cfg.decision_log)
+            seen["alerts"] = str(cfg.alerts_path)
             self.state = LoopState()
 
         def run(self):
@@ -132,7 +134,13 @@ def test_paper_trade_cli(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_client", lambda settings, need_auth: FakeClient())
     monkeypatch.setattr("kalshi_bot.demo_loop.DemoLoop", FakeLoop)
     assert cli.cmd_paper_trade(prod, args) == 0
-    assert seen == {"dry_run": True, "entry": "taker", "allow": True}
+    assert seen == {
+        "dry_run": True,
+        "entry": "taker",
+        "allow": True,
+        "decisions": "state/paper_decisions.jsonl",
+        "alerts": "state/paper_alerts.jsonl",
+    }
     assert "PAPER" in capsys.readouterr().out
 
 

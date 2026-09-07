@@ -100,18 +100,21 @@ class TrackRecord:
     @classmethod
     def load(
         cls,
-        state_paths: list[str | Path],
-        decisions_path: str | Path | None,
+        sources: list[tuple[str | Path, str | Path | None]],
         *,
         now: float | None = None,
     ) -> TrackRecord:
+        """``sources`` pairs each loop state file with its own decision log."""
         from .review import attribute, load_decisions, load_history
 
-        decisions = load_decisions(decisions_path)
         rec = cls(loaded_ts=time.time() if now is None else now)
         seen: set[tuple[str, str, float]] = set()
-        for path in state_paths:
-            for row in attribute(load_history(path), decisions):
+        cache: dict[str, list] = {}
+        for path, decisions_path in sources:
+            key = str(decisions_path)
+            if key not in cache:
+                cache[key] = load_decisions(decisions_path)
+            for row in attribute(load_history(path), cache[key]):
                 key = (
                     str(row.get("ticker")),
                     str(row.get("side")),
