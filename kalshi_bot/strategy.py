@@ -417,7 +417,13 @@ class FairValueStrategy:
         trend_window_s: float = 300.0,
         trend_min_bps: float = 10.0,
         min_confidence: float = 0.65,
+        vol_floor_ann: float = 0.30,
+        vol_cap_ann: float = 3.0,
     ) -> None:
+        # realised vol is clamped to [floor, cap] annualised: a sleepy feed must
+        # not make the model sure of itself, and a glitch must not make it blind
+        self.vol_floor_ann = vol_floor_ann
+        self.vol_cap_ann = vol_cap_ann
         # only buy a side the model gives at least this probability: near a coin
         # flip the fee is highest and the model's error is largest
         self.min_confidence = min_confidence
@@ -595,8 +601,11 @@ class FairValueStrategy:
         if sigma is None:
             out["skip"] = "not enough spot history for volatility yet"
             return out
+        per_year = math.sqrt(365 * 86400)
+        out["ann_vol_raw"] = sigma * per_year
+        sigma = min(max(sigma, self.vol_floor_ann / per_year), self.vol_cap_ann / per_year)
         out["sigma"] = sigma
-        out["ann_vol"] = sigma * math.sqrt(365 * 86400)
+        out["ann_vol"] = sigma * per_year
         p_raw = fair_value(spot, market.strike, sigma, ttc)
         p = self._calibrated(p_raw)
         out["p_raw"] = p_raw
@@ -689,6 +698,7 @@ class DecisionLog:
         outcome: Signal | Skip | Exit,
         count: int | None = None,
         order_id: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if self.path is None:
             return
@@ -714,6 +724,8 @@ class DecisionLog:
         elif isinstance(outcome, Exit):
             row["action"] = "exit"
             row.update({"price": outcome.price, "count": count, "order_id": order_id})
+        if extra:
+            row.update(extra)
         row["inputs"] = {k: v for k, v in outcome.inputs.items() if k != "ticker"}
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -744,6 +756,8 @@ def build_strategy(
     trend_window_s: float = 300.0,
     trend_min_bps: float = 10.0,
     min_confidence: float = 0.65,
+    vol_floor_ann: float = 0.30,
+    vol_cap_ann: float = 3.0,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -776,6 +790,8 @@ def build_strategy(
             trend_window_s=trend_window_s,
             trend_min_bps=trend_min_bps,
             min_confidence=min_confidence,
+            vol_floor_ann=vol_floor_ann,
+            vol_cap_ann=vol_cap_ann,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())

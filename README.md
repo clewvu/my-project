@@ -370,6 +370,25 @@ ever exceeds `--dollars` when the gate has passed. `--risk-fraction`
 overrides the learner's figure; a drawdown of half the loss cap holds size
 at half until the equity recovers.
 
+### Stake by confidence, earned by results
+
+With `fairvalue` the stake is not flat. Each trade's calibrated
+probability and ask give a quarter-Kelly fraction of the bankroll on that
+shard, bounded below by `--dollars` and above by `--max-dollars` ($20, the
+live ceiling) and 5% of the bankroll. A confidence tier (0.65 to 0.75,
+0.75 to 0.85, 0.85 and up) may only stake above the base once it has 20 or
+more results with a positive net, counting the live loop and the paper
+loop (`--paper-state`) together. Until then every tier gets the base.
+
+Calibration comes from the same record: the model's probability is shrunk
+toward the tier's realised win rate as results accumulate, so a tier that
+wins less than it claims is sized as if it claimed less. `kalshi-bot
+review` prints the tiers; the dashboard's Per trade tile shows the ceiling
+and, on hover, the record. `--no-scale` keeps every trade at `--dollars`.
+
+A volatility floor (`--vol-floor`, 30% annualised) and cap (`--vol-cap`)
+stop a sleepy or glitching spot feed from making the model overconfident.
+
 ### Maker entries
 
 By default (`--entry maker`) an entry rests one tick inside the spread

@@ -474,6 +474,10 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         trend_window=args.trend_window,
         trend_bps=args.trend_bps,
         min_confidence=args.min_confidence,
+        vol_floor=args.vol_floor,
+        vol_cap=args.vol_cap,
+        scale_by_confidence=not args.no_scale,
+        paper_state=Path(args.paper_state) if args.paper_state else None,
         min_hold_s=args.min_hold,
         reentry_cooloff_s=args.cooloff,
         allow_flip=args.allow_flip,
@@ -1124,6 +1128,24 @@ def _add_loop_args(
         default=0.65,
         help="fairvalue: only buy a side the model gives at least this probability "
         "(default 0.65; near a coin flip the fee is highest and the model noisiest)",
+    )
+    s.add_argument(
+        "--vol-floor",
+        type=float,
+        default=0.30,
+        help="fairvalue: annualised volatility floor (default 0.30); a quiet feed must not "
+        "make the model overconfident",
+    )
+    s.add_argument("--vol-cap", type=float, default=3.0, help="fairvalue: annualised vol cap")
+    s.add_argument(
+        "--no-scale",
+        action="store_true",
+        help="always stake --dollars; do not scale by confidence once a tier has earned it",
+    )
+    s.add_argument(
+        "--paper-state",
+        default="state/paper_loop.json",
+        help="paper loop state whose results also count toward the confidence track record",
     )
     s.add_argument(
         "--trend-window",

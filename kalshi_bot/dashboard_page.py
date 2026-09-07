@@ -316,7 +316,8 @@ async function refresh() {
   $('fees').textContent = money(s.fees_paid || 0);
   $('feenote').textContent = settled ? `${money((s.fees_paid || 0) / settled)} per trade` : '';
   $('size').textContent = c.dollars ? '$' + fmt(c.dollars, 2) : (c.contracts ? c.contracts + ' ct' : '–');
-  $('sizenote').textContent = `max price ${fmt(c.max_price, 2)}` + (c.profit_target ? ` · target +$${fmt(c.profit_target, 2)}` : ' · no profit cap');
+  $('sizenote').textContent = (c.max_dollars ? `up to $${fmt(c.max_dollars, 0)} when a confidence tier has earned it · ` : '') + `max price ${fmt(c.max_price, 2)}` + (c.profit_target ? ` · target +$${fmt(c.profit_target, 2)}` : ' · no profit cap');
+  $('sizenote').title = c.track_record || '';
   $('strategy').textContent = c.strategy === 'fairvalue' ? 'Fair value' : c.strategy === 'alternate' ? 'Alternate' : (c.strategy || '–');
   $('stratnote').textContent = c.strategy === 'fairvalue' ? `margin ${fmt(c.margin, 2)} · vol ${Math.round((c.vol_window || 0) / 60)} min` : (c.strategy === 'alternate' ? 'YES / NO in turn' : '');
   $('tick').textContent = s.last_tick_ts ? tm(s.last_tick_ts) : '–';

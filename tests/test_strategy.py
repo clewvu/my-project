@@ -213,6 +213,21 @@ def test_trend_filter_never_fades_a_move():
     assert isinstance(sig, st.Signal) and sig.side == "no"
 
 
+def test_vol_floor_and_cap_clamp_sigma():
+    hist = st.SpotHistory()
+    last = gbm("BTC-USD", hist, 3600, 1e-5)  # ~5% annualised: a sleepy feed
+    s = st.FairValueStrategy(FakeFeed({}), history=hist, vol_floor_ann=0.30, vol_cap_ann=3.0)
+    ev = s.evaluate(market(strike=last, now=T0), T0)
+    assert ev["ann_vol_raw"] < 0.15 and ev["ann_vol"] == pytest.approx(0.30)
+    # with the floor a 3 bps gap is not a sure thing
+    assert 0.35 < ev["p_yes"] < 0.65
+    wild = st.SpotHistory()
+    last2 = gbm("BTC-USD", wild, 3600, 1e-3)  # ~560% annualised
+    s2 = st.FairValueStrategy(FakeFeed({}), history=wild, vol_floor_ann=0.30, vol_cap_ann=3.0)
+    ev2 = s2.evaluate(market(strike=last2, now=T0), T0)
+    assert ev2["ann_vol_raw"] > 3.0 and ev2["ann_vol"] == pytest.approx(3.0)
+
+
 def test_min_confidence_skips_coin_flips():
     hist = st.SpotHistory()
     last = gbm("BTC-USD", hist, 3600, 8e-5)

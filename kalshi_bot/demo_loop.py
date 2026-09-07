@@ -67,6 +67,7 @@ from .alerts import AlertLog
 from .client import DryRunOrder, KalshiClient
 from .fees import order_fee
 from .models import Market
+from .sizing import TrackRecord, kelly_dollars
 from .strategy import DecisionLog, Skip, Strategy, build_strategy
 
 log = logging.getLogger(__name__)
@@ -138,6 +139,14 @@ class LoopConfig:
     trend_window: float = 300.0  # fairvalue: never fade a spot move over this window...
     trend_bps: float = 10.0  # ...of at least this many basis points (0 disables)
     min_confidence: float = 0.65  # fairvalue: model probability required for the side bought
+    vol_floor: float = 0.30  # fairvalue: annualised vol floor for the model
+    vol_cap: float = 3.0  # fairvalue: annualised vol cap
+    # stake by confidence: a quarter-Kelly stake from the calibrated probability
+    # and the ask, between dollars and max_dollars, once the confidence tier
+    # has earned it (MIN_TIER_RESULTS results with positive net, live + paper)
+    scale_by_confidence: bool = True
+    paper_state: Path | None = Path("state/paper_loop.json")  # paper results count too
+    record_refresh_s: float = 300.0
     # churn control: a position is held at least min_hold_s before an exit may
     # fire; a market sold out of waits reentry_cooloff_s before another entry;
     # allow_flip permits buying the other side of a market already traded
@@ -382,6 +391,8 @@ class DemoLoop:
             trend_window_s=config.trend_window,
             trend_min_bps=config.trend_bps,
             min_confidence=config.min_confidence,
+            vol_floor_ann=config.vol_floor,
+            vol_cap_ann=config.vol_cap,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name
@@ -390,6 +401,8 @@ class DemoLoop:
             self.state.config["vol_window"] = config.vol_window
         self.bankroll: Any = None  # Balance, refreshed every bankroll_refresh_s
         self._bankroll_ts: float | None = None
+        self.record = TrackRecord()  # the strategy's own results by confidence tier
+        self._record_ts: float | None = None
         self.alerts = AlertLog(config.alerts_path)
         self._reconcile_ts: float | None = None
         self._mismatches: dict[str, str] = {}  # ticker -> problem seen at the last check
@@ -414,19 +427,57 @@ class DemoLoop:
         except Exception as exc:  # noqa: BLE001 - sizing falls back to --dollars
             log.debug("balance refresh failed: %s", exc)
 
-    def trade_dollars(self, market: Market) -> float | None:
-        """Dollars for the next trade: a fraction of the bankroll on the market's
-        shard when fixed-fraction sizing is active, else the configured amount."""
+    def _refresh_record(self, now: float) -> None:
+        if not self.cfg.scale_by_confidence:
+            return
+        if self._record_ts is not None and now - self._record_ts < self.cfg.record_refresh_s:
+            return
+        self._record_ts = now
+        paths: list[str | Path] = [self.cfg.state_file]
+        if self.cfg.paper_state and Path(self.cfg.paper_state) != Path(self.cfg.state_file):
+            paths.append(self.cfg.paper_state)
+        try:
+            self.record = TrackRecord.load(paths, self.cfg.decision_log, now=now)
+        except Exception as exc:  # noqa: BLE001 - sizing falls back to the base stake
+            log.warning("track record refresh failed: %s", exc)
+            return
+        self.state.config["track_record"] = self.record.describe()
+        self.state.config["max_dollars"] = self.cfg.max_dollars
+
+    def trade_dollars(self, market: Market, signal: Any = None) -> float | None:
+        """Dollars for the next trade.
+
+        Base: the configured amount, or a fraction of the shard's bankroll when
+        the learning loop has promoted fixed-fraction sizing. On top of that,
+        with ``scale_by_confidence``, a fair-value signal whose confidence tier
+        has earned it stakes a quarter-Kelly amount from its calibrated
+        probability and ask, never below the base and never above max_dollars.
+        """
+        base = self.cfg.dollars
         fraction = self.cfg.risk_fraction
         if fraction is None:
             fraction = float(getattr(self.strategy, "risk_fraction", 0.0) or 0.0)
-        if fraction <= 0 or self.bankroll is None:
-            return self.cfg.dollars
-        available = self.bankroll.on_shard(getattr(market, "exchange_index", None))
-        dollars = available * fraction
-        if self.cfg.dollars is not None:
-            dollars = max(dollars, 0.0)
-        return round(min(self.cfg.max_dollars, dollars), 2) if dollars > 0 else self.cfg.dollars
+        available = (
+            self.bankroll.on_shard(getattr(market, "exchange_index", None))
+            if self.bankroll is not None
+            else None
+        )
+        if fraction > 0 and available is not None:
+            dollars = available * fraction
+            if dollars > 0:
+                base = round(min(self.cfg.max_dollars, dollars), 2)
+        if base is None or signal is None or not self.cfg.scale_by_confidence:
+            return base
+        p_yes = (signal.inputs or {}).get("p_yes")
+        if p_yes is None:
+            return base
+        p = float(p_yes) if signal.side == "yes" else 1 - float(p_yes)
+        if not self.record.allows_scaling(p):
+            return base
+        p_cal = self.record.calibrated(p)
+        return kelly_dollars(
+            p_cal, signal.price, available, base=base, max_dollars=self.cfg.max_dollars
+        )
 
     # ------------------------------------------------------------------ run
 
@@ -478,6 +529,7 @@ class DemoLoop:
             )
         self.strategy.prepare(now)
         self._refresh_bankroll(now)
+        self._refresh_record(now)
         for name in self.cfg.series:
             if self.state.for_series(name).open is not None:
                 self._settle_if_closed(name, now)
@@ -610,9 +662,8 @@ class DemoLoop:
                 now=now, strategy=self.strategy.name, series=name, market=market, outcome=Skip(why)
             )
             return
-        count = self.cfg.size(
-            price, getattr(self.strategy, "size_scale", 1.0), dollars=self.trade_dollars(market)
-        )
+        dollars = self.trade_dollars(market, outcome)
+        count = self.cfg.size(price, getattr(self.strategy, "size_scale", 1.0), dollars=dollars)
         close_ts = market.close_time.timestamp() if market.close_time else now + 900
         post_price, maker = price, False
         if self.cfg.entry == "maker":
@@ -659,6 +710,7 @@ class DemoLoop:
             outcome=outcome,
             count=count,
             order_id=trade.order_id,
+            extra={"dollars": dollars, "scaled": bool(dollars and dollars != self.cfg.dollars)},
         )
         log.info(
             "%sbuy %s x%d %s at %.3f%s (~$%.2f, %s): %s",

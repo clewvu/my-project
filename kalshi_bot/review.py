@@ -260,6 +260,14 @@ def report(state_path: str | Path, decisions_path: str | Path | None) -> str:
     table("model confidence for the side bought", cut(rows, "p_side", CONFIDENCE))
     table("seconds to close at entry", cut(rows, "secs_to_close", TTC))
     table("spot distance from strike at entry", cut(rows, "strike_bps", DISTANCE))
+    from .sizing import MIN_TIER_RESULTS, TrackRecord
+
+    rec = TrackRecord()
+    for r in rows:
+        rec.add(r["p_side"], r["net"])
+    lines.append("\n-- confidence tiers for sizing (a tier scales above the base stake after")
+    lines.append(f"   {MIN_TIER_RESULTS} results with a positive net; live and paper both count)")
+    lines.append("   " + rec.describe())
     lines.append("\n== what the numbers support")
     for tip in suggest(rows):
         lines.append(f"* {tip}")

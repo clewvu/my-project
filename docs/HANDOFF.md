@@ -386,6 +386,18 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    taker fills, dry-run forced, `state/paper_loop.json`) as the forward
    test, and the review now reports average win/loss with the break-even
    win rate and flags the harvest-winners/hold-losers pattern.
+   Then "self-learning, higher profit from larger investments when
+   confidence is high, raise $5 to $10": `kalshi_bot/sizing.py`
+   (`TrackRecord` per confidence tier from live + paper results via the
+   review join; `allows_scaling` after 20 results with net > 0;
+   `calibrated` shrinks p toward the tier's win rate; `kelly_dollars`
+   quarter-Kelly in [base, max_dollars] and <= 5% of bankroll),
+   `DemoLoop.trade_dollars(market, signal)` and `_refresh_record` every 5
+   min, `--no-scale`, `--paper-state`; vol clamp `--vol-floor 0.30
+   --vol-cap 3.0` (`ann_vol_raw` logged). Base stake now $10 (`--dollars
+   10`); the live ceiling stays $20 and the cap $50. Not built yet: the
+   learned model on recorded data (logistic on z-score, trend, ttc,
+   market-implied p) and the extra series (ETH, SOL, XRP).
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

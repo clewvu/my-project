@@ -639,6 +639,38 @@ def test_losing_exit_is_held_unless_it_is_a_stop(tmp_path):
     assert len([o for o in client2.orders if o["action"] == "sell"]) == 1
 
 
+def test_confidence_scaling_needs_an_earned_tier(tmp_path):
+    from kalshi_bot import sizing
+    from kalshi_bot.models import Balance
+    from kalshi_bot.strategy import Signal
+
+    client = FakeClient({0: "yes"})
+    loop, _ = make(tmp_path, client, dollars=10.0, max_dollars=20.0, max_trades=1)
+    loop.bankroll = Balance.from_dict({"balance": 50000})  # $500
+    m = market(0)
+    confident = Signal(side="yes", price=0.45, reason="x", inputs={"p_yes": 0.82})
+    # no track record: the base stake, however confident the model is
+    assert loop.trade_dollars(m, confident) == 10.0
+    for _ in range(sizing.MIN_TIER_RESULTS):
+        loop.record.add(0.80, 1.0)
+    # the tier has earned it: quarter Kelly, capped at 5% of $500 = $25 -> max_dollars $20
+    assert loop.trade_dollars(m, confident) == 20.0
+    # an earned tier whose record says 50% shrinks a 0.66 claim to 0.58: no Kelly
+    # edge at a 60c ask, so the base stake, never less
+    thin = Signal(side="yes", price=0.60, reason="x", inputs={"p_yes": 0.66})
+    for i in range(sizing.MIN_TIER_RESULTS):
+        loop.record.add(0.70, 1.0 if i % 2 else -0.9)
+    assert loop.record.calibrated(0.66) == pytest.approx(0.58)
+    assert loop.trade_dollars(m, thin) == 10.0
+    # scaling off: always the base
+    loop.cfg.scale_by_confidence = False
+    assert loop.trade_dollars(m, confident) == 10.0
+    # no signal, no p: the base
+    loop.cfg.scale_by_confidence = True
+    assert loop.trade_dollars(m, None) == 10.0
+    assert loop.trade_dollars(m, Signal(side="yes", price=0.45, reason="x")) == 10.0
+
+
 def test_min_hold_and_cooloff_slow_the_churn(tmp_path):
     # the churner wants out every tick; with a 60 s hold and a 120 s cool-off a
     # 30-second tick loop can make at most one round trip per three minutes
