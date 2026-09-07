@@ -13,6 +13,11 @@
 # devices can reach it; DASHBOARD_PASSWORD is required either way.
 
 services:
+  # ==========================================================================
+  # CRYPTO 15-MINUTE DESK (kalshi-bot, package kalshi_bot/)
+  # State: state/live_loop.json, state/paper_loop.json, state/decisions.jsonl,
+  # state/alerts.jsonl, state/params.json, state/market_data.sqlite
+  # ==========================================================================
   live:
     build:
       context: ..
@@ -69,4 +74,20 @@ services:
     volumes:
       - ../state:/app/state
     command: learn --every 3600
+    restart: unless-stopped
+
+  # ==========================================================================
+  # SPORTS RESEARCH (kalshi-sports, package kalshi_sports/): a separate project.
+  # Research only, places no orders. State: state/sports_data.sqlite.
+  # Kalshi books and trades on MLB, NFL, NBA and college markets plus
+  # sportsbook odds and ESPN game state. Needs ODDS_API_KEY in .env for the
+  # odds; runs without it (Kalshi + ESPN only).
+  # ==========================================================================
+  sports-recorder:
+    image: kalshi-bot
+    env_file: ../.env
+    volumes:
+      - ../state:/app/state
+    entrypoint: ["kalshi-sports"]
+    command: record
     restart: unless-stopped

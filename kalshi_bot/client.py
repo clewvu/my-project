@@ -266,6 +266,73 @@ class KalshiClient:
         data = self._request("GET", f"/markets/{ticker}", auth=False)
         return Market.from_dict(data.get("market", data))
 
+    def get_series_list(
+        self, *, category: str | None = None, tags: str | None = None, max_pages: int = 10
+    ) -> list[dict[str, Any]]:
+        """List series (raw dicts), optionally filtered by category or tags.
+
+        The response shape is not pinned down by tests against production yet;
+        callers should treat the dicts as opaque and print them with --raw first.
+        """
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            data = self._request(
+                "GET",
+                "/series",
+                params={"category": category, "tags": tags, "cursor": cursor},
+                auth=False,
+            )
+            out.extend(data.get("series", []))
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+        return out
+
+    def get_series(self, series_ticker: str) -> dict[str, Any]:
+        data = self._request("GET", f"/series/{series_ticker}", auth=False)
+        return data.get("series", data)
+
+    def get_events(
+        self,
+        *,
+        series_ticker: str | None = None,
+        status: str | None = None,
+        with_nested_markets: bool = False,
+        limit: int = 100,
+        max_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """List events (raw dicts). An event groups the markets on one game."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            data = self._request(
+                "GET",
+                "/events",
+                params={
+                    "series_ticker": series_ticker,
+                    "status": status,
+                    "with_nested_markets": "true" if with_nested_markets else None,
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+                auth=False,
+            )
+            out.extend(data.get("events", []))
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+        return out
+
+    def get_event(self, event_ticker: str, *, with_nested_markets: bool = True) -> dict[str, Any]:
+        data = self._request(
+            "GET",
+            f"/events/{event_ticker}",
+            params={"with_nested_markets": "true" if with_nested_markets else None},
+            auth=False,
+        )
+        return data.get("event", data)
+
     def get_orderbook(self, ticker: str, depth: int | None = None) -> Orderbook:
         data = self._request(
             "GET", f"/markets/{ticker}/orderbook", params={"depth": depth}, auth=False
