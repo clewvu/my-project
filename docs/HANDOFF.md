@@ -452,6 +452,18 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    the CLI at start-up with the reason; `--clear-halt` clears it and the
    breaker while keeping history and the cap. Tests run in isolated cwd
    (`tests/conftest.py`) after the suite polluted the real alerts file.
+15. Two desks, one branch (2026-09-07 night). The sports session merged
+   our branch into `claude/kalsi-crypto-bot-memory-2frkn0`, added a sports
+   trader (`kalshi_sports/trader.py`, `risk.py`, `strategy.py`,
+   `learn.py`), a Sports tab in our dashboard (`demo_ui.sports_snapshot`,
+   `sports_control`, `/api/sports*`; keep that code when editing the
+   dashboard) and `docs/RUNNING_BOTH.md`, the runbook for both loops at
+   once. Our branch was fast-forwarded to the same commit; both names now
+   point to the same history, and both sessions push to both. Their asks
+   of us, both satisfied: reconciliation ignores sports positions (it only
+   ever looked at our own series), and `shard_plan` now funds shard 2 only
+   from shard 0 by the shortfall, never from shard 3 or any shard the
+   sports loop trades on.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

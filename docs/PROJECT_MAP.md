@@ -57,6 +57,14 @@ dashboard process (`kalshi-bot demo-ui`) serves both desks: the crypto tabs
 read the crypto files, the Sports tab reads the sports files. `pyproject.toml` installs both commands.
 `deploy/Dockerfile` builds one image that carries both packages.
 
+## Shared account, shared shards
+
+Deposits land on shard 0. The crypto loop funds shard 2 only from shard 0
+and only by the shortfall (`kalshi_bot.cli.shard_plan`); it never draws on
+shard 3 (MLB) or any shard another loop trades on. Its reconciliation looks
+only at positions on its own series (`KXBTC15M`, `KXDOGE15M`), so sports
+positions are invisible to it, as its positions are to the sports trader.
+
 ## Rules that keep them apart
 
 * A sports change never edits a file in the crypto rows above, and the

@@ -120,6 +120,12 @@ def test_shard_plan():
     assert shard_plan(Balance(balance=49.72), {"KXBTC15M": 1}, needed=45.0) is None
     partial = Balance(balance=50.0, breakdown={0: 10.0, 1: 40.0})
     assert shard_plan(partial, {"KXBTC15M": 1}, needed=45.0) == (5.0, 0, 1)
+    # funding comes only from the deposit shard, never from a shard another
+    # loop trades on (sports uses 0 for most leagues and 3 for MLB)
+    rich_mlb = Balance(balance=300.0, breakdown={0: 0.0, 2: 10.0, 3: 290.0})
+    assert shard_plan(rich_mlb, {"KXBTC15M": 2}, needed=55.0) is None
+    some = Balance(balance=300.0, breakdown={0: 20.0, 2: 10.0, 3: 270.0})
+    assert shard_plan(some, {"KXBTC15M": 2}, needed=55.0) == (20.0, 0, 2)
 
 
 def test_move_funds_waits_on_balance_not_transfer_lookup(capsys):

@@ -648,9 +648,23 @@ def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
         bal = probe.get_balance()
         shards = market_shards(probe, cfg.series)
     balance = bal.balance
-    plan = shard_plan(bal, shards, needed=min(balance, cfg.loss_cap + 5.0))
+    needed = min(balance, cfg.loss_cap + 5.0)
+    plan = shard_plan(bal, shards, needed=needed)
     if plan is not None and args.move_funds is not None:
         plan = (args.move_funds, plan[1], plan[2])
+    crypto_shard = next(iter(set(shards.values())), None) if shards else None
+    if (
+        plan is None
+        and crypto_shard is not None
+        and bal.breakdown
+        and bal.on_shard(crypto_shard) < needed
+    ):
+        print(
+            f"note: shard {crypto_shard} holds ${bal.on_shard(crypto_shard):,.2f} of the "
+            f"${needed:,.2f} wanted and shard {DEPOSIT_SHARD} has nothing to move. Funding "
+            "only ever comes from the deposit shard, never from a shard another loop trades "
+            "on; deposit, or move funds yourself with kalshi-bot transfer."
+        )
     fee = fee_per_contract(0.5)
     per_trade = max(1, int(cfg.dollars / 0.5)) * fee
     print("=" * 72)
@@ -715,13 +729,21 @@ def market_shards(client: KalshiClient, series: tuple[str, ...]) -> dict[str, in
     return out
 
 
-def shard_plan(bal, shards: dict[str, int], needed: float) -> tuple[float, int, int] | None:
+DEPOSIT_SHARD = 0  # where deposits land; the only shard a loop may draw funding from
+
+
+def shard_plan(
+    bal, shards: dict[str, int], needed: float, source: int = DEPOSIT_SHARD
+) -> tuple[float, int, int] | None:
     """(amount, source shard, destination shard) to fund the markets' shard, or None.
 
     None when the API reports no breakdown, the markets report no shard, the
-    markets sit on different shards, or the destination already holds
-    ``needed`` dollars. Kalshi runs several exchange shards and an order
-    draws only on the balance of the shard its market lives on.
+    markets sit on different shards, the destination already holds
+    ``needed`` dollars, or ``source`` has nothing to give. Kalshi runs several
+    exchange shards and an order draws only on the balance of the shard its
+    market lives on. Funding comes only from the deposit shard: the sports
+    desk trades on shards 0 and 3 and this loop must never draw on the shard
+    another loop is trading, so at most the shortfall moves, from shard 0.
     """
     if not bal.breakdown or not shards:
         return None
@@ -730,15 +752,12 @@ def shard_plan(bal, shards: dict[str, int], needed: float) -> tuple[float, int, 
         return None
     dst = targets.pop()
     have = bal.breakdown.get(dst, 0.0)
-    if have >= needed:
+    if have >= needed or dst == source:
         return None
-    others = [(i, v) for i, v in bal.breakdown.items() if i != dst]
-    if not others:
-        return None
-    src, src_amount = max(others, key=lambda t: t[1])
+    src_amount = bal.breakdown.get(source, 0.0)
     if src_amount <= 0.01:
         return None
-    return (round(min(needed - have, src_amount), 2), src, dst)
+    return (round(min(needed - have, src_amount), 2), source, dst)
 
 
 def _shards_text(bal) -> str:
