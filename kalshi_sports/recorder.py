@@ -107,8 +107,10 @@ class SportsRecorder:
         scores: ScoreFeed | None = None,
         scores_interval_live: float = 20.0,
         scores_interval_idle: float = 300.0,
+        first_backfill_pages: int = 20,
     ) -> None:
         self.client = client
+        self.first_backfill_pages = first_backfill_pages
         self.store = store
         self.series = list(series)
         self.leagues = [leagues.LEAGUES[k] for k in league_keys]
@@ -250,7 +252,13 @@ class SportsRecorder:
         result.snapshots += 1
         try:
             since = self.store.last_trade_ts(market.ticker)
-            trades = self.client.get_trades(market.ticker, min_ts=int(since) if since else None)
+            # First contact with a market that has been trading for hours (an in-play game)
+            # may need a deep backfill; after that each poll only asks for new prints.
+            trades = self.client.get_trades(
+                market.ticker,
+                min_ts=int(since) if since else None,
+                max_pages=self.first_backfill_pages if since is None else 5,
+            )
             result.new_trades += self.store.insert_trades(market.ticker, trades)
         except KalshiError as exc:
             result.errors.append(f"{market.ticker}: trades: {exc}")

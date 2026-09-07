@@ -73,8 +73,8 @@ class FakeClient:
             {"orderbook_fp": {"yes_dollars": [["0.45", "10"]], "no_dollars": [["0.53", "7"]]}},
         )
 
-    def get_trades(self, ticker, *, min_ts):
-        self.calls.append(("trades", ticker, min_ts))
+    def get_trades(self, ticker, *, min_ts, max_pages=5):
+        self.calls.append(("trades", ticker, min_ts, max_pages))
         return [
             Trade.from_dict(
                 {
@@ -148,6 +148,8 @@ def test_first_tick_discovers_light_snapshots_and_polls_near_games():
     # all three are inside the 24 h book window, so all get a book snapshot
     assert res.markets == 3 and res.snapshots == 3 and res.new_trades == 3 and not res.errors
     assert ("markets", "KXMLBGAME", 1000) in client.calls
+    # first trade fetch backfills deep; later ones are shallow and bounded by min_ts
+    assert ("trades", f"{MLB_EVENT}-NYY", None, 20) in client.calls
     st = store.stats()
     assert st["markets"] == 3 and st["events"] == 2 and st["series"] == 3
     assert st["snapshots"] == 6 and st["book_snapshots"] == 3
@@ -192,6 +194,8 @@ def test_cadence_skips_between_ticks_and_dedups_trades():
     assert sum(1 for c in client.calls if c[0] == "book" and "KXMLB" in c[1]) == books_before
     res3 = rec.tick(now + 61)
     assert res3.markets == 3 and res3.new_trades == 0
+    later = [c for c in client.calls if c[0] == "trades" and c[1] == f"{MLB_EVENT}-NYY"][-1]
+    assert later[2] is not None and later[3] == 5
 
 
 def test_errors_are_recorded_not_raised_and_settlement_is_captured():
