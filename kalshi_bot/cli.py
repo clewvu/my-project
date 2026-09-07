@@ -559,6 +559,8 @@ LIVE_MAX_LOSS_CAP = 50.0
 
 def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     """The live strategy on production quotes with simulated fills: no orders, no money."""
+    from pathlib import Path
+
     from .demo_loop import DemoLoop
 
     if settings.env != "prod":
@@ -566,6 +568,11 @@ def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     settings = dataclasses.replace(settings, dry_run=True)  # whatever .env says
     cfg = _loop_config(args)
     cfg.entry = "taker"  # a simulated maker fill would flatter the result
+    # paper results must not be mistaken for live ones: separate logs by default
+    if args.decision_log == "state/decisions.jsonl":
+        cfg.decision_log = Path("state/paper_decisions.jsonl")
+    if args.alerts == "state/alerts.jsonl":
+        cfg.alerts_path = Path("state/paper_alerts.jsonl")
     if _loop_housekeeping(cfg, args):
         return 0
     print("PAPER. Production quotes and settlements; fills simulated at the ask; nothing sent.")
@@ -578,7 +585,7 @@ def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Strategy: {cfg.strategy}{detail}; {size} per trade")
     print(
         f"State: {cfg.state_file}   Stop file: {cfg.stop_file}   "
-        f"Review: kalshi-bot review --live-state {cfg.state_file}"
+        f"Review: kalshi-bot review --live-state {cfg.state_file} --decisions {cfg.decision_log}"
     )
     with _client(settings, need_auth=settings.has_credentials) as client:
         loop = DemoLoop(client, cfg, allow_production=True)
@@ -759,8 +766,9 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
     """Local web dashboard for the demo loop (reads its state file; can stop it)."""
     from pathlib import Path
 
-    from .demo_ui import serve
+    from .demo_ui import password_from_env, serve
 
+    password = args.password or password_from_env()
     files = (
         [Path(args.state_file)]
         if args.state_file
@@ -770,16 +778,22 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
             Path("state/demo_loop.json"),
         ]
     )
-    server = serve(
-        files,
-        Path(args.stop_file),
-        host=args.host,
-        port=args.port,
-        pause_file=Path(args.pause_file),
-        alerts_file=Path(args.alerts) if args.alerts else None,
-        decisions_file=Path(args.decisions) if args.decisions else None,
-    )
+    try:
+        server = serve(
+            files,
+            Path(args.stop_file),
+            host=args.host,
+            port=args.port,
+            pause_file=Path(args.pause_file),
+            alerts_file=Path(args.alerts) if args.alerts else None,
+            decisions_file=Path(args.decisions) if args.decisions else None,
+            password=password,
+        )
+    except (ValueError, OSError) as exc:
+        sys.exit(f"error: {exc}")
     print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
+    if password:
+        print("password protected: any username, the password you set")
     print("showing whichever of these was updated most recently: " + ", ".join(map(str, files)))
     try:
         server.serve_forever()
@@ -988,6 +1002,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--pause-file", default="state/PAUSE")
     s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed to show")
     s.add_argument("--decisions", default="state/decisions.jsonl", help="decision log to show")
+    s.add_argument(
+        "--password",
+        default=None,
+        help="require this password (any username); needed with any --host other than "
+        "127.0.0.1, or set DASHBOARD_PASSWORD in the environment",
+    )
     s.set_defaults(func=cmd_demo_ui)
 
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)

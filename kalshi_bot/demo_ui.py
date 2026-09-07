@@ -12,8 +12,11 @@ leaves the machine.
 
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import logging
+import os
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +31,14 @@ from .dashboard_page import FAVICON, PAGE
 log = logging.getLogger(__name__)
 
 ALIVE_WITHIN_S = 30.0
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+PASSWORD_ENV = "DASHBOARD_PASSWORD"
+
+
+def password_from_env() -> str | None:
+    return os.environ.get(PASSWORD_ENV) or None
+
+
 STALE_AFTER_S = 90.0  # a running loop that has not ticked for this long is presumed dead
 ALERTS_SHOWN = 40
 
@@ -53,24 +64,70 @@ class Dashboard:
         self.pause_file = Path(pause_file) if pause_file else self.stop_file.with_name("PAUSE")
         self.alerts_file = Path(alerts_file) if alerts_file else None
         self.decisions_file = Path(decisions_file) if decisions_file else None
-        self._decisions_cache: tuple[float, int, list[dict[str, Any]]] | None = None
+        self._decisions_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 
-    @property
-    def state_file(self) -> Path:
+    @staticmethod
+    def _read(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except ValueError:
+            return None  # mid-write; the next poll will get it
+
+    def resolve(self, name: str | None = None) -> Path:
+        """The state file to show: the one asked for by basename, else the first
+        candidate with a live heartbeat (the live loop comes first), else the
+        most recently written."""
+        if name:
+            for f in self.state_files:
+                if f.name == name:
+                    return f
+        now = time.time()
+        for f in self.state_files:
+            st = self._read(f) or {}
+            last = st.get("last_tick_ts")
+            if last is not None and now - float(last) <= ALIVE_WITHIN_S:
+                return f
         existing = [f for f in self.state_files if f.exists()]
         if not existing:
             return self.state_files[0]
         return max(existing, key=lambda f: f.stat().st_mtime)
 
-    def snapshot(self, now: float | None = None) -> dict[str, Any]:
+    @property
+    def state_file(self) -> Path:
+        return self.resolve()
+
+    def companions(self, state_file: Path) -> tuple[Path | None, Path | None]:
+        """(decisions, alerts) for a state file: the paper loop keeps its own."""
+        if state_file.name.startswith("paper_"):
+            return (
+                state_file.with_name("paper_decisions.jsonl"),
+                state_file.with_name("paper_alerts.jsonl"),
+            )
+        return self.decisions_file, self.alerts_file
+
+    def files(self, now: float) -> list[dict[str, Any]]:
+        out = []
+        for f in self.state_files:
+            st = self._read(f)
+            if st is None and not f.exists():
+                continue
+            last = (st or {}).get("last_tick_ts")
+            out.append(
+                {
+                    "name": f.name,
+                    "alive": last is not None and now - float(last) <= ALIVE_WITHIN_S,
+                    "env": ((st or {}).get("config") or {}).get("env"),
+                }
+            )
+        return out
+
+    def snapshot(self, now: float | None = None, name: str | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
-        state: dict[str, Any] | None = None
-        state_file = self.state_file
-        if state_file.exists():
-            try:
-                state = json.loads(state_file.read_text())
-            except ValueError:
-                state = None  # mid-write; the next poll will get it
+        state_file = self.resolve(name)
+        state = self._read(state_file)
+        _decisions_file, alerts_file = self.companions(state_file)
         st = state or {}
         last = st.get("last_tick_ts")
         alive = bool(state) and last is not None and now - float(last) <= ALIVE_WITHIN_S
@@ -88,7 +145,7 @@ class Dashboard:
             heartbeat = "stale"
         else:
             heartbeat = "quiet"
-        rows = alertmod.tail(self.alerts_file, ALERTS_SHOWN)
+        rows = alertmod.tail(alerts_file, ALERTS_SHOWN)
         if heartbeat == "stale":
             rows.append(
                 {
@@ -107,7 +164,8 @@ class Dashboard:
             "stop_file_present": self.stop_file.exists(),
             "pause_file": str(self.pause_file),
             "pause_file_present": self.pause_file.exists(),
-            "alerts_file": str(self.alerts_file) if self.alerts_file else None,
+            "alerts_file": str(alerts_file) if alerts_file else None,
+            "files": self.files(now),
             "alerts": rows,
             "heartbeat": heartbeat,
             "alive": alive and not st.get("halted"),
@@ -115,23 +173,25 @@ class Dashboard:
 
     # ------------------------------------------------------------ analysis
 
-    def _decisions(self) -> list[dict[str, Any]]:
+    def _decisions(self, path: Path | None) -> list[dict[str, Any]]:
         """Decision rows, re-read only when the file changes."""
-        if self.decisions_file is None or not self.decisions_file.exists():
+        if path is None or not path.exists():
             return []
-        st = self.decisions_file.stat()
-        key = (st.st_mtime, st.st_size)
-        if self._decisions_cache and self._decisions_cache[:2] == key:
-            return self._decisions_cache[2]
-        rows = review.load_decisions(self.decisions_file)
-        self._decisions_cache = (key[0], key[1], rows)
+        st = path.stat()
+        cached = self._decisions_cache.get(str(path))
+        if cached and cached[:2] == (st.st_mtime, st.st_size):
+            return cached[2]
+        rows = review.load_decisions(path)
+        self._decisions_cache[str(path)] = (st.st_mtime, st.st_size, rows)
         return rows
 
-    def analysis(self) -> dict[str, Any]:
+    def analysis(self, name: str | None = None) -> dict[str, Any]:
         """The review's cuts as JSON for the Analysis tab, plus every result row
         with its entry inputs for the Trades tab."""
-        history = review.load_history(self.state_file)
-        rows = review.attribute(history, self._decisions())
+        state_file = self.resolve(name)
+        decisions_file, _alerts = self.companions(state_file)
+        history = review.load_history(state_file)
+        rows = review.attribute(history, self._decisions(decisions_file))
         for i, r in enumerate(rows):
             r["id"] = i
         rec = sizing.TrackRecord()
@@ -169,8 +229,11 @@ class Dashboard:
             "suggestions": review.suggest(rows) if rows else [],
         }
 
-    def decisions_for(self, ticker: str, limit: int = 60) -> list[dict[str, Any]]:
-        rows = [d for d in self._decisions() if d.get("ticker") == ticker]
+    def decisions_for(
+        self, ticker: str, limit: int = 60, name: str | None = None
+    ) -> list[dict[str, Any]]:
+        decisions_file, _alerts = self.companions(self.resolve(name))
+        rows = [d for d in self._decisions(decisions_file) if d.get("ticker") == ticker]
         return rows[-limit:]
 
     def stop(self) -> None:
@@ -194,10 +257,40 @@ class Dashboard:
             self.pause_file.unlink()
 
 
-def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
+def _query(path: str, key: str) -> str | None:
+    values = parse_qs(urlparse(path).query).get(key) or []
+    return values[0] or None if values else None
+
+
+def make_handler(dash: Dashboard, password: str | None = None) -> type[BaseHTTPRequestHandler]:
+    """``password`` (any username) is required on every request when set; it is
+    what makes the page safe to reach from a phone over a private network."""
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:  # quieter than the default
             log.debug(fmt, *args)
+
+        def _authorised(self) -> bool:
+            if not password:
+                return True
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Basic "):
+                return False
+            try:
+                raw = base64.b64decode(header[6:].strip()).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return False
+            _user, _, given = raw.partition(":")
+            return hmac.compare_digest(given, password)
+
+        def _challenge(self) -> None:
+            body = b"password required"
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("WWW-Authenticate", 'Basic realm="Lewis Wealth Global"')
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send(self, status: HTTPStatus, body: bytes, ctype: str) -> None:
             self.send_response(status)
@@ -208,25 +301,33 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802 - http.server API
+            if not self._authorised():
+                self._challenge()
+                return
             if self.path in ("/", "/index.html"):
                 self._send(HTTPStatus.OK, PAGE.encode(), "text/html; charset=utf-8")
             elif self.path in ("/favicon.svg", "/favicon.ico"):
                 self._send(HTTPStatus.OK, FAVICON.encode(), "image/svg+xml")
-            elif self.path == "/api/state":
-                body = json.dumps(dash.snapshot()).encode()
+            elif self.path.startswith("/api/state"):
+                name = _query(self.path, "file")
+                body = json.dumps(dash.snapshot(name=name)).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
-            elif self.path == "/api/analysis":
-                body = json.dumps(dash.analysis(), default=str).encode()
+            elif self.path.startswith("/api/analysis"):
+                name = _query(self.path, "file")
+                body = json.dumps(dash.analysis(name=name), default=str).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
             elif self.path.startswith("/api/decisions"):
-                query = parse_qs(urlparse(self.path).query)
-                ticker = (query.get("ticker") or [""])[0]
-                body = json.dumps(dash.decisions_for(ticker), default=str).encode()
+                ticker = _query(self.path, "ticker") or ""
+                name = _query(self.path, "file")
+                body = json.dumps(dash.decisions_for(ticker, name=name), default=str).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
+            if not self._authorised():
+                self._challenge()
+                return
             if self.path == "/api/stop":
                 dash.stop()
             elif self.path == "/api/clear-stop":
@@ -259,8 +360,19 @@ def serve(
     pause_file: Path | None = None,
     alerts_file: Path | None = None,
     decisions_file: Path | None = None,
+    password: str | None = None,
 ) -> ThreadingHTTPServer:
-    """Bind and return the server; call ``serve_forever`` on it."""
+    """Bind and return the server; call ``serve_forever`` on it.
+
+    Binding to anything but the local machine requires a password: the page
+    can stop and pause a live loop, so it must never be open to whoever finds
+    the port.
+    """
+    if host not in LOCAL_HOSTS and not password:
+        raise ValueError(
+            f"binding to {host} exposes the dashboard beyond this machine; pass --password "
+            "(or set DASHBOARD_PASSWORD) so a phone can reach it but a stranger cannot"
+        )
     dash = Dashboard(
         state_file,
         stop_file,
@@ -269,7 +381,7 @@ def serve(
         decisions_file=decisions_file,
     )
     try:
-        return _Server((host, port), make_handler(dash))
+        return _Server((host, port), make_handler(dash, password))
     except OSError as exc:
         raise OSError(
             f"port {port} is already in use, probably by an earlier dashboard window; "

@@ -1133,6 +1133,52 @@ def test_dashboard_analysis_and_decisions_endpoints(tmp_path):
         server.server_close()
 
 
+def test_dashboard_password_and_remote_binding(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="password"):
+        demo_ui.serve(tmp_path / "s.json", tmp_path / "STOP", host="0.0.0.0", port=0)
+    server = demo_ui.serve(tmp_path / "s.json", tmp_path / "STOP", port=0, password="opensesame")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(server, "/")
+        assert exc.value.code == 401 and "Basic" in exc.value.headers.get("WWW-Authenticate", "")
+        with pytest.raises(urllib.error.HTTPError):
+            _get(server, "/api/stop", method="POST")
+        assert not (tmp_path / "STOP").exists()
+        import base64
+
+        for user, pw, ok in (
+            ("cam", "opensesame", True),
+            ("cam", "wrong", False),
+            ("", "opensesame", True),
+        ):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state")
+            req.add_header(
+                "Authorization", "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+            )
+            if ok:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    assert resp.status == 200
+            else:
+                with pytest.raises(urllib.error.HTTPError):
+                    urllib.request.urlopen(req, timeout=5)
+    finally:
+        server.shutdown()
+        server.server_close()
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "fromenv")
+    assert demo_ui.password_from_env() == "fromenv"
+    monkeypatch.delenv("DASHBOARD_PASSWORD")
+    assert demo_ui.password_from_env() is None
+    import kalshi_bot.cli as cli
+
+    args = cli.build_parser().parse_args(["demo-ui", "--host", "0.0.0.0", "--port", "0"])
+    with pytest.raises(SystemExit) as exc2:
+        cli.cmd_demo_ui(None, args)
+    assert "password" in str(exc2.value)
+
+
 def test_dashboard_heartbeat_states(tmp_path):
     dash = demo_ui.Dashboard(tmp_path / "s.json", tmp_path / "STOP", alerts_file=None)
     assert dash.snapshot(now=T0)["heartbeat"] == "none"
@@ -1237,3 +1283,31 @@ def test_dashboard_prefers_freshest_state_file(tmp_path):
     assert dash.snapshot(now=T0)["state"]["trades"] == 7
     os.utime(demo, (T0 + 20, T0 + 20))
     assert dash.snapshot(now=T0)["state"]["trades"] == 1
+
+
+def test_dashboard_prefers_the_live_heartbeat_and_switches_files(tmp_path):
+    import os
+    import time as _time
+
+    now = _time.time()
+    live, paper = tmp_path / "live_loop.json", tmp_path / "paper_loop.json"
+    dash = demo_ui.Dashboard(
+        [live, paper],
+        tmp_path / "STOP",
+        alerts_file=tmp_path / "alerts.jsonl",
+        decisions_file=tmp_path / "decisions.jsonl",
+    )
+    LoopState(trades=3, last_tick_ts=now - 2).save(live)
+    LoopState(trades=9, last_tick_ts=now - 1).save(paper)
+    os.utime(paper, (now + 5, now + 5))  # paper written more recently, but live is alive too
+    snap = dash.snapshot(now=now)
+    assert snap["state"]["trades"] == 3 and len(snap["files"]) == 2
+    assert snap["files"][1]["name"] == "paper_loop.json" and snap["files"][1]["alive"]
+    # asked for by name: the paper loop, with its own companion logs
+    assert dash.snapshot(now=now, name="paper_loop.json")["state"]["trades"] == 9
+    assert dash.companions(paper)[0] == tmp_path / "paper_decisions.jsonl"
+    assert dash.companions(live)[0] == tmp_path / "decisions.jsonl"
+    assert dash.analysis(name="paper_loop.json")["rows"] == []
+    # live gone quiet: the running paper loop is shown instead
+    LoopState(trades=3, last_tick_ts=now - 600).save(live)
+    assert dash.snapshot(now=now)["state"]["trades"] == 9

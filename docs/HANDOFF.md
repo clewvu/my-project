@@ -427,6 +427,19 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    entry inputs, from `review.attribute`) and `/api/decisions?ticker=`
    (decision-log rows for one market, cached on file mtime/size);
    `--decisions` flag. Rendered and checked in Chromium in both themes.
+13. Phone and 24/7 (2026-09-07): `demo_ui` requires `--password`
+   (`DASHBOARD_PASSWORD`) for any non-local `--host` and enforces HTTP
+   Basic auth on every route; `resolve(name)` prefers the first candidate
+   with a live heartbeat (live before paper), `?file=` selects one, the
+   page has a selector when more than one state file exists; the paper
+   loop keeps `state/paper_decisions.jsonl` and `paper_alerts.jsonl` so
+   its results never mix with live ones (`companions`); `TrackRecord.load`
+   takes (state, decisions) pairs. `deploy/`: compose adds a `paper`
+   service, `DASHBOARD_BIND` and `DASHBOARD_PASSWORD`, `TRADE_DOLLARS=10`;
+   `deploy/setup.sh` bootstraps Ubuntu (Docker, Tailscale, ufw allowing
+   SSH and tailscale0 only, clone, folders); README walks through a VPS,
+   Tailscale on server and phone, `DASHBOARD_BIND` = the 100.x address.
+   Unverified in the sandbox: the Docker build and the Tailscale steps.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

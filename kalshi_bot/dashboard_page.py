@@ -98,7 +98,9 @@ PAGE = r"""<!doctype html>
   #err { color: var(--bad); }
 
   /* tabs */
-  .tabs { display: flex; gap: 4px; margin: 18px 0 16px; border-bottom: 1px solid var(--hair); }
+  .tabs { display: flex; gap: 4px; margin: 18px 0 16px; border-bottom: 1px solid var(--hair); overflow-x: auto;
+          scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
   .tab { padding: 10px 14px; border: none; border-bottom: 2px solid transparent; border-radius: 0; background: transparent;
          color: var(--muted); font-weight: 600; font-size: 13px; letter-spacing: 0.02em; }
   .tab:hover { background: transparent; color: var(--ink); }
@@ -217,6 +219,8 @@ PAGE = r"""<!doctype html>
     .tile { grid-template-columns: 1fr 1fr; }
     .value.hero-fig { font-size: 42px; }
     .wordmark .name { font-size: 18px; }
+    .tab { padding: 10px 10px; white-space: nowrap; }
+    main { padding: 16px 14px 48px; }
   }
 </style>
 </head>
@@ -252,7 +256,7 @@ PAGE = r"""<!doctype html>
       <button class="ghost theme" id="themebtn" title="Toggle light and dark" onclick="toggleTheme()">◐</button>
     </div>
   </header>
-  <div class="subline"><span id="cfg">connecting…</span><span id="err"></span></div>
+  <div class="subline"><span id="cfg">connecting…</span><span><select id="filepick" style="display:none" onchange="pickFile(this.value)"></select> <span id="err"></span></span></div>
   <div class="banner" id="banner"><span id="bannertext"></span><span class="spacer"></span><span class="note" id="bannernote"></span></div>
 
   <nav class="tabs">
@@ -385,6 +389,10 @@ const cls = v => v > 0 ? 'up' : v < 0 ? 'down' : 'flat';
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
 const sideTag = s => `<span class="side ${s}">${String(s || '').toUpperCase()}</span>`;
 let analysis = null, snap = null, picked = null, sortKey = 'settled_ts', sortAsc = false, openRow = null, view = 'overview';
+let fileName = null;  // which loop's state to show; null = the server's choice
+const fileQ = (sep) => fileName ? `${sep}file=${encodeURIComponent(fileName)}` : '';
+const fileLabel = n => n === 'live_loop.json' ? 'Live' : n === 'paper_loop.json' ? 'Paper' : n === 'demo_loop.json' ? 'Demo' : n;
+function pickFile(name) { fileName = name || null; openRow = null; picked = null; $('f-chip').innerHTML = ''; refresh(); }
 
 // theme -------------------------------------------------------------
 function applyTheme() {
@@ -475,6 +483,12 @@ function renderOverview(d) {
   const series = Array.isArray(c.series) ? c.series.join(' · ') : (c.series || '');
   $('cfg').textContent = d.state ? `${live ? 'Real money' : (c.env || 'idle')} · ${series}` : `no state file yet at ${d.state_file}`;
   $('foot-file').textContent = d.state_file || '';
+  const files = d.files || []; const sel = $('filepick');
+  if (files.length > 1) {
+    const current = (d.state_file || '').split(/[\\/]/).pop();
+    sel.innerHTML = files.map(f => `<option value="${esc(f.name)}" ${f.name === current ? 'selected' : ''}>${fileLabel(f.name)}${f.alive ? ' · running' : ''}</option>`).join('');
+    sel.style.display = '';
+  } else { sel.style.display = 'none'; }
   const hb = d.heartbeat || 'none';
   const pill = $('pill'); pill.className = 'pill' + (live ? ' live' : '') + (s.halted || hb === 'paused' || hb === 'stale' ? ' halt' : d.alive ? ' on' : '');
   $('pilltext').textContent = s.halted ? 'halted' : hb === 'paused' ? (live ? 'live · paused' : 'paused') : hb === 'stale' ? 'no heartbeat' : d.alive ? (live ? 'live · running' : 'running') : (s.stopped ? 'stopped' : 'not running');
@@ -566,7 +580,7 @@ function toggleRow(id) { openRow = openRow === id ? null : id; renderTrades(); }
 async function loadDetail(r) {
   const cell = $('detail-' + r.id); if (!cell) return;
   let decs = [];
-  try { decs = await (await fetch('/api/decisions?ticker=' + encodeURIComponent(r.ticker))).json(); } catch (e) {}
+  try { decs = await (await fetch('/api/decisions?ticker=' + encodeURIComponent(r.ticker) + fileQ('&'))).json(); } catch (e) {}
   const entry = decs.filter(d => d.action === 'trade' && d.side === r.side && Number(d.ts) <= Number(r.settled_ts)).pop();
   const exits = decs.filter(d => d.action === 'exit');
   const inp = (entry && entry.inputs) || {};
@@ -619,10 +633,10 @@ function renderAnalysis() {
 
 // refresh -----------------------------------------------------------
 async function refresh() {
-  try { snap = await (await fetch('/api/state')).json(); $('err').textContent = ''; }
+  try { snap = await (await fetch('/api/state' + fileQ('?'))).json(); $('err').textContent = ''; }
   catch (e) { $('err').textContent = 'dashboard server unreachable'; return; }
   renderOverview(snap);
-  try { analysis = await (await fetch('/api/analysis')).json(); } catch (e) { analysis = analysis || {rows: [], cuts: {}, tiers: [], suggestions: []}; }
+  try { analysis = await (await fetch('/api/analysis' + fileQ('?'))).json(); } catch (e) { analysis = analysis || {rows: [], cuts: {}, tiers: [], suggestions: []}; }
   if (view === 'trades') renderTrades();
   if (view === 'analysis') renderAnalysis();
 }

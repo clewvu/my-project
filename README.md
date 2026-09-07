@@ -454,9 +454,18 @@ confidence tiers that gate sizing, and what the numbers support);
   drift halts. A loop that stops ticking for 90 seconds without saying why
   is flagged as having no heartbeat, in the pill and in a banner.
 
-There are no push alerts by design; the page is the alert channel. On a
-server, bind it with `--host 0.0.0.0` behind your own access control (see
-`deploy/README.md`).
+There are no push alerts by design; the page is the alert channel.
+
+**From a phone.** Any `--host` other than the local machine requires
+`--password` (or `DASHBOARD_PASSWORD` in the environment); the page then
+asks for it, any username. On the same Wi-Fi, `kalshi-bot demo-ui --host
+0.0.0.0 --password ...` and the laptop's address work. For a server that
+runs with the laptop off, and a private network so the page is reachable
+from the phone anywhere but never from the public internet, follow
+`deploy/README.md` (Docker, Tailscale, a bootstrap script). When both the
+live and the paper loop are running, a selector in the subline switches
+between them; the live loop is shown by default while its heartbeat is
+fresh.
 
 ### Spot source
 
