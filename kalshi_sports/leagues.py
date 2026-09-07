@@ -1,9 +1,9 @@
 """League registry: which Kalshi series, odds-feed sport keys and score feeds go together.
 
-The Kalshi series tickers listed here are *candidates* collected from the
-naming pattern of the crypto series (``KX<UNDERLYING><KIND>``). They are
-verified by ``kalshi-sports discover`` against production; the recorder polls
-whatever is configured and logs series that return no markets.
+Kalshi series tickers confirmed against production on 2026-09-07 with
+``kalshi-sports discover``: MLB, NFL, NBA and college football game, spread
+and total series exist under these names; college basketball uses the
+``KXNCAAMB`` prefix. MLB trades on exchange shard 3, the others on shard 0.
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ NCAAF = League(
     key="ncaaf",
     name="NCAA football",
     sport="football",
-    kalshi_series=("KXNCAAFGAME", "KXNCAAFSPREAD", "KXNCAAFTOTAL", "KXCFBGAME"),
+    kalshi_series=("KXNCAAFGAME", "KXNCAAFSPREAD", "KXNCAAFTOTAL"),
     odds_sport_key="americanfootball_ncaaf",
     espn_path="football/college-football",
     espn_params={"groups": "80", "limit": "300"},  # 80 = all FBS
@@ -87,7 +87,7 @@ NCAAB = League(
     key="ncaab",
     name="NCAA men's basketball",
     sport="basketball",
-    kalshi_series=("KXNCAABGAME", "KXNCAABSPREAD", "KXNCAABTOTAL", "KXCBBGAME"),
+    kalshi_series=("KXNCAAMBGAME", "KXNCAAMBSPREAD", "KXNCAAMBTOTAL", "KXNCAABGAME"),
     odds_sport_key="basketball_ncaab",
     espn_path="basketball/mens-college-basketball",
     espn_params={"groups": "50", "limit": "400"},  # 50 = all Division I
@@ -107,7 +107,7 @@ def league_for_series(series_ticker: str) -> League | None:
     # Order matters: NCAAF/NCAAB before NFL/NBA so KXNCAAB does not match KXNBA-like prefixes.
     for key, prefixes in (
         ("ncaaf", ("KXNCAAF", "KXCFB")),
-        ("ncaab", ("KXNCAAB", "KXCBB", "KXNCAAM")),
+        ("ncaab", ("KXNCAAB", "KXNCAAMB", "KXCBB")),
         ("mlb", ("KXMLB",)),
         ("nfl", ("KXNFL",)),
         ("nba", ("KXNBA",)),

@@ -1,35 +1,15 @@
-from sports_fixtures import ESPN_PAYLOAD, ODDS_PAYLOAD
+from sports_fixtures import CLOSE_TS, ESPN_PAYLOAD, ODDS_PAYLOAD, START_TS, market, rules
 
 from kalshi_bot.client import KalshiAPIError
-from kalshi_bot.models import Market, Orderbook, Trade
+from kalshi_bot.models import Orderbook, Trade
 from kalshi_sports import leagues
 from kalshi_sports.feeds.odds import parse_odds_api
 from kalshi_sports.feeds.scores import parse_espn
 from kalshi_sports.recorder import SportsRecorder, cadence_for
 from kalshi_sports.storage import SportsDataStore
 
-START = "2026-09-07T23:10:00Z"
-START_TS = 1788822600.0
-
-
-def market(ticker, series, title, event, close="2026-09-08T03:00:00Z", result=None, status="open"):
-    return Market.from_dict(
-        {
-            "ticker": ticker,
-            "series_ticker": series,
-            "event_ticker": event,
-            "title": title,
-            "status": status,
-            "close_time": close,
-            "result": result,
-            "yes_bid_dollars": "0.45",
-            "yes_ask_dollars": "0.47",
-            "no_bid_dollars": "0.53",
-            "no_ask_dollars": "0.55",
-            "volume": 10,
-            "exchange_index": 3,
-        }
-    )
+MLB_EVENT = "KXMLBGAME-26SEP071910NYYBOS"
+NFL_EVENT = "KXNFLGAME-26SEP07KCLAC"
 
 
 class FakeClient:
@@ -37,47 +17,42 @@ class FakeClient:
         self.open = {
             "KXMLBGAME": [
                 market(
-                    "KXMLBGAME-26SEP07NYYBOS-NYY",
+                    f"{MLB_EVENT}-NYY",
                     "KXMLBGAME",
-                    "Yankees at Red Sox",
-                    "KXMLBGAME-26SEP07NYYBOS",
+                    "New York Y wins",
+                    MLB_EVENT,
+                    rules_text=rules("New York Y", "Boston"),
+                    sub="New York Y",
                 ),
                 market(
-                    "KXMLBGAME-26SEP07NYYBOS-BOS",
+                    f"{MLB_EVENT}-BOS",
                     "KXMLBGAME",
-                    "Yankees at Red Sox",
-                    "KXMLBGAME-26SEP07NYYBOS",
+                    "Boston wins",
+                    MLB_EVENT,
+                    rules_text=rules("New York Y", "Boston"),
+                    sub="Boston",
                 ),
             ],
+            # NFL: date only, so the start is approximate (13:00 ET) until ESPN refines it
             "KXNFLGAME": [
                 market(
-                    "KXNFLGAME-26SEP07KCLAC-KC",
+                    f"{NFL_EVENT}-KC",
                     "KXNFLGAME",
-                    "Chiefs at Chargers",
-                    "KXNFLGAME-26SEP07KCLAC",
+                    "Kansas City wins",
+                    NFL_EVENT,
+                    rules_text=rules("Kansas City", "Los Angeles C", "Pro Football", "Sep 7, 2026"),
+                    sub="Kansas City",
+                    close="2026-09-10T23:00:00Z",
                 ),
             ],
-        }
-        self.events = {
-            "KXMLBGAME": [
-                {
-                    "event_ticker": "KXMLBGAME-26SEP07NYYBOS",
-                    "title": "Yankees at Red Sox",
-                    "strike_date": START,
-                }
-            ]
         }
         self.settled = {}
         self.fail_orderbook_for = set()
         self.calls = []
 
-    def get_markets(self, *, series_ticker, status, max_pages):
-        self.calls.append(("markets", series_ticker))
+    def get_markets(self, *, series_ticker, status, limit=100, max_pages=5):
+        self.calls.append(("markets", series_ticker, limit))
         return list(self.open.get(series_ticker, []))
-
-    def get_events(self, *, series_ticker, status, max_pages=5):
-        self.calls.append(("events", series_ticker))
-        return list(self.events.get(series_ticker, []))
 
     def get_market(self, ticker):
         self.calls.append(("market", ticker))
@@ -135,12 +110,14 @@ class FakeOdds:
 class FakeScores:
     source = "fake"
 
-    def __init__(self):
+    def __init__(self, payloads=None):
         self.fetched = []
+        self.payloads = payloads or {"mlb": ESPN_PAYLOAD}
 
     def fetch(self, league, *, date=None):
         self.fetched.append((league.key, date))
-        return parse_espn(ESPN_PAYLOAD, league.key, now=1000.0) if league.key == "mlb" else []
+        payload = self.payloads.get(league.key)
+        return parse_espn(payload, league.key, now=1000.0) if payload else []
 
     def close(self):
         pass
@@ -155,80 +132,87 @@ def make(series=("KXMLBGAME", "KXNFLGAME", "KXNCAAFGAME"), **kw):
 
 
 def test_cadence_for():
-    assert cadence_for(None, fast=5, slow=900) == 900
-    assert cadence_for(-100, fast=5, slow=900) == 5  # in play
-    assert cadence_for(20 * 60, fast=5, slow=900) == 5
-    assert cadence_for(2 * 3600, fast=5, slow=900) == 60
-    assert cadence_for(10 * 3600, fast=5, slow=900) == 300
-    assert cadence_for(3 * 86400, fast=5, slow=900) == 900
+    assert cadence_for(None, fast=5) is None
+    assert cadence_for(3 * 86400, fast=5) is None  # light snapshots only
+    assert cadence_for(10 * 3600, fast=5) == 300
+    assert cadence_for(2 * 3600, fast=5) == 60
+    assert cadence_for(20 * 60, fast=5) == 5
+    assert cadence_for(-100, fast=5) == 5  # in play
 
 
-def test_first_tick_discovers_classifies_and_records():
+def test_first_tick_discovers_light_snapshots_and_polls_near_games():
     client, store, rec = make()
-    now = START_TS - 2 * 3600
+    now = START_TS - 2 * 3600  # MLB game in 2 h; NFL approx start 13:00 ET is 6 h earlier
     res = rec.tick(now)
-    assert res.discovered == 3 and res.markets == 3 and res.snapshots == 3 and res.new_trades == 3
-    assert not res.errors
+    assert res.discovered == 3 and res.light == 3
+    # all three are inside the 24 h book window, so all get a book snapshot
+    assert res.markets == 3 and res.snapshots == 3 and res.new_trades == 3 and not res.errors
+    assert ("markets", "KXMLBGAME", 1000) in client.calls
     st = store.stats()
     assert st["markets"] == 3 and st["events"] == 2 and st["series"] == 3
-    rows = store.latest_rows()
+    assert st["snapshots"] == 6 and st["book_snapshots"] == 3
+    assert st["events_exact_start"] == 1  # MLB from the ticker time; NFL approximate
     m = store._conn.execute(
-        "SELECT * FROM markets WHERE ticker='KXMLBGAME-26SEP07NYYBOS-NYY'"
+        "SELECT * FROM markets WHERE ticker=?", (f"{MLB_EVENT}-NYY",)
     ).fetchone()
-    assert (m["league"], m["kind"], m["away"], m["home"], m["side"]) == (
+    assert (m["league"], m["kind"], m["away"], m["home"], m["away_abbr"], m["side_team"]) == (
         "mlb",
         "moneyline",
+        "New York Y",
+        "Boston",
         "NYY",
-        "BOS",
         "NYY",
     )
-    ev = store._conn.execute(
-        "SELECT * FROM events WHERE event_ticker='KXMLBGAME-26SEP07NYYBOS'"
-    ).fetchone()
-    assert ev["start_ts"] == START_TS
-    snap = rows["snapshots"]
-    assert snap["yes_bid"] == 0.45 and snap["no_bid"] == 0.53
-    # NFL event had no events row, so secs_to_start is unknown there but set for MLB
-    mlb_snap = store._conn.execute(
-        "SELECT secs_to_start FROM snapshots WHERE ticker LIKE 'KXMLBGAME%' LIMIT 1"
-    ).fetchone()
-    assert mlb_snap["secs_to_start"] == 2 * 3600
+    assert store.event_start(MLB_EVENT) == (START_TS, True)
+    nfl_start, exact = store.event_start(NFL_EVENT)
+    assert nfl_start is not None and not exact
     # the unknown college series was recorded as empty, not as an error
     series = {r["ticker"]: r["open_markets"] for r in store._conn.execute("SELECT * FROM series")}
     assert series["KXNCAAFGAME"] == 0
 
 
-def test_cadence_skips_far_out_markets_between_ticks():
+def test_far_out_markets_get_light_snapshots_only():
     client, store, rec = make()
-    now = START_TS - 2 * 3600  # 60 s cadence for MLB; NFL has no start -> slow cadence
+    now = START_TS - 3 * 86400
+    res = rec.tick(now)
+    assert res.light == 3 and res.markets == 0 and res.snapshots == 0
+    assert not any(c[0] == "book" for c in client.calls)
+    assert store.stats()["snapshots"] == 3
+
+
+def test_cadence_skips_between_ticks_and_dedups_trades():
+    client, store, rec = make()
+    now = START_TS - 2 * 3600  # 60 s cadence for MLB
     rec.tick(now)
+    books_before = sum(1 for c in client.calls if c[0] == "book" and "KXMLB" in c[1])
     res2 = rec.tick(now + 5)
-    assert res2.markets == 0
+    # the NFL market's approximate 13:00 ET start is already past, so it polls at the fast
+    # cadence; the two MLB markets (2 h out, 60 s cadence) must not
+    assert res2.markets == 1
+    assert sum(1 for c in client.calls if c[0] == "book" and "KXMLB" in c[1]) == books_before
     res3 = rec.tick(now + 61)
-    assert res3.markets == 2  # the two MLB markets; NFL waits for the slow cadence
-    # second visit: trades already stored
-    assert res3.new_trades == 0
+    assert res3.markets == 3 and res3.new_trades == 0
 
 
 def test_errors_are_recorded_not_raised_and_settlement_is_captured():
     client, store, rec = make()
-    client.fail_orderbook_for.add("KXNFLGAME-26SEP07KCLAC-KC")
+    client.fail_orderbook_for.add(f"{NFL_EVENT}-KC")
     now = START_TS - 2 * 3600
     res = rec.tick(now)
     assert len(res.errors) == 1 and "KCLAC" in res.errors[0]
     assert res.snapshots == 3  # snapshot still written from market-level quotes
-    # market closes; a later fetch carries the result
     settled = market(
-        "KXMLBGAME-26SEP07NYYBOS-NYY",
+        f"{MLB_EVENT}-NYY",
         "KXMLBGAME",
-        "Yankees at Red Sox",
-        "KXMLBGAME-26SEP07NYYBOS",
+        "New York Y wins",
+        MLB_EVENT,
+        rules_text=rules("New York Y", "Boston"),
         result="yes",
         status="settled",
     )
     client.settled[settled.ticker] = settled
     client.open["KXMLBGAME"] = []
-    later = 1788837000.0 + 700  # after close + grace
+    later = CLOSE_TS + 700  # after the Sep 10 close + grace
     rec._last_settle = 0.0
     res2 = rec.tick(later)
     assert res2.settled == 1
@@ -252,19 +236,64 @@ def test_odds_and_scores_feeds_are_polled_per_league_and_deduplicated():
     res = rec.tick(now)
     assert odds.fetched == ["mlb", "nfl"] and res.odds == 5
     assert [k for k, _ in scores.fetched] == ["mlb", "nfl"] and res.states == 1
-    # same state again: no new row; odds not due yet
     res2 = rec.tick(now + 30)
     assert res2.odds == 0 and res2.states == 0
     # mlb is in play (state "in"), so scores poll every 20 s; nfl idle every 300 s
-    assert scores.fetched.count(("mlb", scores.fetched[0][1])) == 2
+    assert sum(1 for k, _ in scores.fetched if k == "mlb") == 2
     assert sum(1 for k, _ in scores.fetched if k == "nfl") == 1
     res3 = rec.tick(now + 601)
     assert res3.odds == 5
-    # a failing odds feed is an error line, not a crash
     odds.fail = True
     res4 = rec.tick(now + 1300)
     assert res4.odds == 0 and any("odds" in e for e in res4.errors)
     assert store.stats()["odds"] == 10
+
+
+def test_espn_schedule_refines_a_date_only_start():
+    nfl_payload = {
+        "events": [
+            {
+                "id": "9001",
+                "date": "2026-09-08T00:20Z",  # Sep 7, 8:20 PM EDT
+                "competitions": [
+                    {
+                        "date": "2026-09-08T00:20Z",
+                        "competitors": [
+                            {
+                                "homeAway": "home",
+                                "score": "0",
+                                "team": {
+                                    "displayName": "Los Angeles Chargers",
+                                    "abbreviation": "LAC",
+                                },
+                            },
+                            {
+                                "homeAway": "away",
+                                "score": "0",
+                                "team": {"displayName": "Kansas City Chiefs", "abbreviation": "KC"},
+                            },
+                        ],
+                        "status": {"type": {"state": "pre", "detail": "Scheduled"}},
+                    }
+                ],
+            }
+        ]
+    }
+    scores = FakeScores({"nfl": nfl_payload})
+    client, store, rec = make(scores=scores)
+    now = START_TS - 2 * 3600
+    res = rec.tick(now)
+    assert res.starts_refined == 1
+    assert store.event_start(NFL_EVENT) == (
+        1788827.0 * 1000 + 600 - 600,
+        True,
+    ) or store.event_start(NFL_EVENT) == (1788826800.0, True)
+    tr = rec.tracked[f"{NFL_EVENT}-KC"]
+    assert tr.start_exact and tr.start_ts == 1788826800.0
+    # a later discovery must not overwrite the exact start with the approximation
+    rec._last_discover = 0.0
+    rec.tick(now + 400)
+    assert store.event_start(NFL_EVENT) == (1788826800.0, True)
 
 
 def test_run_stops_after_max_ticks():

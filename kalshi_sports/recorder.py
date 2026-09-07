@@ -1,18 +1,21 @@
 """Recorder for Kalshi sports markets plus the odds and score feeds.
 
-Each tick:
-  1. every ``discover_interval``: list open markets for every configured series,
-     classify them (league, teams, kind, line) and upsert markets and events
-  2. for every live market whose cadence is due: orderbook snapshot and new trades
-  3. every ``settle_interval``: re-fetch closed markets until they carry a result
-  4. every ``odds_interval`` per league: sportsbook odds (if a feed is configured)
-  5. every scores interval per league: ESPN scoreboard; fast while any game is in play
+Request budget. The probe on 2026-09-07 found well over a thousand open
+markets (NFL and college football each list hundreds of spreads and totals),
+and Kalshi answered a burst with 429. At the 0.15 s throttle, three requests
+per market would take longer than any sane cadence. So:
 
-Cadence per market depends on time to the game (``cadence_for``): hourly-ish
-far out, every 5 seconds near the start and in play. Sports markets number in
-the hundreds when college football is included, so this matters for the rate
-limit: at 0.15 s per request, 300 markets at 2 calls each is 90 s per sweep,
-which is why far-out markets are sampled slowly.
+  1. Discovery (every ``discover_interval``) lists every open market per series
+     with ``limit=1000``: a handful of requests. The list carries bid, ask,
+     last, volume and open interest, so a *light snapshot* is written for every
+     live market straight from it, with no per-market request.
+  2. Only markets within ``book_window_s`` of their start (default 24 h) get
+     *book snapshots* (orderbook + trades) on a cadence that tightens toward
+     the start: every 5 minutes inside a day, every minute inside three hours,
+     every 5 seconds in the last half hour and in play.
+  3. Settlements are re-fetched every ``settle_interval`` for closed markets.
+  4. Odds and ESPN game state are polled per league; ESPN start times refine
+     events whose start Kalshi gave only as a date.
 
 Any single failing call is logged and skipped; the loop keeps going.
 """
@@ -30,9 +33,10 @@ from kalshi_bot.client import KalshiClient, KalshiError
 from kalshi_bot.models import Market
 
 from . import leagues
-from .catalog import GameMarket, classify
+from .catalog import GameMarket, classify, date_from_ts
 from .feeds.odds import OddsFeed
-from .feeds.scores import ScoreFeed, today_eastern
+from .feeds.scores import GameState, ScoreFeed, today_eastern
+from .matching import GameRef, match_game
 from .storage import SportsDataStore
 
 log = logging.getLogger(__name__)
@@ -48,28 +52,30 @@ def is_live(market: Market, now: float) -> bool:
     return True
 
 
-def cadence_for(secs_to_start: float | None, *, fast: float, slow: float) -> float:
-    """Seconds between snapshots given time to game start (negative = in play)."""
-    if secs_to_start is None:
-        return slow
-    if secs_to_start <= 30 * 60:  # last half hour before start, and in play
+def cadence_for(
+    secs_to_start: float | None, *, fast: float, window: float = 24 * 3600
+) -> float | None:
+    """Seconds between book snapshots given time to start; None = light snapshots only."""
+    if secs_to_start is None or secs_to_start > window:
+        return None
+    if secs_to_start <= 30 * 60:  # last half hour and in play
         return fast
     if secs_to_start <= 3 * 3600:
         return 60.0
-    if secs_to_start <= 24 * 3600:
-        return 300.0
-    return slow
+    return 300.0
 
 
 @dataclass
 class TickResult:
     discovered: int = 0
+    light: int = 0
     markets: int = 0
     snapshots: int = 0
     new_trades: int = 0
     settled: int = 0
     odds: int = 0
     states: int = 0
+    starts_refined: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -78,6 +84,7 @@ class Tracked:
     market: Market
     gm: GameMarket
     start_ts: float | None
+    start_exact: bool
     next_snapshot: float = 0.0
 
 
@@ -91,8 +98,8 @@ class SportsRecorder:
         league_keys: tuple[str, ...] | list[str] = leagues.DEFAULT_LEAGUES,
         interval: float = 5.0,
         fast_cadence: float = 5.0,
-        slow_cadence: float = 900.0,
-        discover_interval: float = 600.0,
+        book_window_s: float = 24 * 3600,
+        discover_interval: float = 300.0,
         settle_interval: float = 300.0,
         book_depth: int = 10,
         odds: OddsFeed | None = None,
@@ -107,7 +114,7 @@ class SportsRecorder:
         self.leagues = [leagues.LEAGUES[k] for k in league_keys]
         self.interval = max(1.0, interval)
         self.fast_cadence = fast_cadence
-        self.slow_cadence = slow_cadence
+        self.book_window_s = book_window_s
         self.discover_interval = discover_interval
         self.settle_interval = settle_interval
         self.book_depth = book_depth
@@ -129,12 +136,18 @@ class SportsRecorder:
     # ------------------------------------------------------------ discovery
 
     def discover(self, now: float, result: TickResult) -> None:
+        seen: set[str] = set()
         for series in self.series:
             try:
-                markets = self.client.get_markets(series_ticker=series, status="open", max_pages=5)
+                markets = self.client.get_markets(
+                    series_ticker=series, status="open", limit=1000, max_pages=5
+                )
             except KalshiError as exc:
                 result.errors.append(f"{series}: list markets: {exc}")
                 log.warning("%s: list markets failed: %s", series, exc)
+                seen.update(
+                    t for t, tr in self.tracked.items() if tr.market.series_ticker == series
+                )
                 continue
             lg = leagues.league_for_series(series)
             self.store.upsert_series(
@@ -149,42 +162,34 @@ class SportsRecorder:
             )
             if not markets:
                 if series not in self._empty_series:
-                    log.info("%s: no open markets (series may not exist; check `discover`)", series)
+                    log.info("%s: no open markets", series)
                     self._empty_series.add(series)
                 continue
             self._empty_series.discard(series)
-            self._load_events(series, now, result)
             for m in markets:
                 if not is_live(m, now):
                     continue
+                seen.add(m.ticker)
                 event = self.events.get(m.event_ticker or "")
                 gm = classify(m, event)
                 self.store.upsert_event(gm, now, event)
                 self.store.upsert_market(m, gm, now)
-                start = gm.start_ts or self.store.event_start(m.event_ticker)
+                start, exact = gm.start_ts, gm.start_exact
+                db_start, db_exact = self.store.event_start(m.event_ticker)
+                if db_exact and db_start is not None:
+                    start, exact = db_start, True
                 tr = self.tracked.get(m.ticker)
                 if tr is None:
-                    self.tracked[m.ticker] = Tracked(m, gm, start)
+                    self.tracked[m.ticker] = Tracked(m, gm, start, exact)
                     result.discovered += 1
                 else:
-                    tr.market, tr.gm, tr.start_ts = m, gm, start
-        # forget markets that vanished from the open lists
-        seen = {m for m in self.tracked if self.tracked[m].market is not None}
-        for ticker in list(seen):
-            if not is_live(self.tracked[ticker].market, now):
+                    tr.market, tr.gm, tr.start_ts, tr.start_exact = m, gm, start, exact
+                # light snapshot from the list: no extra request
+                self.store.insert_snapshot(now, m, None, start)
+                result.light += 1
+        for ticker in list(self.tracked):
+            if ticker not in seen:
                 del self.tracked[ticker]
-
-    def _load_events(self, series: str, now: float, result: TickResult) -> None:
-        try:
-            events = self.client.get_events(series_ticker=series, status="open", max_pages=5)
-        except KalshiError as exc:
-            result.errors.append(f"{series}: list events: {exc}")
-            log.debug("%s: list events failed: %s", series, exc)
-            return
-        for ev in events:
-            ticker = ev.get("event_ticker") or ev.get("ticker")
-            if ticker:
-                self.events[str(ticker)] = ev
 
     # ------------------------------------------------------------ one tick
 
@@ -200,14 +205,13 @@ class SportsRecorder:
             if not is_live(tr.market, now):
                 self.tracked.pop(tr.market.ticker, None)
                 continue
-            if now < tr.next_snapshot:
+            secs = (tr.start_ts - now) if tr.start_ts is not None else None
+            cadence = cadence_for(secs, fast=self.fast_cadence, window=self.book_window_s)
+            if cadence is None or now < tr.next_snapshot:
                 continue
             result.markets += 1
             self._record_market(tr, now, result)
-            secs = (tr.start_ts - now) if tr.start_ts else None
-            tr.next_snapshot = now + cadence_for(
-                secs, fast=self.fast_cadence, slow=self.slow_cadence
-            )
+            tr.next_snapshot = now + cadence
 
         if now - self._last_settle >= self.settle_interval:
             self._last_settle = now
@@ -228,25 +232,20 @@ class SportsRecorder:
                 )
                 if now - self._last_scores.get(lg.key, 0.0) >= interval:
                     self._last_scores[lg.key] = now
-                    result.states += self._record_scores(lg, now, result)
+                    states = self._record_scores(lg, now, result)
+                    if states:
+                        result.starts_refined += self._refine_starts(lg, states, now)
 
         return result
 
     def _record_market(self, tr: Tracked, now: float, result: TickResult) -> None:
         market = tr.market
-        try:
-            fresh = self.client.get_market(market.ticker)
-            market = tr.market = fresh
-        except KalshiError as exc:
-            result.errors.append(f"{market.ticker}: market: {exc}")
-            log.warning("%s: market refresh failed: %s", market.ticker, exc)
         book = None
         try:
             book = self.client.get_orderbook(market.ticker, depth=self.book_depth)
         except KalshiError as exc:
             result.errors.append(f"{market.ticker}: orderbook: {exc}")
             log.warning("%s: orderbook failed: %s", market.ticker, exc)
-        self.store.upsert_market(market, tr.gm, now)
         self.store.insert_snapshot(now, market, book, tr.start_ts)
         result.snapshots += 1
         try:
@@ -285,15 +284,14 @@ class SportsRecorder:
             return 0
         return self.store.insert_odds([q.row() for q in quotes])
 
-    def _record_scores(self, lg: leagues.League, now: float, result: TickResult) -> int:
+    def _record_scores(self, lg: leagues.League, now: float, result: TickResult) -> list[GameState]:
         try:
             states = self.scores.fetch(lg, date=today_eastern(now))  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"scores {lg.key}: {exc}")
             log.warning("scores %s failed: %s", lg.key, exc)
-            return 0
+            return []
         self._in_play[lg.key] = any(s.state == "in" for s in states)
-        # Only write a row when something changed, so idle days do not bloat the table.
         rows = []
         for s in states:
             last = self.store.last_game_state(lg.key, s.game_id)
@@ -307,7 +305,37 @@ class SportsRecorder:
             ):
                 continue
             rows.append(s.row())
-        return self.store.insert_game_states(rows)
+        result.states += self.store.insert_game_states(rows)
+        return states
+
+    def _refine_starts(self, lg: leagues.League, states: list[GameState], now: float) -> int:
+        """Give date-only Kalshi events an exact start from the score feed's schedule."""
+        refs = [
+            GameRef(lg.key, s.game_id, s.start_ts, s.home, s.away, s.home_abbr, s.away_abbr)
+            for s in states
+            if s.start_ts
+        ]
+        if not refs:
+            return 0
+        refined = 0
+        for ev in self.store.events_needing_start(lg.key, date_from_ts(now)):
+            ref = match_game(
+                lg.key,
+                ev["game_date"],
+                ev["away_abbr"] or ev["away"],
+                ev["home_abbr"] or ev["home"],
+                refs,
+                alt_away=ev["away"],
+                alt_home=ev["home"],
+            )
+            if ref is None or ref.start_ts is None:
+                continue
+            self.store.set_event_start(ev["event_ticker"], ref.start_ts, "espn")
+            for tr in self.tracked.values():
+                if tr.market.event_ticker == ev["event_ticker"]:
+                    tr.start_ts, tr.start_exact = ref.start_ts, True
+            refined += 1
+        return refined
 
     # ------------------------------------------------------------ loop
 
@@ -335,15 +363,16 @@ class SportsRecorder:
                 res = self.tick(started)
                 failures = 0 if not res.errors else failures + 1
                 log.info(
-                    "tick tracked=%d polled=%d snapshots=%d trades+%d settled=%d odds+%d "
-                    "states+%d errors=%d",
+                    "tick tracked=%d light=%d books=%d trades+%d settled=%d odds+%d "
+                    "states+%d starts+%d errors=%d",
                     len(self.tracked),
-                    res.markets,
+                    res.light,
                     res.snapshots,
                     res.new_trades,
                     res.settled,
                     res.odds,
                     res.states,
+                    res.starts_refined,
                     len(res.errors),
                 )
             except Exception:  # noqa: BLE001

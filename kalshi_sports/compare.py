@@ -37,17 +37,15 @@ class Comparison:
 
 
 def _side_prob(
-    cons: Consensus, league: str, side: str | None, home: str, away: str
+    cons: Consensus, league: str, side_team: str | None, side_name: str | None
 ) -> float | None:
-    if not side:
-        return None
-    for outcome, p in cons.probs.items():
-        if teams.same_team(league, side, outcome):
-            return p
-    # Kalshi side may be an abbreviation the college matcher cannot resolve; try home/away.
-    for team, outcome in ((home, home), (away, away)):
-        if teams.same_team(league, side, team):
-            return cons.probs.get(outcome)
+    """Consensus probability of the YES team, by abbreviation (pro) or display name (college)."""
+    for side in (side_team, side_name):
+        if not side:
+            continue
+        for outcome, p in cons.probs.items():
+            if teams.same_team(league, side, outcome):
+                return p
     return None
 
 
@@ -66,7 +64,8 @@ def compare(
         for g in games
     ]
     sql = """
-        SELECT m.ticker, m.league, m.game_date, m.away, m.home, m.side, m.event_ticker,
+        SELECT m.ticker, m.league, m.game_date, m.away, m.home, m.away_abbr, m.home_abbr,
+               m.side, m.side_team, m.side_name, m.event_ticker,
                s.yes_bid, s.yes_ask, s.no_ask, s.secs_to_start, s.ts
         FROM markets m
         JOIN snapshots s ON s.id = (
@@ -83,7 +82,15 @@ def compare(
     for r in conn.execute(sql, args):
         lg = r["league"] or ""
         game = f"{r['away'] or '?'} @ {r['home'] or '?'} {r['game_date'] or ''}".strip()
-        ref = match_game(lg, r["game_date"], r["away"], r["home"], refs)
+        ref = match_game(
+            lg,
+            r["game_date"],
+            r["away_abbr"] or r["away"],
+            r["home_abbr"] or r["home"],
+            refs,
+            alt_away=r["away"],
+            alt_home=r["home"],
+        )
         if ref is None:
             out.append(
                 Comparison(
@@ -130,7 +137,7 @@ def compare(
                 )
             )
             continue
-        p = _side_prob(h2h, lg, r["side"], ref.home, ref.away)
+        p = _side_prob(h2h, lg, r["side_team"], r["side_name"])
         if p is None:
             out.append(
                 Comparison(

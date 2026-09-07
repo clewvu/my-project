@@ -26,7 +26,7 @@ from kalshi_bot.models import Market, Orderbook, Trade
 
 from .catalog import GameMarket
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -50,7 +50,11 @@ CREATE TABLE IF NOT EXISTS events (
     game_date      TEXT,
     away           TEXT,
     home           TEXT,
+    away_abbr      TEXT,
+    home_abbr      TEXT,
     start_ts       REAL,
+    start_exact    INTEGER,
+    start_source   TEXT,
     title          TEXT,
     status         TEXT,
     first_seen_ts  REAL NOT NULL,
@@ -68,7 +72,11 @@ CREATE TABLE IF NOT EXISTS markets (
     game_date        TEXT,
     away             TEXT,
     home             TEXT,
+    away_abbr        TEXT,
+    home_abbr        TEXT,
     side             TEXT,
+    side_team        TEXT,
+    side_name        TEXT,
     line             REAL,
     title            TEXT,
     subtitle         TEXT,
@@ -159,7 +167,18 @@ CREATE TABLE IF NOT EXISTS game_state (
 CREATE INDEX IF NOT EXISTS idx_state_game_ts ON game_state(league, game_id, ts);
 """
 
-MIGRATIONS: dict[int, list[str]] = {}
+MIGRATIONS: dict[int, list[str]] = {
+    2: [
+        "ALTER TABLE markets ADD COLUMN away_abbr TEXT",
+        "ALTER TABLE markets ADD COLUMN home_abbr TEXT",
+        "ALTER TABLE markets ADD COLUMN side_team TEXT",
+        "ALTER TABLE markets ADD COLUMN side_name TEXT",
+        "ALTER TABLE events ADD COLUMN away_abbr TEXT",
+        "ALTER TABLE events ADD COLUMN home_abbr TEXT",
+        "ALTER TABLE events ADD COLUMN start_exact INTEGER",
+        "ALTER TABLE events ADD COLUMN start_source TEXT",
+    ],
+}
 
 
 class SchemaMismatch(Exception):
@@ -204,9 +223,10 @@ class SportsDataStore:
                     f"{self.path} has schema version {version}, newer than this code "
                     f"({SCHEMA_VERSION}). Update kalshi-sports."
                 )
-            for target in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in MIGRATIONS.get(target, []):
-                    self._conn.execute(statement)
+            if version >= 1:
+                for target in range(version + 1, SCHEMA_VERSION + 1):
+                    for statement in MIGRATIONS.get(target, []):
+                        self._conn.execute(statement)
             self._conn.executescript(SCHEMA)
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -271,14 +291,24 @@ class SportsDataStore:
             self._conn.execute(
                 """
                 INSERT INTO events (event_ticker, series_ticker, league, game_date, away, home,
-                                    start_ts, title, status, first_seen_ts, last_seen_ts, raw)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    away_abbr, home_abbr, start_ts, start_exact, start_source,
+                                    title, status, first_seen_ts, last_seen_ts, raw)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_ticker) DO UPDATE SET
                     league = COALESCE(excluded.league, events.league),
                     game_date = COALESCE(excluded.game_date, events.game_date),
                     away = COALESCE(excluded.away, events.away),
                     home = COALESCE(excluded.home, events.home),
-                    start_ts = COALESCE(excluded.start_ts, events.start_ts),
+                    away_abbr = COALESCE(excluded.away_abbr, events.away_abbr),
+                    home_abbr = COALESCE(excluded.home_abbr, events.home_abbr),
+                    -- keep an exact start over an approximate one
+                    start_ts = CASE WHEN events.start_exact = 1 THEN events.start_ts
+                                    ELSE COALESCE(excluded.start_ts, events.start_ts) END,
+                    start_exact = CASE WHEN events.start_exact = 1 THEN 1
+                                       ELSE COALESCE(excluded.start_exact, events.start_exact) END,
+                    start_source = CASE WHEN events.start_exact = 1 THEN events.start_source
+                                        ELSE COALESCE(excluded.start_source,
+                                                      events.start_source) END,
                     title = COALESCE(excluded.title, events.title),
                     status = COALESCE(excluded.status, events.status),
                     last_seen_ts = excluded.last_seen_ts,
@@ -291,7 +321,11 @@ class SportsDataStore:
                     gm.game_date,
                     gm.away,
                     gm.home,
+                    gm.away_abbr,
+                    gm.home_abbr,
                     gm.start_ts,
+                    1 if gm.start_exact else 0,
+                    "kalshi" if gm.start_ts is not None else None,
                     (event or {}).get("title") or None,
                     (event or {}).get("status") or None,
                     now,
@@ -308,10 +342,11 @@ class SportsDataStore:
                 """
                 INSERT INTO markets
                     (ticker, event_ticker, series_ticker, league, kind, game_date, away, home,
-                     side, line, title, subtitle, rules, exchange_index, open_ts, close_ts,
-                     expiration_ts, status, result, expiration_value, first_seen_ts,
-                     last_seen_ts, raw)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     away_abbr, home_abbr, side, side_team, side_name, line, title, subtitle,
+                     rules, exchange_index, open_ts, close_ts, expiration_ts, status, result,
+                     expiration_value, first_seen_ts, last_seen_ts, raw)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?)
                 ON CONFLICT(ticker) DO UPDATE SET
                     status = excluded.status,
                     result = COALESCE(excluded.result, markets.result),
@@ -321,6 +356,10 @@ class SportsDataStore:
                     line = COALESCE(excluded.line, markets.line),
                     away = COALESCE(excluded.away, markets.away),
                     home = COALESCE(excluded.home, markets.home),
+                    away_abbr = COALESCE(excluded.away_abbr, markets.away_abbr),
+                    home_abbr = COALESCE(excluded.home_abbr, markets.home_abbr),
+                    side_team = COALESCE(excluded.side_team, markets.side_team),
+                    side_name = COALESCE(excluded.side_name, markets.side_name),
                     rules = COALESCE(excluded.rules, markets.rules),
                     last_seen_ts = excluded.last_seen_ts,
                     raw = excluded.raw
@@ -334,7 +373,11 @@ class SportsDataStore:
                     gm.game_date,
                     gm.away,
                     gm.home,
+                    gm.away_abbr,
+                    gm.home_abbr,
                     gm.side,
+                    gm.side_team,
+                    gm.side_name,
                     gm.line,
                     market.title,
                     gm.subtitle,
@@ -385,14 +428,40 @@ class SportsDataStore:
             ).fetchall()
         return [r["ticker"] for r in rows]
 
-    def event_start(self, event_ticker: str | None) -> float | None:
+    def event_start(self, event_ticker: str | None) -> tuple[float | None, bool]:
+        """(start_ts, exact) for an event; (None, False) if unknown."""
         if not event_ticker:
-            return None
+            return None, False
         with self._lock:
             row = self._conn.execute(
-                "SELECT start_ts FROM events WHERE event_ticker = ?", (event_ticker,)
+                "SELECT start_ts, start_exact FROM events WHERE event_ticker = ?", (event_ticker,)
             ).fetchone()
-        return row["start_ts"] if row else None
+        if not row:
+            return None, False
+        return row["start_ts"], bool(row["start_exact"])
+
+    def events_needing_start(self, league: str, since_date: str) -> list[sqlite3.Row]:
+        """Events in a league on or after a date whose start is unknown or approximate."""
+        with self._lock:
+            return self._conn.execute(
+                """
+                SELECT event_ticker, game_date, away, home, away_abbr, home_abbr
+                FROM events
+                WHERE league = ? AND (start_exact IS NULL OR start_exact = 0)
+                  AND game_date IS NOT NULL AND game_date >= ?
+                """,
+                (league, since_date),
+            ).fetchall()
+
+    def set_event_start(self, event_ticker: str, start_ts: float, source: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE events SET start_ts = ?, start_exact = 1, start_source = ?
+                WHERE event_ticker = ?
+                """,
+                (start_ts, source, event_ticker),
+            )
 
     # ------------------------------------------------------------ snapshots / trades
 
@@ -552,7 +621,14 @@ class SportsDataStore:
                 "markets": count("SELECT COUNT(*) FROM markets"),
                 "settled": count("SELECT COUNT(*) FROM markets WHERE result IS NOT NULL"),
                 "snapshots": count("SELECT COUNT(*) FROM snapshots"),
-                "empty_books": count("SELECT COUNT(*) FROM snapshots WHERE yes_levels IS NULL"),
+                "book_snapshots": count(
+                    "SELECT COUNT(*) FROM snapshots WHERE book_raw IS NOT NULL"
+                ),
+                "empty_books": count(
+                    "SELECT COUNT(*) FROM snapshots "
+                    "WHERE book_raw IS NOT NULL AND yes_levels IS NULL"
+                ),
+                "events_exact_start": count("SELECT COUNT(*) FROM events WHERE start_exact = 1"),
                 "trades": count("SELECT COUNT(*) FROM trades"),
                 "odds": count("SELECT COUNT(*) FROM odds"),
                 "odds_books": count("SELECT COUNT(DISTINCT book) FROM odds"),

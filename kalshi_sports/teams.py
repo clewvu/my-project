@@ -140,6 +140,22 @@ ALIASES: dict[str, dict[str, str]] = {
 }
 TABLES = {"mlb": MLB_TEAMS, "nfl": NFL_TEAMS, "nba": NBA_TEAMS}
 
+# Kalshi disambiguates shared cities with a trailing initial: "Los Angeles D", "New York G".
+KALSHI_CITY_NAMES: dict[str, dict[str, str]] = {
+    "mlb": {
+        "losangelesd": "LAD",
+        "losangelesa": "LAA",
+        "newyorky": "NYY",
+        "newyorkm": "NYM",
+        "chicagoc": "CHC",
+        "chicagow": "CWS",
+        "as": "ATH",
+        "athletics": "ATH",
+    },
+    "nfl": {"newyorkg": "NYG", "newyorkj": "NYJ", "losangelesr": "LAR", "losangelesc": "LAC"},
+    "nba": {"losangelesl": "LAL", "losangelesc": "LAC"},
+}
+
 
 def normalise(name: str) -> str:
     """Lower-case alphanumerics only: 'St. Louis Cardinals' -> 'stlouiscardinals'."""
@@ -172,6 +188,8 @@ def abbr_for_name(league: str, name: str) -> str | None:
         return None
     if target.upper() in table:
         return target.upper()
+    if target in KALSHI_CITY_NAMES.get(league, {}):
+        return KALSHI_CITY_NAMES[league][target]
     # Full name first, then nickname, then city (city alone is ambiguous for NY/LA/CHI).
     for abbr, (city, nick) in table.items():
         if normalise(f"{city} {nick}") == target or normalise(nick) == target:

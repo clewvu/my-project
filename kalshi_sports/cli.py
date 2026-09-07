@@ -115,8 +115,9 @@ def cmd_discover(settings: Settings, args: argparse.Namespace) -> int:
                 else:
                     print(
                         f"    {m.ticker:<36} {gm.game_date or '?'} "
-                        f"{gm.away or '?'}@{gm.home or '?'}"
-                        f" side={gm.side} line={gm.line} shard={m.exchange_index}"
+                        f"{gm.away or '?'}({gm.away_abbr})@{gm.home or '?'}({gm.home_abbr})"
+                        f" side={gm.side_team or gm.side} line={gm.line} shard={m.exchange_index}"
+                        f" start={_fmt_ts(gm.start_ts)}{'' if gm.start_exact else '~'}"
                         f" bid={m.yes_bid} ask={m.yes_ask} vol={m.volume:.0f}"
                         f" close={_fmt_ts(m.close_time.timestamp() if m.close_time else None)}"
                     )
@@ -154,7 +155,7 @@ def cmd_record(settings: Settings, args: argparse.Namespace) -> int:
                 league_keys=keys,
                 interval=args.interval,
                 fast_cadence=args.fast,
-                slow_cadence=args.slow,
+                book_window_s=args.book_window * 3600,
                 discover_interval=args.discover_every,
                 book_depth=args.depth,
                 odds=odds,
@@ -187,7 +188,11 @@ def cmd_record_stats(_: Settings, args: argparse.Namespace) -> int:
         f"series:      {st['series']}   events: {st['events']}   markets: {st['markets']}"
         f"   settled: {st['settled']}"
     )
-    print(f"snapshots:   {st['snapshots']}   (empty books: {st['empty_books']})")
+    print(
+        f"snapshots:   {st['snapshots']}   (with book: {st['book_snapshots']}, "
+        f"empty books: {st['empty_books']})"
+    )
+    print(f"events with exact start: {st['events_exact_start']} of {st['events']}")
     print(f"trades:      {st['trades']}")
     print(f"odds:        {st['odds']} quotes from {st['odds_books']} books  {st['odds_by_league']}")
     print(f"game states: {st['game_states']}  {st['states_by_league']}")
@@ -332,9 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
     league_args(s)
     s.add_argument("--db", default=DEFAULT_DB)
     s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
-    s.add_argument("--fast", type=float, default=5.0, help="snapshot cadence near/in game")
-    s.add_argument("--slow", type=float, default=900.0, help="snapshot cadence days out")
-    s.add_argument("--discover-every", type=float, default=600.0, help="market list refresh")
+    s.add_argument("--fast", type=float, default=5.0, help="book cadence near/in game (s)")
+    s.add_argument(
+        "--book-window", type=float, default=24.0, help="hours before start to poll books/trades"
+    )
+    s.add_argument(
+        "--discover-every",
+        type=float,
+        default=300.0,
+        help="market list refresh (s); light snapshots",
+    )
     s.add_argument("--odds-every", type=float, default=None, help="odds poll seconds per league")
     s.add_argument("--depth", type=int, default=10)
     s.add_argument("--ticks", type=int, default=None, help="stop after N ticks")

@@ -1,7 +1,7 @@
 import sqlite3
 
 import pytest
-from sports_fixtures import NOW, seed
+from sports_fixtures import NOW, START_TS, seed
 
 from kalshi_bot.fees import fee_per_contract
 from kalshi_sports.compare import compare, format_table
@@ -23,11 +23,36 @@ def test_match_game_by_teams_and_date():
         GameRef("nfl", "g3", 1788822600.0, "Boston Red Sox", "New York Yankees"),
     ]
     assert match_game("mlb", "2026-09-07", "NYY", "BOS", refs).game_id == "g1"
-    # swapped home/away still finds the game
-    assert match_game("mlb", "2026-09-07", "BOS", "NYY", refs).game_id == "g1"
+    assert match_game("mlb", "2026-09-07", "BOS", "NYY", refs).game_id == "g1"  # swapped
     assert match_game("mlb", "2026-09-07", "SD", "LAD", refs).game_id == "g2"
+    # Kalshi display names, including the disambiguated city
+    assert match_game("mlb", "2026-09-07", "San Diego", "Los Angeles D", refs).game_id == "g2"
     assert match_game("mlb", "2026-09-20", "NYY", "BOS", refs) is None  # wrong date
     assert match_game("mlb", "2026-09-07", None, "BOS", refs) is None
+    # alternates: abbreviation unknown, name known
+    assert (
+        match_game(
+            "mlb", "2026-09-07", None, None, refs, alt_away="Yankees", alt_home="Red Sox"
+        ).game_id
+        == "g1"
+    )
+
+
+def test_match_game_college_by_abbreviation_or_name():
+    refs = [
+        GameRef(
+            "ncaaf",
+            "c1",
+            1788822600.0,
+            "San Jose State Spartans",
+            "Fresno State Bulldogs",
+            "SJSU",
+            "FRES",
+        ),
+    ]
+    assert match_game("ncaaf", "2026-09-07", "FRES", "SJSU", refs).game_id == "c1"
+    assert match_game("ncaaf", "2026-09-07", "Fresno St.", "San Jose St.", refs).game_id == "c1"
+    assert match_game("ncaaf", "2026-09-07", "Nevada", "San Jose St.", refs) is None
 
 
 def test_match_game_doubleheader_prefers_same_eastern_date():
@@ -46,8 +71,7 @@ def test_consensus_weights_sharp_books_and_needs_full_market():
     by_market = {c.market: c for c in cons}
     assert set(by_market) == {"h2h", "totals"}
     h2h = by_market["h2h"]
-    # draftkings had one bad price, so only pinnacle counts
-    assert h2h.n_books == 1 and h2h.sharp_books == 1
+    assert h2h.n_books == 1 and h2h.sharp_books == 1  # draftkings had a bad price
     p_bos = h2h.p("Boston Red Sox")
     assert p_bos == pytest.approx((1 / 2.10) / (1 / 2.10 + 1 / 1.80))
     assert h2h.probs["New York Yankees"] + p_bos == pytest.approx(1.0)
@@ -74,9 +98,9 @@ def test_compare_reports_edges_net_of_fee():
     assert r.edge_yes == pytest.approx(p_nyy - 0.42 - fee_per_contract(0.42))
     assert r.edge_no == pytest.approx((1 - p_nyy) - 0.60 - fee_per_contract(0.60))
     assert r.note == "" and r.n_books == 1
-    assert r.secs_to_start == pytest.approx(1788822600.0 - NOW)
+    assert r.secs_to_start == pytest.approx(START_TS - NOW)
     text = format_table(rows)
-    assert "KXMLBGAME-26SEP07NYYBOS-NYY" in text and "cons" in text.splitlines()[0]
+    assert "KXMLBGAME-26SEP071910NYYBOS-NYY" in text and "cons" in text.splitlines()[0]
 
 
 def test_compare_marks_unmatched_markets():
