@@ -414,6 +414,17 @@ def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
             return 0
 
 
+def cmd_quote_test(_: Settings, args: argparse.Namespace) -> int:
+    """Backtest passive two-sided quoting around fair value on recorded prints."""
+    try:
+        from . import fairvalue, quoting
+    except ImportError:
+        sys.exit('quote-test needs pandas: pip install -e ".[research]"')
+    data = fairvalue.load(args.db, series=args.series or None)
+    print(quoting.report(data, min_ttc=args.min_ttc, fill=args.fill))
+    return 0
+
+
 def cmd_review(_: Settings, args: argparse.Namespace) -> int:
     """Loss attribution over the live loop's results: where the P&L went and what to change."""
     from .review import report
@@ -890,6 +901,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-trades", type=int, default=0, help="also print the last N trades of the backtest"
     )
     s.set_defaults(func=cmd_fairvalue)
+
+    s = sub.add_parser("quote-test", help=cmd_quote_test.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--series", nargs="*", default=None, help="restrict to these series")
+    s.add_argument("--min-ttc", type=float, default=120.0, help="no quotes inside this of close")
+    s.add_argument(
+        "--fill",
+        choices=["cross", "touch"],
+        default="cross",
+        help="cross: a print must trade through our price (conservative). touch: at it",
+    )
+    s.set_defaults(func=cmd_quote_test)
 
     s = sub.add_parser("review", help=cmd_review.__doc__)
     s.add_argument("--live-state", default="state/live_loop.json", help="loop state to read")

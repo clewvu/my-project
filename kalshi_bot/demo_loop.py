@@ -944,6 +944,9 @@ class DemoLoop:
                 "won": net > 0,
                 "net": round(net, 4),
                 "settled_ts": now,
+                "maker": trade.maker,
+                "fee": round(entry_fee + sell_fee, 4),
+                "fee_reported": trade.fee_paid is not None,
             }
         )
         del s.history[:-200]
@@ -1049,6 +1052,9 @@ class DemoLoop:
                 "won": won,
                 "net": round(net, 4),
                 "settled_ts": now,
+                "maker": trade.maker,
+                "fee": round(fee, 4),
+                "fee_reported": trade.fee_paid is not None,
             }
         )
         del s.history[:-200]

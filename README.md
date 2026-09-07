@@ -267,13 +267,32 @@ that file with the recorder's `markets` table. Its edge is unproven until
 `kalshi-bot fairvalue` on recorded data says VIABLE; until then treat a live
 fair-value run as a paid experiment.
 
+### The maker pivot: `kalshi-bot quote-test`
+
+The directional trade has now been measured on recorded data and on real
+money, and the published large-sample studies of these 15-minute binaries
+agree: takers lose to a market that is faster than a spot model, makers
+lose far less, and the crypto series charge no maker fee. `kalshi-bot
+quote-test` backtests the pivot on the recorder's snapshots and trade
+prints: rest a YES bid and a NO bid a `spread` under the model's fair
+value (already TWAP-aware through `effective_tau`), requote every
+snapshot, fill only when a public print crosses the quote (`--fill cross`,
+conservative; `touch` for at-price fills), hold fills to settlement, count
+a market that fills both sides as locked. It reports fills, win rate,
+adverse selection (fair value when quoted against what settled), net per
+contract with a clustered bootstrap, a cut by seconds to close, and a
+time-ordered held-out verdict. Nothing quotes live until that verdict
+says VIABLE; the live quoting engine is the next build after it does.
+
 ### Where the money went: `kalshi-bot review`
 
 `kalshi-bot review` joins every booked result in `state/live_loop.json`
 with the entry decision that produced it in `state/decisions.jsonl` and
-cuts the P&L by how the position ended, side, series, the model's
-confidence at entry, seconds to close, and distance from the strike, with
-an estimate of how much was fees. It ends with the settings the numbers
+cuts the P&L by how the position ended, entry type (maker or taker, with
+the fee per contract actually booked, so the zero-maker-fee claim can be
+checked on your own fills), side, series, the model's confidence at entry,
+seconds to close, and distance from the strike, with an estimate of how
+much was fees. It ends with the settings the numbers
 support. Run it after a losing stretch before changing anything.
 
 ### Self-improvement: `kalshi-bot learn`

@@ -398,6 +398,26 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    10`); the live ceiling stays $20 and the cap $50. Not built yet: the
    learned model on recorded data (logistic on z-score, trend, ttc,
    market-implied p) and the extra series (ETH, SOL, XRP).
+11. Cameron shared a research summary (2026-09-07) with three claims:
+   settlement is a 60 s trimmed average (our `effective_tau` already
+   prices the averaging; brief section 3), the crypto maker fee is zero
+   (`fees.MAKER_RATE` is already 0; the loop's entry threshold still uses
+   the taker fee, conservative; history rows now carry `maker`, `fee`,
+   `fee_reported` and `review` prints fee per contract by entry type so
+   the claim is checked on real fills), and a 727M-row study finds the
+   spot-model directional trade nets -0.116 per trade with a 16 ms
+   lead-lag (matches our live result). The pivot it recommends, passive
+   TWAP-aware quoting, is now backtestable: `kalshi_bot/quoting.py`,
+   `kalshi-bot quote-test [--fill cross|touch] [--min-ttc]` (quotes both
+   sides `spread` under fair value per snapshot, fills on crossing prints
+   with taker_side, one fill per side per market, locked when both fill,
+   clustered bootstrap, held-out verdict). Next if VIABLE: a live quoting
+   engine (two resting orders per market, requote on fair-value moves,
+   inventory cap, pull quotes on a spot jump; 1 s ticks). Cameron also
+   asked for the system to be "an expert in BTC and DOGE prediction and
+   evaluation": evaluation exists (`fairvalue` Brier vs market and basis
+   tables, `review`, the track record); prediction beyond the driftless
+   model is the learned-model item above and needs the recorder's data.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across
