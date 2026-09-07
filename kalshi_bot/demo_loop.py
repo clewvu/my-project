@@ -797,7 +797,14 @@ class DemoLoop:
             try:
                 self.client.cancel_order(trade.order_id, ticker=trade.ticker)
             except Exception as exc:  # noqa: BLE001
-                log.warning("cancel maker %s failed: %s", trade.order_id, exc)
+                # the resting order may still be live: sending a taker order now
+                # could fill both and double the position. Retry next tick.
+                log.warning(
+                    "cancel maker %s failed (%s); keeping it, retrying next tick",
+                    trade.order_id,
+                    exc,
+                )
+                return
             self._refresh_fills(trade)
             if trade.filled:
                 log.info("maker order %s filled before cancel; holding", trade.order_id)

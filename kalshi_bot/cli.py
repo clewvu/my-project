@@ -528,6 +528,31 @@ def _loop_housekeeping(cfg, args: argparse.Namespace) -> bool:
         return True
     if cfg.stop_file.exists():
         sys.exit(f"{cfg.stop_file} exists; delete it (or use --reset) to start")
+    state = LoopState.load(cfg.state_file)
+    # one loop per state file: two would trade the same account twice over
+    last = state.last_tick_ts
+    if last is not None and not getattr(args, "force", False):
+        age = time.time() - float(last)
+        if age < HEARTBEAT_LIVE_S:
+            sys.exit(
+                f"another loop wrote {cfg.state_file} {age:.0f}s ago and looks alive. Stop it "
+                "first (Ctrl-C in its window, or the dashboard's Stop then Clear stop file). "
+                "If you are sure it is dead, add --force."
+            )
+    if state.halted:
+        if getattr(args, "clear_halt", False):
+            print(f"clearing the earlier halt: {state.halted}")
+            state.halted = None
+            state.breaker_until = None
+            state.loss_streak = 0
+            state.save(cfg.state_file)
+        else:
+            sys.exit(
+                f"the loop halted earlier: {state.halted}\n"
+                "Look into it (kalshi-bot --env prod status shows the exchange's positions), "
+                "then start again with --clear-halt to keep the history and the cap, or "
+                "--reset to start from zero."
+            )
     return False
 
 
@@ -553,6 +578,7 @@ def cmd_demo_trade(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+HEARTBEAT_LIVE_S = 30.0  # a state file written this recently belongs to a running loop
 LIVE_MAX_DOLLARS = 20.0
 LIVE_MAX_LOSS_CAP = 50.0
 
@@ -1256,6 +1282,17 @@ def _add_loop_args(
     )
     s.add_argument(
         "--run-after-reset", action="store_true", help="with --reset: start the loop afterwards"
+    )
+    s.add_argument(
+        "--clear-halt",
+        action="store_true",
+        help="start even though the loop halted last time (cap, breaker, reconciliation); "
+        "keeps the history and the cap",
+    )
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="start even though the state file has a fresh heartbeat from another loop",
     )
 
 

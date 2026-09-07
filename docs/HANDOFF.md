@@ -440,6 +440,18 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    SSH and tailscale0 only, clone, folders); README walks through a VPS,
    Tailscale on server and phone, `DASHBOARD_BIND` = the 100.x address.
    Unverified in the sandbox: the Docker build and the Tailscale steps.
+14. Reconciliation halt (2026-09-07 evening): "KXBTC15M-26SEP071815-15:
+   loop has -9, exchange -18". Two credible causes, both now guarded:
+   (a) the maker-to-taker fallback sent the taker order even when the
+   cancel of the resting maker order had raised, so both could fill
+   (`_maker_to_taker` now returns and retries next tick on a failed
+   cancel); (b) two loops on one state file, after a window was closed
+   and the loop restarted while the old process still lived
+   (`_loop_housekeeping` refuses to start while the state file's
+   heartbeat is under 30 s unless `--force`). A persisted halt now stops
+   the CLI at start-up with the reason; `--clear-halt` clears it and the
+   breaker while keeping history and the cap. Tests run in isolated cwd
+   (`tests/conftest.py`) after the suite polluted the real alerts file.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

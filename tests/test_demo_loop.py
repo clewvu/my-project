@@ -460,6 +460,72 @@ def test_maker_falls_back_to_taker_after_the_wait(tmp_path):
     assert t.maker is False and t.limit_price == 0.58 and t.order_id == "o2"
 
 
+def test_maker_fallback_waits_when_the_cancel_fails(tmp_path):
+    # a cancel that errors may have left the maker order live; sending a taker
+    # order on top could fill both, so the fallback retries next tick instead
+    client = FakeClient({0: "yes"}, fill=False)
+    wide = Market.from_dict(
+        {
+            "ticker": "KXBTC15M-0",
+            "series_ticker": "KXBTC15M",
+            "status": "open",
+            "close_time": T0 + 900,
+            "yes_ask_dollars": "0.580",
+            "yes_bid_dollars": "0.550",
+            "no_ask_dollars": "0.450",
+            "no_bid_dollars": "0.420",
+        }
+    )
+    client.get_markets = lambda **kw: [wide]
+    client.get_market = lambda ticker: wide
+    attempts = []
+
+    def flaky_cancel(order_id, *, ticker=None):
+        attempts.append(order_id)
+        if len(attempts) < 3:
+            raise RuntimeError("exchange timeout")
+        client.cancelled.append(order_id)
+
+    client.cancel_order = flaky_cancel
+    loop = _maker_loop(tmp_path, client)
+    loop.run(max_ticks=6)  # ticks at 0..50 s: fallback attempts from 20 s on
+    assert attempts == ["o1", "o1", "o1"]  # two failures, then success
+    assert [o["price"] for o in client.orders] == [0.56, 0.58]  # one taker order, not three
+    assert client.cancelled == ["o1"]
+
+
+def test_startup_refuses_a_live_twin_and_a_stale_halt(tmp_path, monkeypatch, capsys):
+    import time as _time
+
+    import kalshi_bot.cli as cli
+
+    monkeypatch.chdir(tmp_path)
+    parser = cli.build_parser()
+
+    def run(*extra):
+        args = parser.parse_args(
+            ["demo-trade", "--state-file", "s.json", "--stop-file", "STOP", *extra]
+        )
+        return cli._loop_housekeeping(cli._loop_config(args), args)
+
+    assert run() is False  # no state yet
+    LoopState(last_tick_ts=_time.time() - 5).save(tmp_path / "s.json")
+    with pytest.raises(SystemExit) as exc:
+        run()
+    assert "looks alive" in str(exc.value)
+    assert run("--force") is False
+    LoopState(last_tick_ts=_time.time() - 600, halted="reconciliation mismatch: x").save(
+        tmp_path / "s.json"
+    )
+    with pytest.raises(SystemExit) as exc:
+        run()
+    assert "halted earlier" in str(exc.value) and "--clear-halt" in str(exc.value)
+    assert run("--clear-halt") is False
+    assert "clearing the earlier halt" in capsys.readouterr().out
+    reloaded = LoopState.load(tmp_path / "s.json")
+    assert reloaded.halted is None and reloaded.loss_streak == 0
+
+
 def test_fixed_fraction_sizing_uses_the_shard_balance(tmp_path):
     from kalshi_bot.models import Balance
     from kalshi_bot.strategy import Signal
