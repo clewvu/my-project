@@ -24,34 +24,51 @@ dashboard.
 | Server services | `live`, `paper`, `dashboard`, `recorder`, `learn` in `deploy/docker-compose.yml` |
 | Settings | the top block of `.env.example` and `deploy/.env.server` (`KALSHI_*`, `STRATEGY`, `MARGIN`, `TRADE_DOLLARS`, `LOSS_CAP`, `PROFIT_TARGET`, `DASHBOARD_*`) |
 
-## Sports research (`kalshi-sports`)
+## Sports desk (`kalshi-sports`)
 
-Research on Kalshi's game markets (MLB, NFL, NBA, college football and
-basketball): catalog, recorder, sportsbook odds and ESPN feeds, a consensus
-comparison. It places no orders.
+Research and trading on Kalshi's game markets (MLB, NFL, NBA, college
+football and basketball): catalog, recorder, sportsbook odds and ESPN feeds,
+the consensus comparison, and since 2026-09-07 a trading loop (paper and
+live) with a persisted risk engine and an hourly learning cycle. Its live
+loop places real orders only behind `kalshi-sports live-trade`'s gates.
 
 | What | Where |
 | --- | --- |
 | Package | `kalshi_sports/` (every module) |
 | Command | `kalshi-sports` (`kalshi_sports/cli.py`) |
-| State (git-ignored) | `state/sports_data.sqlite` |
-| Docs | `README.md` section "Sports research", `docs/sports-design.md`, `docs/sports-strategy.md`, `docs/sports-phase1.md` |
+| Strategy, loop, risk, learning | `kalshi_sports/strategy.py`, `trader.py`, `risk.py`, `learn.py` |
+| Research | `kalshi_sports/catalog.py`, `teams.py`, `leagues.py`, `matching.py`, `consensus.py`, `compare.py`, `feeds/devig.py` |
+| Recorder and feeds | `kalshi_sports/recorder.py`, `storage.py`, `feeds/odds.py`, `feeds/scores.py`, `config.py` |
+| Dashboard | the "Sports" tab in `kalshi_bot/dashboard_page.py` and `sports_snapshot`, `sports_control`, `/api/sports` in `kalshi_bot/demo_ui.py` (the only sports code inside `kalshi_bot/`) |
+| State (git-ignored) | `state/sports_data.sqlite` (recorder tables plus `decisions`, `positions`, `limits`), `state/sports_live.json`, `state/sports_paper.json`, `state/sports_params.json`, `state/sports_alerts.jsonl`, `state/SPORTS_STOP`, `state/SPORTS_PAUSE` |
+| Docs | `README.md` section "Sports (kalshi-sports)", `docs/sports-design.md`, `docs/sports-strategy.md`, `docs/sports-phase1.md`, `docs/sports-trading.md`, `docs/RUNNING_BOTH.md` |
 | Tests | `tests/test_sports_*.py`, `tests/sports_fixtures.py` |
-| Server service | `sports-recorder` in `deploy/docker-compose.yml` |
-| Settings | the block below the "SPORTS RESEARCH" banner in `.env.example` and `deploy/.env.server` (`ODDS_API_KEY`, `ODDS_API_REGIONS`, `ODDS_INTERVAL`, `SPORTS_LEAGUES`, `SCORES_INTERVAL_*`) |
+| Server services | `sports-recorder`, `sports-paper` in `deploy/docker-compose.yml` |
+| Settings | the sports block in `.env.example` and `deploy/.env.server` (`ODDS_API_KEY`, `ODDS_API_REGIONS`, `ODDS_INTERVAL`, `SPORTS_LEAGUES`, `SCORES_INTERVAL_*`) |
 
 ## Shared
 
 `kalshi_bot/client.py`, `kalshi_bot/models.py`, `kalshi_bot/auth.py`,
-`kalshi_bot/config.py` and `kalshi_bot/fees.py` are used by both. The
-sports package imports them and adds nothing to them beyond read-only
-series and event endpoints. `pyproject.toml` installs both commands.
+`kalshi_bot/config.py`, `kalshi_bot/fees.py`, `kalshi_bot/alerts.py`
+(the `AlertLog` class, pointed at a sports file) and `kalshi_bot/sizing.py`
+(`kelly_dollars`) are used by both. The sports package imports them and
+adds nothing to them beyond read-only series and event endpoints. One
+dashboard process (`kalshi-bot demo-ui`) serves both desks: the crypto tabs
+read the crypto files, the Sports tab reads the sports files. `pyproject.toml` installs both commands.
 `deploy/Dockerfile` builds one image that carries both packages.
 
 ## Rules that keep them apart
 
 * A sports change never edits a file in the crypto rows above, and the
-  reverse, except the shared files listed.
+  reverse, except the shared files listed and the sports parts of the two
+  dashboard files, which a crypto change must leave in place.
+* The two loops share one Kalshi account but different exchange shards:
+  crypto on shard 2, MLB on shard 3, the other sports on shard 0. The
+  sports trader ignores non-sports positions when it reconciles; the crypto
+  loop must likewise not touch positions on `KX<LEAGUE>...` series.
+* Stop and pause files are per desk: `state/STOP` and `state/PAUSE` stop
+  the crypto loop only; `state/SPORTS_STOP` and `state/SPORTS_PAUSE` the
+  sports loop only.
 * A new state file takes the project's prefix: `sports_` for sports;
   crypto files keep their existing names.
 * Tests run in an isolated working directory (`tests/conftest.py`), so
