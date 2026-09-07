@@ -30,12 +30,12 @@ class SportsSettings:
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> SportsSettings:
         load_dotenv(dotenv_path=dotenv_path, override=False)
-        regions = os.getenv("ODDS_API_REGIONS", "us,us2,eu").strip() or "us,us2,eu"
+        regions = os.getenv("ODDS_API_REGIONS", "us,eu").strip() or "us,eu"
         leagues = os.getenv("SPORTS_LEAGUES", ",".join(DEFAULT_LEAGUES)).strip()
         return cls(
             odds_api_key=os.getenv("ODDS_API_KEY", "").strip(),
             odds_regions=tuple(r.strip() for r in regions.split(",") if r.strip()),
-            odds_interval=float(os.getenv("ODDS_INTERVAL", "1800") or 1800),
+            odds_interval=float(os.getenv("ODDS_INTERVAL", "3600") or 3600),
             scores_interval_live=float(os.getenv("SCORES_INTERVAL_LIVE", "20") or 20),
             scores_interval_idle=float(os.getenv("SCORES_INTERVAL_IDLE", "300") or 300),
             leagues=tuple(k.strip().lower() for k in leagues.split(",") if k.strip()),

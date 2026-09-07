@@ -8,11 +8,10 @@ price pluggable").
 The Odds API (the-odds-api.com), v4:
     GET /v4/sports/{sport_key}/odds?apiKey=&regions=us&markets=h2h,spreads,totals
         &oddsFormat=decimal
-One request per league per poll, regardless of the number of games. The free
-tier allows 500 requests a month, so the default cadence here is conservative;
-the remaining quota is read from the ``x-requests-remaining`` header and
-logged. Nothing here is verified against the live API yet (``kalshi-sports
-odds-test``).
+One request per league per poll, regardless of the number of games, costing
+(markets x regions) credits: 6 with the defaults. Verified 2026-09-07 on the
+20,000-credit plan: 18 MLB games, 38 books including pinnacle, betonlineag and
+lowvig. The remaining quota is read from ``x-requests-remaining`` and logged.
 """
 
 from __future__ import annotations
@@ -31,8 +30,8 @@ log = logging.getLogger(__name__)
 
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/{sport}/odds"
 DEFAULT_MARKETS = ("h2h", "spreads", "totals")
-DEFAULT_REGIONS = ("us", "us2", "eu")  # eu brings in Pinnacle where the feed carries it
-SHARP_BOOKS = ("pinnacle", "betonlineag", "bookmaker", "circasports")
+DEFAULT_REGIONS = ("us", "eu")  # eu brings in Pinnacle; each region x market costs one credit
+SHARP_BOOKS = ("pinnacle", "betonlineag", "lowvig", "bookmaker", "circasports")
 
 
 @dataclass(frozen=True)

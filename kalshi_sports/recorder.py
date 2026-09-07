@@ -220,7 +220,10 @@ class SportsRecorder:
             result.settled = self._check_settlements(now, result)
 
         if self.odds is not None:
+            active = {tr.gm.league for tr in self.tracked.values()}
             for lg in self.leagues:
+                if lg.key not in active:
+                    continue  # off-season league: no Kalshi markets, so spend no odds credits
                 if now - self._last_odds.get(lg.key, 0.0) >= self.odds_interval:
                     self._last_odds[lg.key] = now
                     result.odds += self._record_odds(lg, result)

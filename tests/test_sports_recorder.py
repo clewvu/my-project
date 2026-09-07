@@ -238,6 +238,7 @@ def test_odds_and_scores_feeds_are_polled_per_league_and_deduplicated():
     )
     now = START_TS - 2 * 3600
     res = rec.tick(now)
+    # both leagues have open Kalshi markets, so both are polled
     assert odds.fetched == ["mlb", "nfl"] and res.odds == 5
     assert [k for k, _ in scores.fetched] == ["mlb", "nfl"] and res.states == 1
     res2 = rec.tick(now + 30)
@@ -298,6 +299,13 @@ def test_espn_schedule_refines_a_date_only_start():
     rec._last_discover = 0.0
     rec.tick(now + 400)
     assert store.event_start(NFL_EVENT) == (1788826800.0, True)
+
+
+def test_odds_are_not_polled_for_leagues_without_markets():
+    odds = FakeOdds()
+    client, store, rec = make(series=("KXMLBGAME",), odds=odds)
+    rec.tick(START_TS - 3600)
+    assert odds.fetched == ["mlb"]
 
 
 def test_run_stops_after_max_ticks():
