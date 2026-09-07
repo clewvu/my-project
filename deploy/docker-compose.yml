@@ -52,3 +52,15 @@ services:
       - ../state:/app/state
     command: learn --every 3600
     restart: unless-stopped
+
+  # sports research recorder (kalshi-sports): Kalshi books and trades on MLB,
+  # NFL, NBA and college markets plus sportsbook odds and ESPN game state.
+  # Needs ODDS_API_KEY in .env for the odds; runs without it (Kalshi + ESPN only).
+  sports-recorder:
+    image: kalshi-bot
+    env_file: ../.env
+    volumes:
+      - ../state:/app/state
+    entrypoint: ["kalshi-sports"]
+    command: record
+    restart: unless-stopped

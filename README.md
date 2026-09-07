@@ -439,6 +439,30 @@ research uses when the recorder is running alongside it. `--spot-source db`
 never falls back to REST (a stale feed then means no trades); `--spot-source
 rest` ignores the database.
 
+## Sports (kalshi-sports)
+
+A second package, `kalshi_sports/`, applies the same research-first approach
+to Kalshi's game markets on MLB, NFL, NBA, college football and college
+basketball. It reuses the client, models and fee model from `kalshi_bot`.
+The plan is `docs/sports-design.md`; the strategy and its evidence are
+`docs/sports-strategy.md`; the phase-1 checklist is `docs/sports-phase1.md`.
+Nothing in it places orders.
+
+```bash
+kalshi-sports discover --events            # which sports series exist, how tickers look
+kalshi-sports scores-test mlb              # ESPN scoreboard, free, no key
+kalshi-sports odds-test mlb                # one request to The Odds API (needs ODDS_API_KEY)
+kalshi-sports record                       # books, trades, settlements, odds, game state
+kalshi-sports record-stats                 # what has been captured
+kalshi-sports compare --league mlb         # Kalshi ask vs de-vigged sportsbook consensus
+kalshi-sports devig -150 +130              # remove a book's margin three ways
+```
+
+Data lands in `state/sports_data.sqlite` (tables: series, events, markets,
+snapshots, trades, odds, game_state). Snapshot cadence follows time to the
+game: every 5 s in the last half hour and in play, every minute inside three
+hours, every five minutes inside a day, otherwise every fifteen minutes.
+
 ## Development
 
 ```bash
