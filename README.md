@@ -459,9 +459,24 @@ kalshi-sports devig -150 +130              # remove a book's margin three ways
 ```
 
 Data lands in `state/sports_data.sqlite` (tables: series, events, markets,
-snapshots, trades, odds, game_state). Snapshot cadence follows time to the
-game: every 5 s in the last half hour and in play, every minute inside three
-hours, every five minutes inside a day, otherwise every fifteen minutes.
+snapshots, trades, odds, game_state, plus decisions, positions and limits for
+the trader). Every open market gets a light snapshot from the list call;
+books and trades are polled only inside 24 hours of the game.
+
+Trading, paper or live, runs the consensus-gap strategy behind a persisted
+risk engine and an hourly learning cycle; see `docs/sports-trading.md`:
+
+```bash
+kalshi-sports paper-trade                                   # simulated fills, no money
+kalshi-sports --env prod live-trade --real-money --dollars 5 # gates + typed TRADE
+kalshi-sports positions                                     # P&L and closing-line value
+kalshi-sports learn --mode live                             # review; --apply adjusts params
+```
+
+The sports desk keeps its own files (`state/sports_*`, `state/SPORTS_STOP`,
+`state/SPORTS_PAUSE`, `state/sports_alerts.jsonl`) and appears as its own
+block at the bottom of the `kalshi-bot demo-ui` dashboard, with its own
+pause and stop buttons.
 
 ## Development
 

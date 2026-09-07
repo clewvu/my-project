@@ -134,10 +134,26 @@ PAGE = r"""<!doctype html>
   .series-row:last-child { border-bottom: none; }
   .series-row .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
 
+  /* Sports desk: a separate loop (kalshi-sports) with its own files; drawn as its own block */
+  .desk-sep { margin: 40px 0 18px; display: flex; align-items: flex-end; justify-content: space-between;
+              gap: 16px; flex-wrap: wrap; padding-top: 22px; border-top: 2px solid var(--hair); }
+  .desk-sep .brand h1 { font-size: 18px; }
+  .desk-sep .brand h1 .tag { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 6px;
+                              font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+                              background: var(--accent-soft); color: var(--ink); vertical-align: middle; }
+  .sports .card { border-left: 3px solid var(--accent); }
+  .sports .tile { grid-column: span 12; grid-template-columns: repeat(6, 1fr); }
+  .sports .value { font-size: 22px; }
+  .sports .pos { grid-column: span 12; }
+  .sports .ev-list { max-height: 260px; }
+  .st { display: inline-block; padding: 2px 6px; border-radius: 6px; font-size: 11px; font-weight: 700;
+        letter-spacing: 0.04em; border: 1px solid var(--ring); color: var(--ink-2); }
+  .st.open { color: var(--accent); }
   @media (max-width: 860px) {
     .hero, .tile, .split { grid-column: span 12; }
     .split { grid-template-columns: 1fr; }
     .tile { grid-template-columns: 1fr 1fr; }
+    .sports .tile { grid-template-columns: 1fr 1fr; }
     .value.hero-fig { font-size: 42px; }
   }
 </style>
@@ -209,6 +225,44 @@ PAGE = r"""<!doctype html>
     <section class="card events">
       <div class="chart-head"><div class="label">Activity, latest first</div><div class="value" id="evnote"></div></div>
       <div class="ev-list" id="events"><div class="note">no events yet</div></div>
+    </section>
+  </div>
+
+  <div class="desk-sep">
+    <div class="brand">
+      <h1 id="sp-title">Sports desk <span class="tag">kalshi-sports</span></h1>
+      <div class="sub" id="sp-cfg">separate loop, separate files: sports_*.json, sports_data.sqlite, SPORTS_STOP</div>
+    </div>
+    <div class="row" style="margin:0">
+      <div class="pill" id="sp-pill"><span class="dot"></span><span id="sp-pilltext">–</span></div>
+      <button class="pause" id="sp-pausebtn" onclick="spost('pause')">Pause sports entries</button>
+      <button class="resume" id="sp-resumebtn" onclick="spost('resume')" style="display:none">Resume sports</button>
+      <button class="stop" onclick="spost('stop')">Stop sports loop</button>
+      <button onclick="spost('clear-stop')">Clear sports stop</button>
+    </div>
+  </div>
+  <div class="banner" id="sp-banner"><span id="sp-bannertext"></span><span class="spacer"></span><span class="note" id="sp-bannernote"></span></div>
+
+  <div class="grid sports">
+    <section class="tile">
+      <div class="card"><div class="label">Sports net, after fees</div><div class="value" id="sp-net">–</div><div class="delta" id="sp-netnote"></div></div>
+      <div class="card"><div class="label">Settled</div><div class="value" id="sp-settled">–</div><div class="delta" id="sp-record"></div></div>
+      <div class="card"><div class="label">Open positions</div><div class="value" id="sp-open">–</div><div class="delta" id="sp-opennote"></div></div>
+      <div class="card"><div class="label">Closing-line value</div><div class="value" id="sp-clv">–</div><div class="delta" id="sp-clvnote"></div></div>
+      <div class="card"><div class="label">Strategy</div><div class="value" id="sp-params">–</div><div class="delta" id="sp-paramsnote"></div></div>
+      <div class="card"><div class="label">Risk</div><div class="value" id="sp-tick">–</div><div class="delta" id="sp-risk"></div></div>
+    </section>
+
+    <section class="card pos">
+      <div class="chart-head"><div class="label">Sports positions, open first then latest settled</div><div class="value" id="sp-posnote"></div></div>
+      <div style="overflow-x:auto;margin-top:10px"><table><thead><tr>
+        <th>Opened</th><th>Market</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Consensus</th><th class="num">Edge</th><th>Status</th><th class="num">Net</th><th class="num">CLV</th>
+      </tr></thead><tbody id="sp-pos"><tr><td colspan="10" class="note">no sports positions yet</td></tr></tbody></table></div>
+    </section>
+
+    <section class="card events">
+      <div class="chart-head"><div class="label">Sports activity, latest first</div><div class="value" id="sp-evnote"></div></div>
+      <div class="ev-list" id="sp-events"><div class="note">no sports events yet</div></div>
     </section>
   </div>
 
@@ -343,7 +397,60 @@ async function refresh() {
     `<tr><td>${tm(h.settled_ts)}</td><td class="mono">${h.ticker}</td><td><span class="side">${h.side.toUpperCase()}</span></td><td class="num">${fmt(h.count, 0)}</td><td class="num">${fmt(h.price, 3)}</td><td>${h.result.toUpperCase()}</td><td class="num ${cls(h.net)}">${signed(h.net)}</td></tr>`
   ).join('') || '<tr><td colspan="7" class="note">nothing settled yet</td></tr>';
 }
+async function spost(action) {
+  try { await fetch('/api/sports/' + action, {method: 'POST'}); await refreshSports(); }
+  catch (e) { $('err').textContent = String(e); }
+}
+async function refreshSports() {
+  let d;
+  try { d = await (await fetch('/api/sports')).json(); }
+  catch (e) { return; }
+  const s = d.status || {}; const params = s.params || {}; const lt = s.last_tick || {};
+  const mode = s.mode || 'idle'; const live = mode === 'live';
+  $('sp-title').innerHTML = `Sports desk${live ? ' · real money' : mode === 'paper' ? ' · paper' : mode === 'dryrun' ? ' · dry run' : ''} <span class="tag">kalshi-sports</span>`;
+  $('sp-cfg').textContent = d.status ? `${mode} · reading ${d.status_file} · ${d.db ? d.db : 'no sports database'}` : `no sports status yet at ${d.status_file}; start kalshi-sports paper-trade or live-trade`;
+  const hb = d.heartbeat;
+  const pill = $('sp-pill');
+  pill.className = 'pill' + (live ? ' live' : '') + (hb === 'stale' || d.pause_file_present ? ' halt' : d.alive ? ' on' : '');
+  $('sp-pilltext').textContent = hb === 'stale' ? 'no heartbeat' : d.pause_file_present ? (live ? 'live · paused' : 'paused') : d.alive ? (live ? 'live · running' : mode + ' · running') : 'not running';
+  $('sp-pausebtn').style.display = d.pause_file_present ? 'none' : '';
+  $('sp-resumebtn').style.display = d.pause_file_present ? '' : 'none';
+  const b = $('sp-banner');
+  if (hb === 'stale') { b.className = 'banner show halt'; $('sp-bannertext').innerHTML = `<b>Sports loop silent.</b> Last tick ${tm(s.ts)}; it is not scanning or booking settlements.`; $('sp-bannernote').textContent = 'restart kalshi-sports in its window'; }
+  else if (d.pause_file_present) { b.className = 'banner show warn'; $('sp-bannertext').innerHTML = `<b>Sports paused.</b> No new entries; open positions still settle and mark CLV.`; $('sp-bannernote').textContent = d.pause_file; }
+  else if (d.stop_file_present) { b.className = 'banner show warn'; $('sp-bannertext').innerHTML = `<b>Sports stop file present.</b> The sports loop exits and stays down until it is cleared.`; $('sp-bannernote').textContent = d.stop_file; }
+  else if (String(s.risk || '').includes('breaker')) { b.className = 'banner show warn'; $('sp-bannertext').innerHTML = `<b>Sports loss breaker.</b> Consecutive losses paused new entries for a cooling period.`; $('sp-bannernote').textContent = s.risk; }
+  else { b.className = 'banner'; }
+  const net = Number(s.net || 0);
+  const n = $('sp-net'); n.textContent = signed(net); n.className = 'value ' + cls(net);
+  $('sp-netnote').textContent = s.settled ? `fees ${money(s.fees || 0)} · ${s.entries || 0} entries of ${s.decisions || 0} decisions` : (d.status ? `${s.decisions || 0} decisions logged, nothing settled yet` : '');
+  $('sp-settled').textContent = s.settled ?? '–';
+  $('sp-record').textContent = s.settled ? `${s.wins || 0} won · ${Math.round(100 * (s.wins || 0) / s.settled)}%` : '';
+  $('sp-open').textContent = s.open ?? '–';
+  $('sp-opennote').textContent = s.open ? `${money(s.open_dollars || 0)} at risk` : '';
+  const clvC = s.avg_clv_consensus, clvK = s.avg_clv_kalshi;
+  $('sp-clv').textContent = clvC == null ? '–' : (clvC >= 0 ? '+' : '') + (clvC * 100).toFixed(2) + 'c';
+  $('sp-clv').className = 'value ' + (clvC == null ? '' : cls(clvC));
+  $('sp-clvnote').textContent = clvK == null ? 'vs sharp consensus at start' : `vs consensus · vs Kalshi close ${(clvK >= 0 ? '+' : '') + (clvK * 100).toFixed(2)}c`;
+  $('sp-params').textContent = params.margin != null ? `margin ${fmt(params.margin, 2)}` : '–';
+  $('sp-paramsnote').textContent = params.margin != null ? `size ×${fmt(params.size_scale, 2)} · v${params.version} · ${params.note || ''}` : 'consensus gap (H1)';
+  $('sp-tick').textContent = s.ts ? tm(s.ts) : '–';
+  $('sp-risk').textContent = s.risk || (lt.candidates != null ? `${lt.candidates} candidates` : '');
+  const open = (d.positions && d.positions.open) || [], settled = ((d.positions && d.positions.settled) || []).slice().reverse();
+  const rows = open.concat(settled);
+  const pc = x => x == null ? '–' : (x >= 0 ? '+' : '') + (Number(x) * 100).toFixed(1) + 'c';
+  $('sp-posnote').textContent = rows.length ? `${open.length} open · ${settled.length} settled shown` : '';
+  $('sp-pos').innerHTML = rows.length ? rows.map(r =>
+    `<tr><td>${tm(r.opened_ts)}</td><td class="mono">${r.ticker}</td><td><span class="side">${String(r.side).toUpperCase()}</span>${r.side_team ? ' <span class="note">' + r.side_team + '</span>' : ''}</td><td class="num">${r.contracts}</td><td class="num">${fmt(r.price, 2)}</td><td class="num">${r.p_entry == null ? '–' : fmt(r.p_entry, 3)}</td><td class="num">${pc(r.edge_entry)}</td><td><span class="st ${r.status}">${r.status}${r.result ? ' · ' + String(r.result).toUpperCase() : ''}</span></td><td class="num ${r.net == null ? '' : cls(r.net)}">${r.net == null ? '–' : signed(r.net)}</td><td class="num">${r.clv_consensus == null ? '–' : pc(r.clv_consensus)}</td></tr>`
+  ).join('') : '<tr><td colspan="10" class="note">no sports positions yet</td></tr>';
+  const evs = (d.alerts || []).slice().sort((a, b2) => Number(b2.ts || 0) - Number(a.ts || 0));
+  $('sp-evnote').textContent = evs.length ? `${evs.length} shown` : '';
+  $('sp-events').innerHTML = evs.length ? evs.map(e =>
+    `<div class="ev ${e.level || 'info'}"><span class="t">${tm(e.ts)}</span><span class="lvl"></span><span class="src">${e.source || ''}</span><span class="x">${String(e.text || '').replace(/</g, '&lt;')}</span></div>`
+  ).join('') : '<div class="note">no sports events yet</div>';
+}
 refresh(); setInterval(refresh, 2000); window.addEventListener('resize', refresh);
+refreshSports(); setInterval(refreshSports, 2000);
 </script>
 </body>
 </html>

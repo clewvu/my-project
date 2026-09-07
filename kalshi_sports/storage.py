@@ -26,7 +26,7 @@ from kalshi_bot.models import Market, Orderbook, Trade
 
 from .catalog import GameMarket
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -165,9 +165,69 @@ CREATE TABLE IF NOT EXISTS game_state (
     raw          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_state_game_ts ON game_state(league, game_id, ts);
+
+-- trading (paper and live share these; ``mode`` tells them apart)
+CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id            INTEGER PRIMARY KEY,
+    ts            REAL NOT NULL,
+    mode          TEXT NOT NULL,
+    ticker        TEXT NOT NULL,
+    event_ticker  TEXT,
+    league        TEXT,
+    side_team     TEXT,
+    action        TEXT NOT NULL,       -- buy_yes, buy_no, skip
+    reason        TEXT,
+    yes_bid       REAL,
+    yes_ask       REAL,
+    no_ask        REAL,
+    p_consensus   REAL,
+    n_books       INTEGER,
+    sharp_books   INTEGER,
+    dispersion    REAL,
+    odds_age_s    REAL,
+    secs_to_start REAL,
+    edge          REAL,
+    margin        REAL,
+    dollars       REAL,
+    contracts     INTEGER,
+    order_id      TEXT,
+    raw           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id               INTEGER PRIMARY KEY,
+    mode             TEXT NOT NULL,
+    ticker           TEXT NOT NULL,
+    event_ticker     TEXT,
+    league           TEXT,
+    side             TEXT NOT NULL,     -- yes | no
+    side_team        TEXT,
+    contracts        INTEGER NOT NULL,
+    price            REAL NOT NULL,     -- paid per contract on ``side``
+    fee              REAL NOT NULL,
+    dollars          REAL NOT NULL,     -- contracts * price + fee
+    order_id         TEXT,
+    opened_ts        REAL NOT NULL,
+    start_ts         REAL,
+    p_entry          REAL,              -- consensus probability of ``side`` at entry
+    edge_entry       REAL,
+    kalshi_close     REAL,              -- Kalshi mid for ``side`` at game start
+    consensus_close  REAL,              -- consensus probability of ``side`` at game start
+    clv_kalshi       REAL,
+    clv_consensus    REAL,
+    status           TEXT NOT NULL,     -- open | settled | void
+    result           TEXT,
+    net              REAL,
+    closed_ts        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 """
 
 MIGRATIONS: dict[int, list[str]] = {
+    3: [],  # new tables only; created by SCHEMA
     2: [
         "ALTER TABLE markets ADD COLUMN away_abbr TEXT",
         "ALTER TABLE markets ADD COLUMN home_abbr TEXT",
@@ -198,7 +258,8 @@ class SportsDataStore:
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        # the recorder and the trader write the same file; wait out each other's locks
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._init_schema()
@@ -587,6 +648,210 @@ class SportsDataStore:
                 """,
                 (league, game_id),
             ).fetchone()
+
+    # ------------------------------------------------------------ trading
+
+    def limit_get(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM limits WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def limit_set(self, key: str, value: Any) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO limits (key, value) VALUES (?, ?)", (key, str(value))
+            )
+
+    def insert_decision(self, row: dict[str, Any]) -> int:
+        cols = [
+            "ts",
+            "mode",
+            "ticker",
+            "event_ticker",
+            "league",
+            "side_team",
+            "action",
+            "reason",
+            "yes_bid",
+            "yes_ask",
+            "no_ask",
+            "p_consensus",
+            "n_books",
+            "sharp_books",
+            "dispersion",
+            "odds_age_s",
+            "secs_to_start",
+            "edge",
+            "margin",
+            "dollars",
+            "contracts",
+            "order_id",
+            "raw",
+        ]
+        values = [row.get(c) for c in cols]
+        if isinstance(values[-1], dict | list):
+            values[-1] = _json(values[-1])
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"INSERT INTO decisions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                values,
+            )
+            return int(cur.lastrowid)
+
+    def open_position(self, row: dict[str, Any]) -> int:
+        cols = [
+            "mode",
+            "ticker",
+            "event_ticker",
+            "league",
+            "side",
+            "side_team",
+            "contracts",
+            "price",
+            "fee",
+            "dollars",
+            "order_id",
+            "opened_ts",
+            "start_ts",
+            "p_entry",
+            "edge_entry",
+        ]
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"INSERT INTO positions ({', '.join(cols)}, status) "
+                f"VALUES ({', '.join('?' * len(cols))}, 'open')",
+                [row.get(c) for c in cols],
+            )
+            return int(cur.lastrowid)
+
+    def positions(self, status: str | None = None, mode: str | None = None) -> list[sqlite3.Row]:
+        sql, args = "SELECT * FROM positions", []
+        conds = []
+        if status:
+            conds.append("status = ?")
+            args.append(status)
+        if mode:
+            conds.append("mode = ?")
+            args.append(mode)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY opened_ts", args).fetchall()
+
+    def event_exposure(self, event_ticker: str | None, mode: str) -> float:
+        if not event_ticker:
+            return 0.0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(dollars), 0) FROM positions "
+                "WHERE event_ticker = ? AND status = 'open' AND mode = ?",
+                (event_ticker, mode),
+            ).fetchone()
+        return float(row[0])
+
+    def set_close_marks(
+        self, position_id: int, kalshi_close: float | None, consensus_close: float | None
+    ) -> None:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT price, p_entry FROM positions WHERE id = ?", (position_id,)
+            ).fetchone()
+            if row is None:
+                return
+            clv_k = (kalshi_close - row["price"]) if kalshi_close is not None else None
+            clv_c = (
+                (consensus_close - row["p_entry"])
+                if consensus_close is not None and row["p_entry"] is not None
+                else None
+            )
+            self._conn.execute(
+                "UPDATE positions SET kalshi_close = ?, consensus_close = ?, clv_kalshi = ?, "
+                "clv_consensus = ? WHERE id = ?",
+                (kalshi_close, consensus_close, clv_k, clv_c, position_id),
+            )
+
+    def settle_position(
+        self, position_id: int, *, status: str, result: str | None, net: float, now: float
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE positions SET status = ?, result = ?, net = ?, closed_ts = ? WHERE id = ?",
+                (status, result, net, now, position_id),
+            )
+
+    def market_result(self, ticker: str) -> tuple[str | None, str | None]:
+        """(result, status) from the recorder's markets table."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT result, status FROM markets WHERE ticker = ?", (ticker,)
+            ).fetchone()
+        return (row["result"], row["status"]) if row else (None, None)
+
+    def latest_snapshot(self, ticker: str, before_ts: float | None = None) -> sqlite3.Row | None:
+        sql = "SELECT * FROM snapshots WHERE ticker = ?"
+        args: list[Any] = [ticker]
+        if before_ts is not None:
+            sql += " AND ts <= ?"
+            args.append(before_ts)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY ts DESC LIMIT 1", args).fetchone()
+
+    def candidate_markets(
+        self, now: float, *, min_lead_s: float, max_lead_s: float, leagues: tuple[str, ...]
+    ) -> list[sqlite3.Row]:
+        """Open moneyline markets whose game starts within the lead window, with their
+        latest quotes and the event's start time. Requires the recorder's data."""
+        if not leagues:
+            return []
+        marks = ",".join("?" * len(leagues))
+        with self._lock:
+            return self._conn.execute(
+                f"""
+                SELECT m.ticker, m.event_ticker, m.league, m.game_date, m.away, m.home,
+                       m.away_abbr, m.home_abbr, m.side_team, m.side_name, m.exchange_index,
+                       e.start_ts, e.start_exact,
+                       s.yes_bid, s.yes_ask, s.no_bid, s.no_ask, s.ts AS quote_ts
+                FROM markets m
+                JOIN events e ON e.event_ticker = m.event_ticker
+                JOIN snapshots s ON s.id = (
+                    SELECT id FROM snapshots WHERE ticker = m.ticker ORDER BY ts DESC LIMIT 1
+                )
+                WHERE m.kind = 'moneyline' AND m.result IS NULL AND m.league IN ({marks})
+                  AND e.start_ts IS NOT NULL AND e.start_ts - ? BETWEEN ? AND ?
+                ORDER BY e.start_ts
+                """,
+                (*leagues, now, min_lead_s, max_lead_s),
+            ).fetchall()
+
+    def trading_summary(self, mode: str) -> dict[str, Any]:
+        with self._lock:
+            c = self._conn
+            open_rows = c.execute(
+                "SELECT COUNT(*), COALESCE(SUM(dollars), 0) FROM positions "
+                "WHERE status='open' AND mode=?",
+                (mode,),
+            ).fetchone()
+            settled = c.execute(
+                "SELECT COUNT(*), COALESCE(SUM(net), 0), COALESCE(SUM(net > 0), 0), "
+                "AVG(clv_kalshi), AVG(clv_consensus), COALESCE(SUM(fee), 0) "
+                "FROM positions WHERE status='settled' AND mode=?",
+                (mode,),
+            ).fetchone()
+            decisions = c.execute(
+                "SELECT COUNT(*), SUM(action != 'skip') FROM decisions WHERE mode=?", (mode,)
+            ).fetchone()
+        return {
+            "open": int(open_rows[0]),
+            "open_dollars": float(open_rows[1]),
+            "settled": int(settled[0]),
+            "net": float(settled[1]),
+            "wins": int(settled[2]),
+            "avg_clv_kalshi": settled[3],
+            "avg_clv_consensus": settled[4],
+            "fees": float(settled[5]),
+            "decisions": int(decisions[0] or 0),
+            "entries": int(decisions[1] or 0),
+        }
 
     # ------------------------------------------------------------ inspection
 

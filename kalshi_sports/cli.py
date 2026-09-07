@@ -1,8 +1,9 @@
 """Command line entry point: ``kalshi-sports <command>``.
 
-Phase 1 commands: probe Kalshi's sports catalogue, record everything, inspect
-what was recorded, test the external feeds, and print the first
-Kalshi-versus-consensus table. Nothing here places orders.
+Research commands probe Kalshi's sports catalogue, record everything, inspect
+what was recorded, test the external feeds and print the Kalshi-versus-consensus
+table. Trading commands run the consensus-gap strategy: ``paper-trade`` with
+simulated fills, ``live-trade`` with real money behind its gates.
 """
 
 from __future__ import annotations
@@ -28,9 +29,13 @@ from .feeds.devig import METHODS, american_to_decimal, devig, overround
 from .feeds.odds import TheOddsApiFeed
 from .feeds.scores import EspnScoreFeed, today_eastern
 from .recorder import SportsRecorder
+from .risk import LIVE_MAX_DOLLARS, LIVE_MAX_LOSS_CAP, RiskEngine, RiskLimits
 from .storage import SchemaMismatch, SportsDataStore
+from .strategy import Params
+from .trader import SportsTrader, TraderConfig
 
 DEFAULT_DB = "state/sports_data.sqlite"
+DEFAULT_PARAMS = "state/sports_params.json"
 
 
 def _setup_logging(level: str) -> None:
@@ -305,6 +310,246 @@ def cmd_compare(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- trading
+
+
+def _trader_parts(settings: Settings, args: argparse.Namespace, mode: str):
+    sports = SportsSettings.from_env()
+    keys = _leagues(args, sports)
+    cfg = TraderConfig(
+        mode=mode,
+        leagues=keys,
+        dollars=args.dollars,
+        max_dollars=args.max_dollars,
+        paper_bankroll=args.paper_bankroll,
+        interval=args.interval,
+        params_path=args.params,
+        status_path=args.status_file,
+        self_learn=not args.no_learn,
+        confirm_age_s=args.confirm_age,
+    )
+    limits = RiskLimits(
+        daily_loss_cap=args.daily_loss_cap,
+        total_loss_cap=args.loss_cap,
+        max_trade_dollars=args.max_dollars,
+        max_event_dollars=args.max_dollars,
+        max_open_positions=args.max_open,
+        max_open_dollars=args.max_open_dollars,
+    )
+    odds = None
+    if sports.has_odds:
+        odds = TheOddsApiFeed(sports.odds_api_key, regions=sports.odds_regions)
+    return sports, cfg, limits, odds
+
+
+def _recorder_is_fresh(store: SportsDataStore, max_age_s: float = 900.0) -> tuple[bool, str]:
+    st = store.stats()
+    last = st["last_ts"]
+    if not last:
+        return False, "the sports database has no snapshots; start `kalshi-sports record` first"
+    age = time.time() - last
+    if age > max_age_s:
+        return False, f"the recorder's newest snapshot is {age / 60:.0f} min old; is it running?"
+    return True, f"recorder fresh ({age:.0f}s ago), {st['odds']} odds quotes, {st['events']} events"
+
+
+def _add_trade_args(s: argparse.ArgumentParser, *, live: bool) -> None:
+    s.add_argument("--league", action="append", choices=sorted(leagues.LEAGUES))
+    s.add_argument("--series", action="append", help=argparse.SUPPRESS)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--dollars", type=float, default=5.0, help="base stake per trade")
+    s.add_argument("--max-dollars", type=float, default=10.0, help="ceiling per trade and per game")
+    s.add_argument("--loss-cap", type=float, default=50.0, help="stop entering at this loss")
+    s.add_argument("--daily-loss-cap", type=float, default=25.0)
+    s.add_argument("--max-open", type=int, default=10, help="max open positions")
+    s.add_argument("--max-open-dollars", type=float, default=60.0)
+    s.add_argument("--paper-bankroll", type=float, default=200.0)
+    s.add_argument("--interval", type=float, default=30.0, help="seconds between ticks")
+    s.add_argument(
+        "--confirm-age", type=float, default=600.0, help="refresh odds older than this (s)"
+    )
+    s.add_argument("--params", default=DEFAULT_PARAMS)
+    s.add_argument(
+        "--status-file", default="state/sports_live.json" if live else "state/sports_paper.json"
+    )
+    s.add_argument("--no-learn", action="store_true", help="disable the hourly learning cycle")
+    s.add_argument("--ticks", type=int, default=None, help=argparse.SUPPRESS)
+    s.add_argument("--reset-limits", action="store_true", help="reset the loss counters")
+
+
+def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the consensus-gap strategy on live Kalshi quotes with simulated fills. No money."""
+    sports, cfg, limits, odds = _trader_parts(settings, args, "paper")
+    try:
+        with KalshiClient.from_settings(settings) as client, SportsDataStore(args.db) as store:
+            ok, note = _recorder_is_fresh(store)
+            print(note)
+            if not ok:
+                return 1
+            if not sports.has_odds:
+                print("ODDS_API_KEY not set: the strategy needs the sportsbook consensus")
+                return 1
+            risk = RiskEngine(store, limits, "paper")
+            if args.reset_limits:
+                risk.reset_totals()
+            trader = SportsTrader(client, store, cfg, risk, odds=odds)
+            print(
+                f"paper trading {', '.join(cfg.leagues)}: ${cfg.dollars:.2f} base stake, "
+                f"margin {trader.strategy.params.margin:.2f}; Ctrl-C to stop"
+            )
+            reason = trader.run(max_ticks=args.ticks)
+            print(f"stopped: {reason}")
+    except SchemaMismatch as exc:
+        sys.exit(str(exc))
+    finally:
+        if odds is not None:
+            odds.close()
+    return 0
+
+
+def _league_shards(store: SportsDataStore, keys: tuple[str, ...]) -> dict[str, int]:
+    rows = store._conn.execute(
+        "SELECT league, MAX(exchange_index) AS shard FROM markets "
+        "WHERE result IS NULL AND exchange_index IS NOT NULL GROUP BY league"
+    )
+    return {r["league"]: int(r["shard"]) for r in rows if r["league"] in keys}
+
+
+def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """The consensus-gap strategy on PRODUCTION with real money. Requires --real-money."""
+    from kalshi_bot.cli import _shards_text
+
+    if settings.env != "prod":
+        sys.exit("live-trade needs production: kalshi-sports --env prod live-trade")
+    if settings.dry_run:
+        sys.exit("live-trade needs KALSHI_DRY_RUN=false in .env (it is true, the safe default)")
+    if not settings.has_credentials:
+        sys.exit("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH must be set")
+    if not args.real_money:
+        sys.exit(
+            "live-trade places real orders from your Kalshi balance. Re-run with --real-money "
+            "if that is what you want."
+        )
+    if args.dollars > LIVE_MAX_DOLLARS or args.max_dollars > LIVE_MAX_DOLLARS:
+        sys.exit(f"live-trade caps --dollars and --max-dollars at {LIVE_MAX_DOLLARS:.0f}")
+    if args.loss_cap > LIVE_MAX_LOSS_CAP:
+        sys.exit(f"live-trade caps --loss-cap at {LIVE_MAX_LOSS_CAP:.0f}")
+    sports, cfg, limits, odds = _trader_parts(settings, args, "live")
+    if not sports.has_odds:
+        sys.exit("ODDS_API_KEY not set: the strategy needs the sportsbook consensus")
+    try:
+        with SportsDataStore(args.db) as store:
+            ok, note = _recorder_is_fresh(store)
+            print(note)
+            if not ok:
+                return 1
+            with KalshiClient.from_settings(settings) as probe:
+                bal = probe.get_balance()
+            shards = _league_shards(store, cfg.leagues)
+            risk = RiskEngine(store, limits, "live")
+            if args.reset_limits:
+                risk.reset_totals()
+            params = Params.load(cfg.params_path)
+            print("=" * 72)
+            print("REAL MONEY. Strategy: buy the side of a Kalshi moneyline whose sharp-book")
+            print(
+                f"consensus beats the ask by the fee plus {params.margin:.2f}, "
+                f"inside {params.max_lead_s / 3600:.0f}h of the start."
+            )
+            print("Its edge is unproven: the pre-registered test (docs/sports-design.md, H1)")
+            print("needs weeks of recorded data; this loop is the forward test with money on.")
+            print(
+                f"Leagues: {', '.join(cfg.leagues)}. Base stake ${cfg.dollars:.2f}, "
+                f"ceiling ${cfg.max_dollars:.2f} per trade and per game."
+            )
+            print(
+                f"Stops entering at -${limits.total_loss_cap:.2f} total or "
+                f"-${limits.daily_loss_cap:.2f} in a day; {limits.max_consecutive_losses} "
+                f"straight losses pause it {limits.loss_pause_s / 3600:.0f}h."
+            )
+            shard_text = f"; by shard: {_shards_text(bal)}" if bal.breakdown else ""
+            print(f"Balance ${bal.balance:,.2f}{shard_text}")
+            for league, shard in sorted(shards.items()):
+                have = bal.on_shard(shard) if bal.breakdown else bal.balance
+                flag = "" if have >= cfg.max_dollars else "  <- fund with `kalshi-bot transfer`"
+                print(f"  {league}: shard {shard} holds ${have:,.2f}{flag}")
+            print(f"Risk now: {risk.describe(time.time())}")
+            print(
+                f"Stop any time: Ctrl-C or the file {limits.stop_file}; "
+                f"pause with {limits.pause_file}."
+            )
+            print("=" * 72)
+            if not args.yes:
+                answer = input("Type TRADE to place real orders, anything else to abort: ")
+                if answer.strip() != "TRADE":
+                    print("aborted")
+                    return 1
+            with KalshiClient.from_settings(settings, allow_live=True) as client:
+                trader = SportsTrader(client, store, cfg, risk, odds=odds)
+                reason = trader.run(max_ticks=args.ticks)
+            print(f"stopped: {reason}")
+            print(json.dumps(store.trading_summary("live"), indent=1, default=str))
+    except SchemaMismatch as exc:
+        sys.exit(str(exc))
+    finally:
+        if odds is not None:
+            odds.close()
+    return 0
+
+
+def cmd_positions(_: Settings, args: argparse.Namespace) -> int:
+    """Open and settled positions with P&L and closing-line value."""
+    try:
+        with SportsDataStore(args.db) as store:
+            modes = (args.mode,) if args.mode else ("paper", "live", "dryrun")
+            shown = 0
+            for mode in modes:
+                rows = store.positions(mode=mode)
+                if not rows:
+                    continue
+                shown += 1
+                print(f"\n== {mode}: {json.dumps(store.trading_summary(mode), default=str)}")
+                for r in rows[-args.show :]:
+                    clv = ""
+                    if r["clv_kalshi"] is not None or r["clv_consensus"] is not None:
+                        clv = f" clv k={r['clv_kalshi']} c={r['clv_consensus']}"
+                    net = f" net {r['net']:+.2f}" if r["net"] is not None else ""
+                    p_entry = "-" if r["p_entry"] is None else f"{r['p_entry']:.3f}"
+                    print(
+                        f"  #{r['id']:<4} {r['ticker']:<36} {r['side']:<3} x{r['contracts']:<3} "
+                        f"@{r['price']:.2f} p={p_entry} {r['status']:<7} "
+                        f"{r['result'] or ''}{net}{clv}"
+                    )
+            if not shown:
+                print("no positions yet")
+    except SchemaMismatch as exc:
+        sys.exit(str(exc))
+    return 0
+
+
+def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
+    """Review settled results (CLV, P&L by bucket) and, with --apply, adjust the parameters."""
+    from .learn import format_review, propose, review
+
+    try:
+        with SportsDataStore(args.db) as store:
+            rv = review(store, args.mode)
+            print(format_review(rv))
+            params = Params.load(args.params)
+            new, why = propose(params, rv, max_scale=args.max_scale)
+            print(
+                f"\nparams v{params.version}: margin {params.margin:.2f}, "
+                f"size scale {params.size_scale:.2f} ({params.note})"
+            )
+            print(why)
+            if new is not None and args.apply:
+                new.save(args.params)
+                print(f"written v{new.version} to {args.params}")
+    except SchemaMismatch as exc:
+        sys.exit(str(exc))
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -379,6 +624,30 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("devig", help=cmd_devig.__doc__)
     s.add_argument("odds", nargs="+", help="American odds, e.g. -150 +130")
     s.set_defaults(func=cmd_devig)
+
+    s = sub.add_parser("paper-trade", help=cmd_paper_trade.__doc__)
+    _add_trade_args(s, live=False)
+    s.set_defaults(func=cmd_paper_trade)
+
+    s = sub.add_parser("live-trade", help=cmd_live_trade.__doc__)
+    _add_trade_args(s, live=True)
+    s.add_argument("--real-money", action="store_true", help="required: place real orders")
+    s.add_argument("--yes", action="store_true", help="skip the typed confirmation (servers)")
+    s.set_defaults(func=cmd_live_trade)
+
+    s = sub.add_parser("positions", help=cmd_positions.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--mode", choices=("paper", "live", "dryrun"), default=None)
+    s.add_argument("--show", type=int, default=40)
+    s.set_defaults(func=cmd_positions)
+
+    s = sub.add_parser("learn", help=cmd_learn.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--mode", choices=("paper", "live"), default="live")
+    s.add_argument("--params", default=DEFAULT_PARAMS)
+    s.add_argument("--max-scale", type=float, default=2.0)
+    s.add_argument("--apply", action="store_true", help="write the proposed parameters")
+    s.set_defaults(func=cmd_learn)
 
     s = sub.add_parser("compare", help=cmd_compare.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)

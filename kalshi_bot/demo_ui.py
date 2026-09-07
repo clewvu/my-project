@@ -43,12 +43,22 @@ class Dashboard:
         stop_file: Path,
         pause_file: Path | None = None,
         alerts_file: Path | None = None,
+        sports_dir: Path | None = None,
     ) -> None:
         files = state_file if isinstance(state_file, list) else [state_file]
         self.state_files = [Path(f) for f in files]
         self.stop_file = Path(stop_file)
         self.pause_file = Path(pause_file) if pause_file else self.stop_file.with_name("PAUSE")
         self.alerts_file = Path(alerts_file) if alerts_file else None
+        # The sports desk (kalshi-sports) keeps its own files in the same state directory,
+        # all prefixed so nothing is shared with the crypto loop: status JSON per mode,
+        # its own alert log, its own database, and its own stop and pause files.
+        sd = Path(sports_dir) if sports_dir else self.stop_file.parent
+        self.sports_status_files = [sd / "sports_live.json", sd / "sports_paper.json"]
+        self.sports_alerts_file = sd / "sports_alerts.jsonl"
+        self.sports_db = sd / "sports_data.sqlite"
+        self.sports_stop_file = sd / "SPORTS_STOP"
+        self.sports_pause_file = sd / "SPORTS_PAUSE"
 
     @property
     def state_file(self) -> Path:
@@ -128,6 +138,75 @@ class Dashboard:
         if self.pause_file.exists():
             self.pause_file.unlink()
 
+    # ------------------------------------------------------------ sports desk
+
+    def sports_snapshot(self, now: float | None = None) -> dict[str, Any]:
+        """Everything the Sports panel shows; independent of the crypto loop's state."""
+        now = time.time() if now is None else now
+        existing = [f for f in self.sports_status_files if f.exists()]
+        status_file = (
+            max(existing, key=lambda f: f.stat().st_mtime)
+            if existing
+            else self.sports_status_files[0]
+        )
+        status: dict[str, Any] | None = None
+        if status_file.exists():
+            try:
+                status = json.loads(status_file.read_text())
+            except ValueError:
+                status = None
+        ts = (status or {}).get("ts")
+        if not status:
+            heartbeat = "none"
+        elif ts is not None and now - float(ts) <= 3 * STALE_AFTER_S:
+            heartbeat = "alive"
+        else:
+            heartbeat = "stale"
+        positions: dict[str, list[dict[str, Any]]] = {"open": [], "settled": []}
+        if self.sports_db.exists():
+            try:
+                from kalshi_sports.storage import SportsDataStore
+
+                mode = (status or {}).get("mode") or "paper"
+                with SportsDataStore(self.sports_db) as store:
+                    positions["open"] = [dict(r) for r in store.positions("open", mode)]
+                    positions["settled"] = [dict(r) for r in store.positions("settled", mode)][-40:]
+            except Exception as exc:  # noqa: BLE001 - the panel must not take the page down
+                log.warning("sports positions unavailable: %s", exc)
+        rows = alertmod.tail(self.sports_alerts_file, ALERTS_SHOWN)
+        return {
+            "now": now,
+            "status": status,
+            "status_file": str(status_file),
+            "heartbeat": heartbeat,
+            "alive": heartbeat == "alive",
+            "stop_file": str(self.sports_stop_file),
+            "stop_file_present": self.sports_stop_file.exists(),
+            "pause_file": str(self.sports_pause_file),
+            "pause_file_present": self.sports_pause_file.exists(),
+            "db": str(self.sports_db) if self.sports_db.exists() else None,
+            "positions": positions,
+            "alerts": rows,
+        }
+
+    def sports_control(self, action: str) -> bool:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        if action == "stop":
+            self.sports_stop_file.parent.mkdir(parents=True, exist_ok=True)
+            self.sports_stop_file.write_text(f"stopped from dashboard at {stamp}\n")
+        elif action == "clear-stop":
+            if self.sports_stop_file.exists():
+                self.sports_stop_file.unlink()
+        elif action == "pause":
+            self.sports_pause_file.parent.mkdir(parents=True, exist_ok=True)
+            self.sports_pause_file.write_text(f"paused from dashboard at {stamp}\n")
+        elif action == "resume":
+            if self.sports_pause_file.exists():
+                self.sports_pause_file.unlink()
+        else:
+            return False
+        return True
+
 
 def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -148,10 +227,20 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/api/state":
                 body = json.dumps(dash.snapshot()).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path == "/api/sports":
+                body = json.dumps(dash.sports_snapshot(), default=str).encode()
+                self._send(HTTPStatus.OK, body, "application/json")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
+            if self.path.startswith("/api/sports/"):
+                if dash.sports_control(self.path.rsplit("/", 1)[1]):
+                    body = json.dumps(dash.sports_snapshot(), default=str).encode()
+                    self._send(HTTPStatus.OK, body, "application/json")
+                else:
+                    self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
+                return
             if self.path == "/api/stop":
                 dash.stop()
             elif self.path == "/api/clear-stop":

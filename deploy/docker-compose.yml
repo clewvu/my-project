@@ -64,3 +64,15 @@ services:
     entrypoint: ["kalshi-sports"]
     command: record
     restart: unless-stopped
+
+  # sports paper trader: the consensus-gap strategy with simulated fills, reading the
+  # sports recorder's database. For real money run live-trade by hand (it asks for
+  # the typed TRADE confirmation) or add --real-money --yes here deliberately.
+  sports-paper:
+    image: kalshi-bot
+    env_file: ../.env
+    volumes:
+      - ../state:/app/state
+    entrypoint: ["kalshi-sports"]
+    command: paper-trade
+    restart: unless-stopped

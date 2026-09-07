@@ -163,7 +163,9 @@ Delivered:
   `compare` report.
 - 37 tests, all HTTP mocked.
 
-Not yet (phase 2 and 3 in the design): the core extraction from
-`kalshi_bot`, the execution state machine, the persisted risk engine, the
-feature store and the CLV report, the backtester. None of those is useful
-before the recorder has data and the grammar is confirmed.
+Added the same evening, at Cameron's request to trade now: the trading loop
+(paper and live), the persisted risk engine, decisions and positions as the
+feature store with CLV marks, the hourly learning cycle, and the Sports desk
+block on the dashboard. See `docs/sports-trading.md`. Still not built: the
+core extraction from `kalshi_bot`, the backtester over recorded data, and
+the pre-registered gate report (`clv` verdict) from the design.
