@@ -418,6 +418,15 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    evaluation": evaluation exists (`fairvalue` Brier vs market and basis
    tables, `review`, the track record); prediction beyond the driftless
    model is the learned-model item above and needs the recorder's data.
+12. Dashboard redesign (2026-09-07, Cameron's ask): Lewis Wealth Global
+   branding with an inline SVG monogram and favicon, the creed "Faith
+   without Works is Dead. God Move." in the masthead and footer, navy and
+   gold palette in dark and light with a toggle (localStorage), tabs
+   Overview / Trades / Analysis / Activity. New endpoints in `demo_ui`:
+   `/api/analysis` (review cuts, tiers, suggestions, every result row with
+   entry inputs, from `review.attribute`) and `/api/decisions?ticker=`
+   (decision-log rows for one market, cached on file mtime/size);
+   `--decisions` flag. Rendered and checked in Chromium in both themes.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

@@ -777,6 +777,7 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
         port=args.port,
         pause_file=Path(args.pause_file),
         alerts_file=Path(args.alerts) if args.alerts else None,
+        decisions_file=Path(args.decisions) if args.decisions else None,
     )
     print(f"dashboard at http://{args.host}:{server.server_address[1]}/  (Ctrl-C to stop)")
     print("showing whichever of these was updated most recently: " + ", ".join(map(str, files)))
@@ -986,6 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--pause-file", default="state/PAUSE")
     s.add_argument("--alerts", default="state/alerts.jsonl", help="event feed to show")
+    s.add_argument("--decisions", default="state/decisions.jsonl", help="decision log to show")
     s.set_defaults(func=cmd_demo_ui)
 
     s = sub.add_parser("cancel-all", help=cmd_cancel_all.__doc__)

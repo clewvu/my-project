@@ -428,11 +428,21 @@ next check the loop halts, because its P&L can no longer be trusted, and
 says why in the dashboard. Markets the loop has already booked are ignored
 while Kalshi settles them. `--reconcile 0` disables the check.
 
-### Dashboard: pause, events, heartbeat
+### Dashboard: the Lewis Wealth Global desk
 
-`kalshi-bot demo-ui` shows the running loop (it reads whichever of
-`state/live_loop.json` and `state/demo_loop.json` is fresher, or the
-`--state-file` you give it) and offers three controls:
+`kalshi-bot demo-ui` serves a single-page desk on localhost (navy and
+gold, dark and light, a theme toggle in the masthead) that reads whichever
+of `state/live_loop.json`, `state/paper_loop.json` and
+`state/demo_loop.json` is freshest, or the `--state-file` you give it.
+Four views: **Overview** (realised P&L against the cap, results, win rate,
+fees, stake, heartbeat, the equity curve, open positions, by series);
+**Trades** (every booked result, sortable by any column, filterable by
+series, side and how it ended; click a row to open the decision-log record
+behind it: model probability, edge, spot, strike, trend, volatility raw
+and clamped, the asks, the stake, the fee booked, and any exit);
+**Analysis** (the review's cuts as tables whose rows filter the trades, the
+confidence tiers that gate sizing, and what the numbers support);
+**Activity** (the event feed). Three controls sit in the masthead:
 
 * **Pause entries** writes `state/PAUSE`: the loop keeps ticking, manages
   and settles what it holds, but opens nothing new. **Resume** removes it.

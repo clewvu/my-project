@@ -19,9 +19,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from . import alerts as alertmod
-from .dashboard_page import PAGE
+from . import review, sizing
+from .dashboard_page import FAVICON, PAGE
 
 log = logging.getLogger(__name__)
 
@@ -43,12 +45,15 @@ class Dashboard:
         stop_file: Path,
         pause_file: Path | None = None,
         alerts_file: Path | None = None,
+        decisions_file: Path | None = None,
     ) -> None:
         files = state_file if isinstance(state_file, list) else [state_file]
         self.state_files = [Path(f) for f in files]
         self.stop_file = Path(stop_file)
         self.pause_file = Path(pause_file) if pause_file else self.stop_file.with_name("PAUSE")
         self.alerts_file = Path(alerts_file) if alerts_file else None
+        self.decisions_file = Path(decisions_file) if decisions_file else None
+        self._decisions_cache: tuple[float, int, list[dict[str, Any]]] | None = None
 
     @property
     def state_file(self) -> Path:
@@ -108,6 +113,66 @@ class Dashboard:
             "alive": alive and not st.get("halted"),
         }
 
+    # ------------------------------------------------------------ analysis
+
+    def _decisions(self) -> list[dict[str, Any]]:
+        """Decision rows, re-read only when the file changes."""
+        if self.decisions_file is None or not self.decisions_file.exists():
+            return []
+        st = self.decisions_file.stat()
+        key = (st.st_mtime, st.st_size)
+        if self._decisions_cache and self._decisions_cache[:2] == key:
+            return self._decisions_cache[2]
+        rows = review.load_decisions(self.decisions_file)
+        self._decisions_cache = (key[0], key[1], rows)
+        return rows
+
+    def analysis(self) -> dict[str, Any]:
+        """The review's cuts as JSON for the Analysis tab, plus every result row
+        with its entry inputs for the Trades tab."""
+        history = review.load_history(self.state_file)
+        rows = review.attribute(history, self._decisions())
+        for i, r in enumerate(rows):
+            r["id"] = i
+        rec = sizing.TrackRecord()
+        for r in rows:
+            rec.add(r.get("p_side"), r["net"])
+        gross, fees = review.fee_share(rows)
+
+        def cuts(key: str, edges=None):
+            return [{"bucket": label, **stats} for label, stats in review.cut(rows, key, edges)]
+
+        tiers = [
+            {
+                "tier": label,
+                "n": t.n,
+                "win_rate": t.win_rate,
+                "net": t.net,
+                "scaling": t.n >= sizing.MIN_TIER_RESULTS and t.net > 0,
+            }
+            for label, t in sorted(rec.tiers.items())
+        ]
+        return {
+            "rows": rows,
+            "gross": gross,
+            "fees": fees,
+            "cuts": {
+                "how": cuts("how"),
+                "side": cuts("side"),
+                "series": cuts("series"),
+                "confidence": cuts("p_side", review.CONFIDENCE),
+                "ttc": cuts("secs_to_close", review.TTC),
+                "distance": cuts("strike_bps", review.DISTANCE),
+            },
+            "tiers": tiers,
+            "min_tier_results": sizing.MIN_TIER_RESULTS,
+            "suggestions": review.suggest(rows) if rows else [],
+        }
+
+    def decisions_for(self, ticker: str, limit: int = 60) -> list[dict[str, Any]]:
+        rows = [d for d in self._decisions() if d.get("ticker") == ticker]
+        return rows[-limit:]
+
     def stop(self) -> None:
         self.stop_file.parent.mkdir(parents=True, exist_ok=True)
         self.stop_file.write_text(
@@ -145,8 +210,18 @@ def make_handler(dash: Dashboard) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802 - http.server API
             if self.path in ("/", "/index.html"):
                 self._send(HTTPStatus.OK, PAGE.encode(), "text/html; charset=utf-8")
+            elif self.path in ("/favicon.svg", "/favicon.ico"):
+                self._send(HTTPStatus.OK, FAVICON.encode(), "image/svg+xml")
             elif self.path == "/api/state":
                 body = json.dumps(dash.snapshot()).encode()
+                self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path == "/api/analysis":
+                body = json.dumps(dash.analysis(), default=str).encode()
+                self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path.startswith("/api/decisions"):
+                query = parse_qs(urlparse(self.path).query)
+                ticker = (query.get("ticker") or [""])[0]
+                body = json.dumps(dash.decisions_for(ticker), default=str).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
@@ -183,9 +258,16 @@ def serve(
     port: int = 8765,
     pause_file: Path | None = None,
     alerts_file: Path | None = None,
+    decisions_file: Path | None = None,
 ) -> ThreadingHTTPServer:
     """Bind and return the server; call ``serve_forever`` on it."""
-    dash = Dashboard(state_file, stop_file, pause_file=pause_file, alerts_file=alerts_file)
+    dash = Dashboard(
+        state_file,
+        stop_file,
+        pause_file=pause_file,
+        alerts_file=alerts_file,
+        decisions_file=decisions_file,
+    )
     try:
         return _Server((host, port), make_handler(dash))
     except OSError as exc:

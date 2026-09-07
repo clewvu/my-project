@@ -1067,6 +1067,67 @@ def test_dashboard_pause_resume_and_events(tmp_path):
         assert not (tmp_path / "PAUSE").exists()
         page = _get(server, "/")[1].decode()
         assert "Pause entries" in page and "Activity" in page and "/api/resume" in page
+        assert "Lewis Wealth Global" in page and "Faith without Works is Dead. God Move." in page
+        status, body = _get(server, "/favicon.svg")
+        assert status == 200 and body.startswith(b"<svg")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_dashboard_analysis_and_decisions_endpoints(tmp_path):
+    state = LoopState()
+    for i in range(3):
+        state.history.append(
+            {
+                "series": "KXBTC15M",
+                "ticker": f"KXBTC15M-{i}",
+                "side": "yes",
+                "count": 10,
+                "price": 0.45,
+                "result": "yes",
+                "won": True,
+                "net": 4.0,
+                "settled_ts": T0 + i * 900 + 800,
+                "maker": True,
+                "fee": 0.3,
+            }
+        )
+    state.save(tmp_path / "state.json")
+    dec = tmp_path / "decisions.jsonl"
+    with dec.open("w") as fh:
+        for i in range(3):
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": T0 + i * 900,
+                        "action": "trade",
+                        "ticker": f"KXBTC15M-{i}",
+                        "side": "yes",
+                        "reason": "fair value",
+                        "inputs": {"p_yes": 0.72, "secs_to_close": 600},
+                    }
+                )
+                + "\n"
+            )
+        fh.write(json.dumps({"ts": T0 + 100, "action": "skip", "ticker": "KXBTC15M-9"}) + "\n")
+    server = demo_ui.serve(tmp_path / "state.json", tmp_path / "STOP", port=0, decisions_file=dec)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        data = json.loads(_get(server, "/api/analysis")[1])
+        assert len(data["rows"]) == 3 and data["rows"][0]["p_side"] == 0.72
+        assert data["cuts"]["confidence"][0]["bucket"] == "0.65-0.80"
+        assert data["tiers"][0]["tier"] == "0.65-0.75" and not data["tiers"][0]["scaling"]
+        assert data["suggestions"]
+        rows = json.loads(_get(server, "/api/decisions?ticker=KXBTC15M-1")[1])
+        assert len(rows) == 1 and rows[0]["ticker"] == "KXBTC15M-1"
+        assert json.loads(_get(server, "/api/decisions?ticker=nope")[1]) == []
+        # the cache follows the file
+        with dec.open("a") as fh:
+            fh.write(json.dumps({"ts": T0 + 5000, "action": "exit", "ticker": "KXBTC15M-1"}) + "\n")
+        rows = json.loads(_get(server, "/api/decisions?ticker=KXBTC15M-1")[1])
+        assert len(rows) == 2
     finally:
         server.shutdown()
         server.server_close()

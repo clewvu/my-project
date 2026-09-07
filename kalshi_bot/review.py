@@ -217,7 +217,13 @@ def suggest(rows: list[dict[str, Any]]) -> list[str]:
                 "trending against them; the trend filter is the guard, not a side ban"
             )
     if not tips:
-        tips.append("no single cut explains the losses; this looks like variance plus fees")
+        if total > 0:
+            tips.append(
+                f"net positive ({total:+.2f} over {len(rows)} results) with no losing cut; "
+                "keep the rules as they are and let the sample grow"
+            )
+        else:
+            tips.append("no single cut explains the losses; this looks like variance plus fees")
     return tips
 
 
