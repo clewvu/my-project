@@ -375,7 +375,17 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
    `kalshi-bot review` (loss attribution by exit type, side, confidence,
    time to close, strike distance, fee share, with suggested settings) and
    `--min-confidence` 0.65 (skip near-coin-flip markets, where fees peak
-   and the model is noisiest). Cameron should paste the `review` output.
+   and the model is noisiest). Cameron's `review` over 124 live results
+   (2026-09-06): net -47.19 (cap 50), 50% wins, fees 17.23, before fees
+   -29.96, so no edge before fees either; settled positions won 25% and
+   lost -63.69 while sales won 73% for +16.50 (exits harvested the good
+   half of coin flips, losers were held to settlement); 120 of 124 entries
+   had model confidence under 0.65 and 88 were within 5 bps of the strike;
+   the 4 entries at 0.65-0.80 made +3.05. Conclusion: stop paying to
+   learn. Added `kalshi-bot paper-trade` (production quotes, simulated
+   taker fills, dry-run forced, `state/paper_loop.json`) as the forward
+   test, and the review now reports average win/loss with the break-even
+   win rate and flags the harvest-winners/hold-losers pattern.
 
 Demo trading loop (added 2026-09-04 evening at Cameron's request, separate
 from the research plan): `kalshi_bot/demo_loop.py` alternates YES/NO across

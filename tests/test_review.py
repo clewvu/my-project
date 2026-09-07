@@ -1,4 +1,7 @@
+import dataclasses
 import json
+
+import pytest
 
 from kalshi_bot import review
 from kalshi_bot.demo_loop import LoopState
@@ -69,6 +72,68 @@ def test_attribution_joins_entries_and_cuts(tmp_path):
     text = review.report(state, dec)
     assert "model confidence" in text and "what the numbers support" in text
     assert "12/12" in text
+
+
+def test_review_flags_harvested_winners_and_held_losers(tmp_path):
+    state = LoopState()
+    for i in range(20):
+        sold = i % 2 == 0
+        state.history.append(
+            {
+                "ticker": f"KXBTC15M-{i}",
+                "side": "yes",
+                "count": 10,
+                "price": 0.5,
+                "result": "sold" if sold else "no",
+                "sold_at": 0.55 if sold else None,
+                "won": sold,
+                "net": 0.3 if sold else -5.2,
+                "settled_ts": T0 + i * 900,
+            }
+        )
+    state.save(tmp_path / "s.json")
+    text = review.report(tmp_path / "s.json", None)
+    assert "winners are being sold small" in text
+    assert "break-even win rate" in text
+
+
+def test_paper_trade_cli(monkeypatch, capsys):
+    import kalshi_bot.cli as cli
+
+    parser = cli.build_parser()
+    args = parser.parse_args(["paper-trade", "--dollars", "5"])
+    assert args.state_file == "state/paper_loop.json" and args.strategy == "fairvalue"
+    assert args.default_env == "prod" and args.loss_cap == 50.0
+    demo = dataclasses.replace(cli.Settings.from_env("/nonexistent"), env="demo")
+    with pytest.raises(SystemExit):
+        cli.cmd_paper_trade(demo, args)  # demo env
+    prod = dataclasses.replace(demo, env="prod", dry_run=False)
+    seen = {}
+
+    class FakeLoop:
+        def __init__(self, client, cfg, allow_production=False):
+            seen["dry_run"] = client.dry_run
+            seen["entry"] = cfg.entry
+            seen["allow"] = allow_production
+            self.state = LoopState()
+
+        def run(self):
+            return "test"
+
+    class FakeClient:
+        dry_run = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(cli, "_client", lambda settings, need_auth: FakeClient())
+    monkeypatch.setattr("kalshi_bot.demo_loop.DemoLoop", FakeLoop)
+    assert cli.cmd_paper_trade(prod, args) == 0
+    assert seen == {"dry_run": True, "entry": "taker", "allow": True}
+    assert "PAPER" in capsys.readouterr().out
 
 
 def test_review_handles_missing_and_small(tmp_path):

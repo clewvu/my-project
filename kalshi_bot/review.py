@@ -158,6 +158,17 @@ def suggest(rows: list[dict[str, Any]]) -> list[str]:
             f"(-{fees:.2f} fees): trade less often and only with larger edges"
         )
     sold = [r for r in rows if r["how"] == "sold"]
+    settled = [r for r in rows if r["how"] == "settled"]
+    if len(sold) >= 5 and len(settled) >= 5:
+        ss, st = _stats(sold), _stats(settled)
+        if ss["win_rate"] >= 0.6 and st["win_rate"] <= 0.4 and st["net"] < 0:
+            tips.append(
+                f"winners are being sold small (+{ss['per_trade']:.2f} each, {ss['win_rate']:.0%} "
+                f"won) while losers are held to settlement ({st['per_trade']:+.2f} each, "
+                f"{st['win_rate']:.0%} won): the exits harvest the good half of a coin flip and "
+                "leave the bad half. Either hold everything (--no-exits) or, better, stop "
+                "entering coin flips (--min-confidence 0.65 or more)"
+            )
     if sold:
         s = _stats(sold)
         if s["net"] < 0:
@@ -225,6 +236,15 @@ def report(state_path: str | Path, decisions_path: str | Path | None) -> str:
     )
     matched = sum(1 for r in rows if r["p_side"] is not None)
     lines.append(f"entries matched to a decision-log row: {matched}/{len(rows)}")
+    wins = [r["net"] for r in rows if r["net"] > 0]
+    losses = [r["net"] for r in rows if r["net"] <= 0]
+    if wins and losses:
+        avg_w = sum(wins) / len(wins)
+        avg_l = sum(losses) / len(losses)
+        lines.append(
+            f"average win {avg_w:+.2f} over {len(wins)}, average loss {avg_l:+.2f} over "
+            f"{len(losses)}: break-even win rate {abs(avg_l) / (avg_w + abs(avg_l)):.0%}"
+        )
 
     def table(title: str, cuts) -> None:
         lines.append(f"\n-- {title}")

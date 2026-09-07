@@ -542,6 +542,37 @@ LIVE_MAX_DOLLARS = 20.0
 LIVE_MAX_LOSS_CAP = 50.0
 
 
+def cmd_paper_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """The live strategy on production quotes with simulated fills: no orders, no money."""
+    from .demo_loop import DemoLoop
+
+    if settings.env != "prod":
+        sys.exit("paper-trade reads production quotes: kalshi-bot --env prod paper-trade")
+    settings = dataclasses.replace(settings, dry_run=True)  # whatever .env says
+    cfg = _loop_config(args)
+    cfg.entry = "taker"  # a simulated maker fill would flatter the result
+    if _loop_housekeeping(cfg, args):
+        return 0
+    print("PAPER. Production quotes and settlements; fills simulated at the ask; nothing sent.")
+    size = f"${cfg.dollars:.2f}" if cfg.dollars else f"{cfg.contracts} contract(s)"
+    detail = (
+        f" (margin {cfg.margin:.2f}, min confidence {cfg.min_confidence:.2f})"
+        if cfg.strategy == "fairvalue"
+        else ""
+    )
+    print(f"Strategy: {cfg.strategy}{detail}; {size} per trade")
+    print(
+        f"State: {cfg.state_file}   Stop file: {cfg.stop_file}   "
+        f"Review: kalshi-bot review --live-state {cfg.state_file}"
+    )
+    with _client(settings, need_auth=settings.has_credentials) as client:
+        loop = DemoLoop(client, cfg, allow_production=True)
+        reason = loop.run()
+    print(f"stopped: {reason}")
+    print(loop.state.summary())
+    return 0
+
+
 def cmd_live_trade(settings: Settings, args: argparse.Namespace) -> int:
     """The same alternating trader on PRODUCTION with real money. Requires --real-money."""
     from .demo_loop import DemoLoop
@@ -718,7 +749,11 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
     files = (
         [Path(args.state_file)]
         if args.state_file
-        else [Path("state/live_loop.json"), Path("state/demo_loop.json")]
+        else [
+            Path("state/live_loop.json"),
+            Path("state/paper_loop.json"),
+            Path("state/demo_loop.json"),
+        ]
     )
     server = serve(
         files,
@@ -873,6 +908,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_loop_args(s, state_file="state/demo_loop.json")
     s.set_defaults(func=cmd_demo_trade)
 
+    s = sub.add_parser("paper-trade", help=cmd_paper_trade.__doc__)
+    _add_loop_args(
+        s,
+        state_file="state/paper_loop.json",
+        loss_cap=50.0,
+        profit_target=0.0,
+        strategy="fairvalue",
+    )
+    s.set_defaults(func=cmd_paper_trade, default_env="prod")
+
     s = sub.add_parser("live-trade", help=cmd_live_trade.__doc__)
     _add_loop_args(
         s,
@@ -908,8 +953,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--state-file",
         default=None,
-        help="loop state to show (default: the fresher of state/live_loop.json and "
-        "state/demo_loop.json)",
+        help="loop state to show (default: the freshest of state/live_loop.json, "
+        "state/paper_loop.json and state/demo_loop.json)",
     )
     s.add_argument("--stop-file", default="state/STOP")
     s.add_argument("--pause-file", default="state/PAUSE")

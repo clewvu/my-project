@@ -213,6 +213,16 @@ at the limit price without sending anything, which needs no API key at all.
 Note that the demo exchange lists few 15-minute crypto markets; when none is
 open the loop waits and logs it.
 
+### Paper on production quotes: `paper-trade`
+
+`kalshi-bot paper-trade --dollars 5` runs the live strategy against
+production markets and settlements with simulated fills at the ask and
+sends nothing. It needs no key for the quotes and forces dry-run whatever
+`.env` says. State goes to `state/paper_loop.json`, the dashboard shows it
+when it is the freshest file, and `kalshi-bot review --live-state
+state/paper_loop.json` reads it. This is the forward test to run for a few
+days after any strategy change, before a dollar goes on it.
+
 ### Real money: `live-trade`
 
 The same loop can run on production with real money. It has no edge: each
