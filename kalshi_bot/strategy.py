@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 from collections import deque
@@ -667,6 +668,9 @@ class FairValueStrategy:
 # ---------------------------------------------------------------- decision log
 
 
+_NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
 class DecisionLog:
     """Append-only JSON lines: every trade, and every change of skip reason
     per market, with the strategy's inputs. Doubles as the feature store."""
@@ -689,9 +693,11 @@ class DecisionLog:
         if self.path is None:
             return
         if isinstance(outcome, Skip):
-            if self._last_skip.get(market.ticker) == outcome.reason:
+            # the same kind of skip with a wobbling number is one event, not many
+            kind = _NUMBER.sub("#", outcome.reason)
+            if self._last_skip.get(market.ticker) == kind:
                 return
-            self._last_skip[market.ticker] = outcome.reason
+            self._last_skip[market.ticker] = kind
         row: dict[str, Any] = {
             "ts": now,
             "time": datetime.fromtimestamp(now, tz=UTC).isoformat(timespec="seconds"),

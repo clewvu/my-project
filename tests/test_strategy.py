@@ -327,6 +327,24 @@ def test_decision_log_writes_trades_and_reason_changes(tmp_path):
     st.DecisionLog(None).record(now=T0, strategy="x", series="y", market=m, outcome=skip)
 
 
+def test_decision_log_collapses_wobbling_skip_numbers(tmp_path):
+    log = st.DecisionLog(tmp_path / "d.jsonl")
+    m = market()
+    for conf in (0.417, 0.399, 0.421):
+        log.record(
+            now=T0,
+            strategy="fairvalue",
+            series="KXBTC15M",
+            market=m,
+            outcome=st.Skip(f"no confidence {conf:.3f} below min_confidence 0.65"),
+        )
+    log.record(
+        now=T0, strategy="fairvalue", series="KXBTC15M", market=m, outcome=st.Skip("no asks")
+    )
+    rows = (tmp_path / "d.jsonl").read_text().splitlines()
+    assert len(rows) == 2 and "0.417" in rows[0] and "no asks" in rows[1]
+
+
 def test_build_strategy(tmp_path):
     assert st.build_strategy("alternate").name == "alternate"
     fv = st.build_strategy(
