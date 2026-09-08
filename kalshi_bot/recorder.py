@@ -27,7 +27,14 @@ from .storage import MarketDataStore
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SERIES = ["KXBTC15M", "KXDOGE15M"]
+# Crypto series price cleanly off the Coinbase spot feed, so the fair-value model
+# trades them once their data is validated. The commodity series (gold, silver,
+# copper, WTI) are recorded for research only: they have no spot feed yet and only
+# trade in CME sessions, so nothing prices or trades them until that is built out.
+DEFAULT_SERIES = [
+    "KXBTC15M", "KXDOGE15M", "KXETH15M", "KXSOL15M",
+    "KXGOLD15M", "KXSILVER15M", "KXCOPPER15M", "KXWTI15M", "KXNATGAS15M",
+]
 DEAD_STATUSES = {"closed", "settled", "finalized", "determined"}
 
 
@@ -40,7 +47,7 @@ def is_live(market: Market, now: float) -> bool:
     return True
 
 
-DEFAULT_SPOT_SYMBOLS = ["BTC-USD", "DOGE-USD"]
+DEFAULT_SPOT_SYMBOLS = ["BTC-USD", "DOGE-USD", "ETH-USD", "SOL-USD"]
 
 
 @dataclass

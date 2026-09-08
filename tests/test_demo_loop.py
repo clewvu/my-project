@@ -1417,3 +1417,27 @@ def test_transient_tick_error_recovers(tmp_path):
     reason = loop.run()
     assert reason.startswith("max trades")  # recovered from the blip and traded normally
     assert client.boom == 0  # the transient error was consumed, not fatal
+
+
+def test_cluster_exposure_cap_blocks_correlated_overexposure(tmp_path):
+    """Correlated series share one budget: once open exposure would exceed the cap,
+    further entries are skipped and logged, protecting the balance."""
+    client = FakeClient({0: "yes"}, series=("KXBTC15M", "KXDOGE15M"))
+    # each trade costs 3 x 0.55 = 1.65; a $3 cap admits one position, not two
+    loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100,
+                   dollars=2.0, max_open_dollars=3.0)
+    loop.run(max_ticks=1)
+    assert len(client.orders) == 1                       # second entry blocked
+    assert len(loop.state.open_trades) == 1
+    assert loop.state.open_exposure() == pytest.approx(1.65, abs=1e-9)
+    # the block was recorded as a decision for the dashboard/audit
+    import json as _json
+    logged = [_json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    assert any("cluster exposure" in (d.get("reason") or "") for d in logged)
+    # without a cap, both correlated positions open (fresh dir: own state file)
+    d2 = tmp_path / "b"
+    d2.mkdir()
+    client2 = FakeClient({0: "yes"}, series=("KXBTC15M", "KXDOGE15M"))
+    loop2, _ = make(d2, client2, loss_cap=100, profit_target=100, dollars=2.0)
+    loop2.run(max_ticks=1)
+    assert len(client2.orders) == 2

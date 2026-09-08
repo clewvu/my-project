@@ -128,6 +128,10 @@ class LoopConfig:
     free_entries: int = 2  # entries beyond this need the market to be in profit so far
     risk_fraction: float | None = None  # of bankroll per trade; None = the learning loop's
     max_dollars: float = 20.0  # ceiling per trade under fixed-fraction sizing
+    # cluster cap: total cost of all open positions this loop holds at once. Its
+    # series are correlated (all crypto), so they share one budget rather than
+    # each risking independently. 0 = no aggregate cap. Protects the balance.
+    max_open_dollars: float = 0.0
     bankroll_refresh_s: float = 300.0
     entry: str = "taker"  # taker: pay the ask. maker: rest one tick inside, then take
     maker_wait_s: float = 20.0  # how long a maker order may rest before the taker fallback
@@ -338,6 +342,15 @@ class LoopState:
     @property
     def open_trades(self) -> list[tuple[str, OpenTrade]]:
         return [(name, ss.open) for name, ss in self.series.items() if ss.open is not None]
+
+    def open_exposure(self) -> float:
+        """Total dollars committed to open positions (filled cost, else resting cost)."""
+        total = 0.0
+        for _, t in self.open_trades:
+            qty = t.filled_count if t.filled_count > 0 else t.count
+            px = t.fill_price if t.fill_price is not None else t.limit_price
+            total += qty * px
+        return total
 
     def summary(self) -> str:
         opens = ", ".join(f"{t.side} x{t.count} {t.ticker}" for _, t in self.open_trades) or "none"
@@ -719,6 +732,17 @@ class DemoLoop:
             inside = maker_price(bid, price)
             if inside is not None:
                 post_price, maker = inside, True
+        if self.cfg.max_open_dollars > 0:
+            exposure = self.state.open_exposure()
+            if exposure + count * post_price > self.cfg.max_open_dollars + 1e-9:
+                why = (f"cluster exposure ${exposure:.2f} + ${count * post_price:.2f} "
+                       f"would exceed cap ${self.cfg.max_open_dollars:.2f}")
+                self._skip(name, market.ticker, why)
+                self.decisions.record(
+                    now=now, strategy=self.strategy.name, series=name, market=market,
+                    outcome=Skip(why),
+                )
+                return
         order = self.client.create_order(
             market.ticker,
             side=side,
