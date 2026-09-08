@@ -682,3 +682,21 @@ def test_cli_positions_and_learn_offline(tmp_path, capsys, monkeypatch):
 def test_sqlite_row_factory_on_store():
     store = SportsDataStore()
     assert isinstance(store._conn.execute("SELECT 1 AS x").fetchone(), sqlite3.Row)
+
+
+def test_stale_recorded_quote_is_refreshed_from_the_live_book(tmp_path):
+    # recorded quote is stale (> max_quote_age) but consensus is fresh: the trader
+    # should pull the live book and still trade, not discard the game for staleness.
+    store = SportsDataStore()
+    seed_game(store, quote_ts=CONS_NOW - 5000)
+    trader, _ = make_trader(store, tmp_path)
+    res = trader.tick(CONS_NOW)
+    assert res.quote_refreshes >= 1
+    assert res.entries == 1 and not res.errors
+    assert len(store.positions(status="open", mode="paper")) == 1
+    # a fresh recorded quote needs no live refresh
+    store2 = SportsDataStore()
+    seed_game(store2)
+    trader2, _ = make_trader(store2, tmp_path)
+    res2 = trader2.tick(CONS_NOW)
+    assert res2.quote_refreshes == 0 and res2.entries == 1

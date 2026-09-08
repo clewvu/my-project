@@ -77,6 +77,7 @@ class TickResult:
     settled: int = 0
     marked: int = 0
     odds_pulls: int = 0
+    quote_refreshes: int = 0
     errors: list[str] | None = None
 
     def __post_init__(self) -> None:
@@ -440,6 +441,26 @@ class SportsTrader:
             cons = self._consensus_for(league, cand["event_ticker"], at=now)
             ctx = self._context(cand, quotes, cons, now)
             pre = self.strategy.evaluate(ctx)
+            # a stale local quote alone should not discard a game we could trade: the
+            # recorder snapshots each book slower than our freshness gate, so pull the
+            # live book and re-judge (the same confirmation we do before executing).
+            # Bounded to games that already have a consensus, so we never spend an API
+            # call on a market we could not trade anyway.
+            if not pre.is_entry and pre.reason == "kalshi quote stale" and cons is not None:
+                try:
+                    book = self.client.get_orderbook(cand["ticker"], depth=5)
+                    quotes = {
+                        "yes_bid": book.best_yes_bid,
+                        "yes_ask": book.best_yes_ask,
+                        "no_bid": book.best_no_bid,
+                        "no_ask": book.best_no_ask,
+                        "ts": now,
+                    }
+                    ctx = self._context(cand, quotes, cons, now)
+                    pre = self.strategy.evaluate(ctx)
+                    res.quote_refreshes += 1
+                except KalshiError as exc:
+                    res.errors.append(f"{cand['ticker']}: quote refresh: {exc}")
             # pull fresh odds when a signal needs confirming, when the odds we have are
             # stale, or when the recorder has none for this league at all
             wants_fresh = pre.is_entry or pre.reason in ("odds stale", "no consensus")
