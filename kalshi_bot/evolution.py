@@ -141,6 +141,9 @@ def run(db: str, series: list[str] | None, every: float, generations: int,
         gen += 1
         try:
             fv = fairvalue.load(db, series=series or None, vol_windows=VOL_WINDOWS)
+            # selection scores on taker net; drop the trade stream so each backtest
+            # skips the expensive maker-fill simulation over millions of prints.
+            fv.trades = None
             rec = evolve_once(fv, champion, seed=seed + gen)
         except Exception:  # noqa: BLE001 - a bad generation must not kill the loop
             log.exception("evolution generation failed")
