@@ -820,6 +820,7 @@ def cmd_demo_ui(_: Settings, args: argparse.Namespace) -> int:
         if args.state_file
         else [
             Path("state/live_loop.json"),
+            Path("state/explore_loop.json"),  # the ETH/SOL $1 exploration loop
             Path("state/paper_loop.json"),
             Path("state/demo_loop.json"),
         ]
