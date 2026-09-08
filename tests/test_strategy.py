@@ -463,3 +463,18 @@ def test_reversion_take_banks_an_overshoot():
     # a small run-up below the take threshold is still held
     m2 = market(strike=last * 0.99, yes_ask=0.56, no_ask=0.46, now=T0)  # yes_bid 0.55, +0.05
     assert chall.exit(m2, "yes", 0.50, T0) is None
+
+
+def test_min_history_gate_blocks_a_young_feed():
+    """A market may not trade until its spot history spans min_history_s, so a
+    thin/young feed cannot yield an overconfident vol estimate and phantom edges."""
+    hist = st.SpotHistory()
+    gbm("BTC-USD", hist, 1000, 8e-5, start=T0 - 1000)  # ~1000s of fresh history
+    m = market(strike=100, now=T0)
+    young = st.FairValueStrategy(FakeFeed({}), history=hist)  # default = full vol window (1800)
+    sig = young.signal(m, None, T0)
+    assert isinstance(sig, st.Skip) and "warming up" in sig.reason
+    # a lower bar lets the same feed trade
+    ok = st.FairValueStrategy(FakeFeed({}), history=hist, min_history_s=500)
+    ev = ok.evaluate(m, T0)
+    assert "skip" not in ev and ev.get("p_yes") is not None

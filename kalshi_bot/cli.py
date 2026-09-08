@@ -477,6 +477,7 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         risk_fraction=args.risk_fraction,
         max_dollars=args.max_dollars,
         max_open_dollars=args.max_open_dollars,
+        min_history_s=args.min_history,
         entry=args.entry,
         maker_wait_s=args.maker_wait,
         reconcile_s=args.reconcile,
@@ -1277,6 +1278,13 @@ def _add_loop_args(
         default=0.0,
         help="cap on the total cost of all open positions at once (0 = no cap); "
         "the loop's correlated series share this one budget to protect the balance",
+    )
+    s.add_argument(
+        "--min-history",
+        type=float,
+        default=None,
+        help="fairvalue: require this many seconds of spot history before a market "
+        "may trade (default: a full vol window); guards against thin/young feeds",
     )
     s.add_argument(
         "--entry",

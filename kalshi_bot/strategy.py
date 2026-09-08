@@ -218,6 +218,13 @@ class SpotHistory:
             return None
         return math.sqrt(sq / count / step_s)
 
+    def span(self, symbol: str) -> float:
+        """Seconds between the oldest and newest tick held for a symbol (0 if <2)."""
+        q = self._points.get(symbol)
+        if not q or len(q) < 2:
+            return 0.0
+        return q[-1][0] - q[0][0]
+
     def bootstrap_from_db(self, db_path: str | Path, symbol: str, since: float) -> int:
         """Seed history from the recorder's ``spot`` table. Returns rows loaded."""
         path = Path(db_path)
@@ -420,6 +427,7 @@ class FairValueStrategy:
         vol_floor_ann: float = 0.30,
         vol_cap_ann: float = 3.0,
         reversion_take: float = 0.0,
+        min_history_s: float | None = None,
     ) -> None:
         # realised vol is clamped to [floor, cap] annualised: a sleepy feed must
         # not make the model sure of itself, and a glitch must not make it blind
@@ -465,6 +473,11 @@ class FairValueStrategy:
         # A transient overshoot is banked instead of risked back to settlement.
         # 0 disables (the champion default); a challenger turns it on.
         self.reversion_take = reversion_take
+        # warm-up guard: a market is not priced for trading until its spot history
+        # spans at least this long, so a thin/young feed cannot produce an
+        # overconfident volatility estimate (and phantom edges). Defaults to a full
+        # vol window; established markets seed enough history on start to pass at once.
+        self.min_history_s = vol_window_s if min_history_s is None else min_history_s
         self.reload_params(force=True)
 
     def reload_params(self, now: float | None = None, force: bool = False) -> bool:
@@ -617,6 +630,11 @@ class FairValueStrategy:
         sigma = self.history.sigma(symbol, self.vol_window_s, now)  # type: ignore[arg-type]
         if sigma is None:
             out["skip"] = "not enough spot history for volatility yet"
+            return out
+        span = self.history.span(symbol)  # type: ignore[arg-type]
+        out["history_span_s"] = round(span, 0)
+        if span < self.min_history_s:
+            out["skip"] = f"warming up: {span:.0f}s of {self.min_history_s:.0f}s spot history"
             return out
         per_year = math.sqrt(365 * 86400)
         out["ann_vol_raw"] = sigma * per_year
@@ -776,6 +794,7 @@ def build_strategy(
     vol_floor_ann: float = 0.30,
     vol_cap_ann: float = 3.0,
     reversion_take: float = 0.0,
+    min_history_s: float | None = None,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -811,6 +830,7 @@ def build_strategy(
             vol_floor_ann=vol_floor_ann,
             vol_cap_ann=vol_cap_ann,
             reversion_take=reversion_take,
+            min_history_s=min_history_s,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())
