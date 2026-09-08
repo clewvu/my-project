@@ -444,3 +444,22 @@ def test_build_strategy_spot_source(tmp_path, monkeypatch):
         assert "spot_source" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_reversion_take_banks_an_overshoot():
+    """Challenger: bank a price overshoot the model would otherwise hold to
+    settlement. Off by default (champion), so the base strategy still holds."""
+    hist = st.SpotHistory()
+    last = gbm("BTC-USD", hist, 3600, 8e-5)
+    # hold YES bought at 0.50; spot sits above the strike so the model still
+    # values YES highly -> the normal surplus rule would hold to settlement
+    m = market(strike=last * 0.99, yes_ask=0.90, no_ask=0.12, now=T0)  # yes_bid 0.89
+    base = st.FairValueStrategy(FakeFeed({}), history=hist)  # reversion_take defaults to 0
+    assert base.exit(m, "yes", 0.50, T0) is None  # champion: hold to settlement
+    chall = st.FairValueStrategy(FakeFeed({}), history=hist, reversion_take=0.10)
+    ex = chall.exit(m, "yes", 0.50, T0)
+    assert isinstance(ex, st.Exit) and not ex.stop and ex.price == 0.89
+    assert "banking the overshoot" in ex.reason
+    # a small run-up below the take threshold is still held
+    m2 = market(strike=last * 0.99, yes_ask=0.56, no_ask=0.46, now=T0)  # yes_bid 0.55, +0.05
+    assert chall.exit(m2, "yes", 0.50, T0) is None

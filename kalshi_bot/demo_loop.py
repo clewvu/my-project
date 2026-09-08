@@ -120,6 +120,8 @@ class LoopConfig:
     params_path: Path | None = Path("state/params.json")  # written by `kalshi-bot learn`
     exits: bool = True  # let the strategy sell before settlement
     exit_margin: float = 0.02  # fairvalue: sell when the bid beats model value by this
+    reversion_take: float = 0.0  # fairvalue: bank a profit when the bid runs this far
+    # above entry, even if the model still values the position higher (0 = off)
     take_profit: float = 0.0  # alternate: sell when the bid is this far above entry (0 = off)
     stop_loss: float = 0.0  # alternate: sell when the bid is this far below entry (0 = off)
     max_entries: int = 1  # entries per market (a re-entry needs the previous one sold)
@@ -402,6 +404,7 @@ class DemoLoop:
             min_confidence=config.min_confidence,
             vol_floor_ann=config.vol_floor,
             vol_cap_ann=config.vol_cap,
+            reversion_take=config.reversion_take,
         )
         self.decisions = DecisionLog(config.decision_log)
         self.state.config["strategy"] = self.strategy.name

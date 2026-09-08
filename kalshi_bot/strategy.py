@@ -419,6 +419,7 @@ class FairValueStrategy:
         min_confidence: float = 0.65,
         vol_floor_ann: float = 0.30,
         vol_cap_ann: float = 3.0,
+        reversion_take: float = 0.0,
     ) -> None:
         # realised vol is clamped to [floor, cap] annualised: a sleepy feed must
         # not make the model sure of itself, and a glitch must not make it blind
@@ -459,6 +460,11 @@ class FairValueStrategy:
         # entry margin, so a round trip needs the model to move at least as much
         # as it took to get in (see ``effective_exit_margin``)
         self.exit_margin = exit_margin
+        # reversion / peak exit: if the bid runs at least this far above entry,
+        # lock the profit even when the model still values the position higher.
+        # A transient overshoot is banked instead of risked back to settlement.
+        # 0 disables (the champion default); a challenger turns it on.
+        self.reversion_take = reversion_take
         self.reload_params(force=True)
 
     def reload_params(self, now: float | None = None, force: bool = False) -> bool:
@@ -527,6 +533,17 @@ class FairValueStrategy:
         )
         surplus = bid - sell_fee - value
         ev.update({"bid": bid, "entry": entry_price, "hold_value": value, "sell_surplus": surplus})
+        # reversion / peak exit: a transient overshoot lifts the bid well above
+        # entry even when the model still values the position higher. Bank it
+        # rather than risk giving it back to settlement, provided the sale still
+        # clears the fee. Off unless a challenger enables it (reversion_take > 0).
+        if self.reversion_take > 0 and bid - entry_price >= self.reversion_take and bid - sell_fee > entry_price:
+            return Exit(
+                bid,
+                f"take {side} at {bid:.3f}: bid {bid - entry_price:+.3f} over entry "
+                f"{entry_price:.3f}, banking the overshoot",
+                ev,
+            )
         if surplus < self.effective_exit_margin:
             return None
         if bid >= entry_price:
@@ -758,6 +775,7 @@ def build_strategy(
     min_confidence: float = 0.65,
     vol_floor_ann: float = 0.30,
     vol_cap_ann: float = 3.0,
+    reversion_take: float = 0.0,
 ) -> Strategy:
     if name == "alternate":
         return AlternatingStrategy(
@@ -792,6 +810,7 @@ def build_strategy(
             min_confidence=min_confidence,
             vol_floor_ann=vol_floor_ann,
             vol_cap_ann=vol_cap_ann,
+            reversion_take=reversion_take,
         )
         if spot_db is not None:
             strat.bootstrap(spot_db, series, now if now is not None else time.time())
