@@ -158,6 +158,10 @@ class LoopConfig:
     # and settlements alike) no entries for loss_pause_s; 0 disables
     max_consecutive_losses: int = 3
     loss_pause_s: float = 1800.0
+    # resilience: a single failing tick (API blip, bad response) must not kill the
+    # loop and stop it managing open positions. Errors are logged and retried with
+    # backoff; only this many failures in a row halt the loop.
+    max_tick_failures: int = 5
 
     def validate(self) -> None:
         if self.max_entries < 1 or self.free_entries < 1:
@@ -285,6 +289,10 @@ class LoopState:
     breaker_until: float | None = None  # consecutive-loss breaker: no entries until then
     loss_streak: int = 0  # losing results in a row, sales and settlements alike
     config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
+    # last balance seen, for the dashboard's funding ledger (shard index -> dollars)
+    shard_balances: dict[str, float] = field(default_factory=dict)
+    balance_total: float | None = None
+    balance_ts: float | None = None
 
     @classmethod
     def load(cls, path: Path) -> LoopState:
@@ -425,6 +433,12 @@ class DemoLoop:
         self._bankroll_ts = now
         try:
             self.bankroll = self.client.get_balance()
+            if self.bankroll is not None:
+                self.state.shard_balances = {
+                    str(k): v for k, v in (self.bankroll.breakdown or {}).items()
+                }
+                self.state.balance_total = self.bankroll.balance
+                self.state.balance_ts = now
         except Exception as exc:  # noqa: BLE001 - sizing falls back to --dollars
             log.debug("balance refresh failed: %s", exc)
 
@@ -490,10 +504,38 @@ class DemoLoop:
             log.warning("KALSHI_DRY_RUN is on: fills are simulated at the limit price")
         log.info("demo loop start: %s", self.state.summary())
         ticks = 0
+        fails = 0
         try:
             while max_ticks is None or ticks < max_ticks:
                 ticks += 1
-                reason = self.tick()
+                try:
+                    reason = self.tick()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one bad tick must not kill the loop
+                    fails += 1
+                    cap = self.cfg.max_tick_failures
+                    log.exception("tick failed (%d/%d in a row)", fails, cap)
+                    try:
+                        self.alerts.record(
+                            "halt" if fails >= cap else "warn",
+                            self._alert_src,
+                            f"tick error ({fails}/{cap}): {exc}",
+                            now=self.clock(),
+                        )
+                    except Exception:  # noqa: BLE001 - never let alerting mask the loop
+                        pass
+                    if fails >= cap:
+                        self.state.halted = f"{fails} consecutive tick errors; last: {exc}"
+                        try:
+                            return self._stop(self.state.halted)
+                        except Exception:  # noqa: BLE001 - the exchange may be unreachable too
+                            log.exception("clean stop failed after repeated tick errors")
+                            return self.state.halted
+                    # back off (capped) so a flapping API is not hammered, then retry
+                    self.sleep(min(self.cfg.interval * 2 ** min(fails, 4), 60.0))
+                    continue
+                fails = 0
                 if reason:
                     return self._stop(reason)
                 self.sleep(self.cfg.interval)

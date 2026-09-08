@@ -75,6 +75,12 @@ class Dashboard:
         self.sports_db = sd / "sports_data.sqlite"
         self.sports_stop_file = sd / "SPORTS_STOP"
         self.sports_pause_file = sd / "SPORTS_PAUSE"
+        # Files whose freshness stands in for a process heartbeat, plus the crypto
+        # decision log the live-signal table reads. All local; nothing leaves the box.
+        self.state_dir = sd
+        self.crypto_db = sd / "market_data.sqlite"  # written by `kalshi-bot record`
+        self.params_file = sd / "params.json"  # written by `kalshi-bot learn`
+        self.decision_log = sd / "decisions.jsonl"  # written by the crypto loop
 
     @staticmethod
     def _read(path: Path) -> dict[str, Any] | None:
@@ -331,6 +337,109 @@ class Dashboard:
             return False
         return True
 
+    # ------------------------------------------------------------ health & signals
+
+    def _file_age(self, path: Path, now: float) -> float | None:
+        try:
+            return now - path.stat().st_mtime
+        except OSError:
+            return None
+
+    @staticmethod
+    def _age_str(a: float | None) -> str:
+        if a is None:
+            return "—"
+        a = int(a)
+        if a < 90:
+            return f"{a}s ago"
+        if a < 5400:
+            return f"{a // 60}m ago"
+        return f"{a // 3600}h ago"
+
+    def health(self, now: float | None = None) -> dict[str, Any]:
+        """One row per process, alive/slow/down from the freshness of the file each
+        one keeps writing. Purely local: no exchange calls, nothing leaves the box."""
+        now = time.time() if now is None else now
+        procs: list[dict[str, Any]] = []
+
+        def by_age(name: str, age: float | None, fresh: float, stale: float) -> None:
+            state = "down" if age is None else "ok" if age <= fresh else "warn" if age <= stale else "down"
+            procs.append({"name": name, "state": state, "detail": self._age_str(age)})
+
+        # recorders append to their sqlite files every few seconds while alive
+        by_age("crypto record", self._file_age(self.crypto_db, now), 120, 900)
+        by_age("sports record", self._file_age(self.sports_db, now), 120, 900)
+        # live loops carry their own heartbeat in their state files
+        snap = self.snapshot(now)
+        cs = snap.get("state") or {}
+        ct = cs.get("last_tick_ts")
+        procs.append({
+            "name": "crypto live",
+            "state": "ok" if snap.get("alive") else "warn" if snap.get("heartbeat") in ("paused", "quiet") else "down",
+            "detail": self._age_str(None if ct is None else now - float(ct)) if ct else "not running",
+        })
+        sp = self.sports_snapshot(now)
+        ss = sp.get("status") or {}
+        st = ss.get("ts")
+        procs.append({
+            "name": "sports live",
+            "state": "ok" if sp.get("alive") else "warn" if sp.get("pause_file_present") else "down",
+            "detail": self._age_str(None if st is None else now - float(st)) if st else "not running",
+        })
+        # the learner rewrites params.json when it promotes; treat a recent write as alive
+        pa = self._file_age(self.params_file, now)
+        procs.append({
+            "name": "learn",
+            "state": "ok" if pa is not None and pa < 7200 else "warn" if pa is not None else "down",
+            "detail": ("updated " + self._age_str(pa)) if pa is not None else "no params yet",
+        })
+        procs.append({"name": "dashboard", "state": "ok", "detail": "serving"})
+        return {"now": now, "procs": procs}
+
+    def signals(self, limit: int = 8) -> dict[str, Any]:
+        """The crypto loop's most recent decision per market, so the dashboard can
+        show what the model saw and why it did or did not trade. Reads the tail of
+        the decision log only, so it stays cheap however large the log grows."""
+        if not self.decision_log.exists():
+            return {"signals": []}
+        try:
+            with self.decision_log.open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 65536))
+                data = fh.read().decode("utf-8", "ignore")
+        except OSError:
+            return {"signals": []}
+        rows: dict[str, dict[str, Any]] = {}
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)  # a truncated first line is skipped
+            except ValueError:
+                continue
+            tk = r.get("ticker")
+            if tk:
+                rows[tk] = r  # later lines win: the latest decision per market
+        latest = sorted(rows.values(), key=lambda r: r.get("ts") or 0, reverse=True)[:limit]
+        out = []
+        for r in latest:
+            inp = r.get("inputs") or {}
+            out.append({
+                "ticker": r.get("ticker"),
+                "action": r.get("action"),
+                "reason": r.get("reason"),
+                "side": r.get("side"),
+                "price": r.get("price"),
+                "edge": r.get("edge"),
+                "p_yes": inp.get("p_yes"),
+                "edge_yes": inp.get("edge_yes"),
+                "edge_no": inp.get("edge_no"),
+                "ts": r.get("ts"),
+            })
+        return {"signals": out}
+
 
 def _query(path: str, key: str) -> str | None:
     values = parse_qs(urlparse(path).query).get(key) or []
@@ -399,6 +508,10 @@ def make_handler(dash: Dashboard, password: str | None = None) -> type[BaseHTTPR
             elif self.path.startswith("/api/sports"):
                 body = json.dumps(dash.sports_snapshot(), default=str).encode()
                 self._send(HTTPStatus.OK, body, "application/json")
+            elif self.path == "/api/health":
+                self._send(HTTPStatus.OK, json.dumps(dash.health()).encode(), "application/json")
+            elif self.path == "/api/signals":
+                self._send(HTTPStatus.OK, json.dumps(dash.signals()).encode(), "application/json")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
 

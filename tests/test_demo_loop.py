@@ -1377,3 +1377,43 @@ def test_dashboard_prefers_the_live_heartbeat_and_switches_files(tmp_path):
     # live gone quiet: the running paper loop is shown instead
     LoopState(trades=3, last_tick_ts=now - 600).save(live)
     assert dash.snapshot(now=now)["state"]["trades"] == 9
+def test_bad_tick_is_survived_then_halts(tmp_path):
+    """A tick that raises must not kill the loop: it retries with backoff and only
+    halts after max_tick_failures in a row, cleanly (no exception escapes run())."""
+
+    class ExplodingClient(FakeClient):
+        def get_markets(self, *args, **kw):
+            raise RuntimeError("exchange on fire")
+
+    client = ExplodingClient({0: "yes"})
+    loop, slept = make(tmp_path, client, loss_cap=100, profit_target=100, max_tick_failures=3)
+    reason = loop.run()  # must return, not raise
+    assert "consecutive tick errors" in reason
+    assert loop.state.halted
+    # the first two failures back off and retry; the third halts before sleeping
+    assert len(slept) == 2
+    assert slept == sorted(slept)  # exponential backoff is non-decreasing
+    # the failures were written to the event feed for the dashboard
+    alerts = (tmp_path / "alerts.jsonl").read_text()
+    assert "tick error" in alerts
+
+
+def test_transient_tick_error_recovers(tmp_path):
+    """One bad tick, then healthy: the loop keeps going and does not halt."""
+
+    class FlakyClient(FakeClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.boom = 1
+
+        def get_markets(self, *args, **kw):
+            if self.boom > 0:
+                self.boom -= 1
+                raise RuntimeError("transient blip")
+            return super().get_markets(*args, **kw)
+
+    client = FlakyClient({i: ("yes" if i % 2 == 0 else "no") for i in range(4)})
+    loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100, max_trades=2)
+    reason = loop.run()
+    assert reason.startswith("max trades")  # recovered from the blip and traded normally
+    assert client.boom == 0  # the transient error was consumed, not fatal

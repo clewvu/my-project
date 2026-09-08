@@ -1,0 +1,436 @@
+<title>Lewis Wealth Global — Two-Desk Control Room</title>
+<style>
+  :root{
+    --bg:#0d1014; --surface:#151a21; --surface-2:#1b222b; --surface-3:#222c37;
+    --hair:#252f3a; --hair-soft:#1d252e;
+    --ink:#e8eef4; --ink-2:#9fadbc; --muted:#64717f;
+    --accent:#7aa2f7; --accent-dim:#28375a;
+    --good:#4ec9a0; --good-dim:#16342c;
+    --bad:#f0655f; --bad-dim:#3a1e1d;
+    --warn:#f0883e; --warn-dim:#3a271543;
+    --crypto:#e8b13a; --sports:#7aa2f7;
+    --mono:ui-monospace,"JetBrains Mono","SF Mono","Cascadia Code",Consolas,monospace;
+    --sans:"Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",sans-serif;
+    --r:13px;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:var(--bg);color:var(--ink);}
+  body{font:14px/1.5 var(--sans);-webkit-font-smoothing:antialiased;
+       background-image:radial-gradient(1200px 600px at 80% -10%, #131a24 0%, transparent 60%);}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums;}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;}
+  .up{color:var(--good);} .down{color:var(--bad);} .flat{color:var(--ink-2);}
+  .lbl{color:var(--muted);font-size:10.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;}
+  a{color:var(--accent);}
+  ::selection{background:var(--accent-dim);}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:0 20px 64px;}
+
+  /* ---------- masthead ---------- */
+  .masthead{position:sticky;top:0;z-index:20;background:color-mix(in oklab,var(--bg) 88%,transparent);
+            backdrop-filter:blur(10px);border-bottom:1px solid var(--hair);}
+  .mast-in{max-width:1180px;margin:0 auto;padding:14px 20px;display:grid;
+           grid-template-columns:auto 1fr auto;gap:22px;align-items:center;}
+  .brand{display:flex;flex-direction:column;gap:2px;}
+  .brand .mark{display:flex;align-items:center;gap:9px;font-weight:700;letter-spacing:.02em;font-size:15px;}
+  .brand .mark .glyph{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
+       background:linear-gradient(135deg,var(--crypto),var(--sports));color:#0d1014;font-weight:800;font-size:13px;
+       font-family:var(--mono);}
+  .brand .sub{color:var(--muted);font-size:11px;letter-spacing:.04em;}
+
+  .mast-figs{display:flex;gap:30px;justify-content:center;flex-wrap:wrap;}
+  .figs-item{display:flex;flex-direction:column;gap:1px;}
+  .figs-item .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;line-height:1.1;}
+  .figs-item .v.big{font-size:26px;}
+
+  .mast-ctrl{display:flex;align-items:center;gap:8px;}
+  .live-tag{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;
+            border:1px solid color-mix(in oklab,var(--bad) 45%,transparent);color:var(--bad);
+            font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:var(--bad-dim);}
+  .live-tag .dot{width:7px;height:7px;border-radius:50%;background:var(--bad);animation:pulse 1.8s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 color-mix(in oklab,var(--bad) 60%,transparent);}
+                   50%{opacity:.6;box-shadow:0 0 0 5px transparent;}}
+  @media (prefers-reduced-motion:reduce){.live-tag .dot{animation:none;}}
+
+  button{font:inherit;font-weight:600;cursor:pointer;border-radius:9px;border:1px solid var(--hair);
+         background:var(--surface-2);color:var(--ink);padding:8px 13px;transition:background .15s,border-color .15s;}
+  button:hover{background:var(--surface-3);}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+  button.kill{background:var(--bad-dim);border-color:color-mix(in oklab,var(--bad) 40%,transparent);color:var(--bad);}
+  button.kill:hover{background:color-mix(in oklab,var(--bad) 22%,var(--surface));}
+
+  /* ---------- process health rail ---------- */
+  .health{max-width:1180px;margin:0 auto;padding:9px 20px;display:flex;gap:8px;flex-wrap:wrap;
+          border-bottom:1px solid var(--hair-soft);}
+  .proc{display:flex;align-items:center;gap:7px;padding:5px 10px;border-radius:8px;background:var(--surface);
+        border:1px solid var(--hair-soft);font-size:11.5px;}
+  .proc .d{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none;}
+  .proc.ok .d{background:var(--good);box-shadow:0 0 0 3px var(--good-dim);}
+  .proc.warnp .d{background:var(--warn);box-shadow:0 0 0 3px var(--warn-dim);}
+  .proc.down .d{background:var(--bad);box-shadow:0 0 0 3px var(--bad-dim);}
+  .proc .nm{font-family:var(--mono);color:var(--ink-2);}
+  .proc .ago{color:var(--muted);font-size:10.5px;}
+
+  /* ---------- tabs ---------- */
+  .tabs{display:flex;gap:4px;margin:22px 0 20px;background:var(--surface);padding:5px;border-radius:11px;
+        border:1px solid var(--hair);width:fit-content;}
+  .tab{padding:8px 18px;border-radius:8px;border:none;background:transparent;color:var(--ink-2);font-weight:600;}
+  .tab[aria-selected="true"]{background:var(--surface-3);color:var(--ink);box-shadow:0 1px 0 rgba(0,0,0,.3);}
+  .tab .badge{display:inline-block;width:7px;height:7px;border-radius:50%;margin-left:8px;vertical-align:middle;}
+  .tab .badge.c{background:var(--crypto);} .tab .badge.s{background:var(--sports);}
+
+  .panel{display:none;} .panel.on{display:block;animation:fade .25s ease;}
+  @keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
+
+  /* ---------- grid + cards ---------- */
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;}
+  .card{background:var(--surface);border:1px solid var(--hair);border-radius:var(--r);padding:16px 18px;}
+  .card.desk-c{border-top:2px solid var(--crypto);}
+  .card.desk-s{border-top:2px solid var(--sports);}
+  .card h3{margin:0 0 2px;font-size:13px;font-weight:600;letter-spacing:.01em;}
+  .card .cardhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;}
+  .card .cardhead .meta{color:var(--muted);font-size:11px;}
+  .span3{grid-column:span 3;} .span4{grid-column:span 4;} .span5{grid-column:span 5;}
+  .span6{grid-column:span 6;} .span7{grid-column:span 7;} .span8{grid-column:span 8;} .span12{grid-column:span 12;}
+
+  .kpi .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:27px;font-weight:600;margin-top:7px;line-height:1;}
+  .kpi .d{color:var(--ink-2);font-size:12px;margin-top:7px;}
+
+  /* meters */
+  .meter{margin-top:11px;}
+  .meter .track{height:7px;border-radius:4px;background:var(--surface-3);overflow:hidden;}
+  .meter .fill{height:100%;border-radius:4px;background:var(--good);transition:width .5s ease;}
+  .meter .fill.warn{background:var(--warn);} .meter .fill.crit{background:var(--bad);}
+  .meter .cap{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:6px;}
+
+  /* funding ledger */
+  .shard{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid var(--hair-soft);}
+  .shard:last-child{border-bottom:none;}
+  .shard .tag{font-family:var(--mono);font-size:11px;padding:3px 8px;border-radius:6px;background:var(--surface-3);color:var(--ink-2);}
+  .shard .who{font-size:12.5px;color:var(--ink-2);}
+  .shard .who b{color:var(--ink);font-weight:600;}
+  .shard .bal{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:16px;font-weight:600;}
+  .chip{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+        padding:2px 7px;border-radius:5px;margin-left:8px;}
+  .chip.ok{background:var(--good-dim);color:var(--good);}
+  .chip.warn{background:var(--warn-dim);color:var(--warn);}
+
+  /* tables */
+  .tbl-wrap{overflow-x:auto;margin:0 -4px;}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--hair-soft);white-space:nowrap;}
+  th{color:var(--muted);font-weight:600;font-size:10px;letter-spacing:.07em;text-transform:uppercase;}
+  tr:last-child td{border-bottom:none;}
+  td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;}
+  td.tk{font-family:var(--mono);color:var(--ink-2);font-size:11.5px;}
+  .side{display:inline-block;min-width:32px;text-align:center;padding:2px 6px;border-radius:5px;font-size:10.5px;
+        font-weight:700;border:1px solid var(--hair);color:var(--ink-2);}
+  .side.yes{color:var(--good);border-color:color-mix(in oklab,var(--good) 35%,transparent);}
+  .side.no{color:var(--bad);border-color:color-mix(in oklab,var(--bad) 35%,transparent);}
+  .verdict{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;}
+  .verdict .vd{width:7px;height:7px;border-radius:50%;flex:none;}
+  .verdict.take .vd{background:var(--good);} .verdict.take{color:var(--good);}
+  .verdict.skip .vd{background:var(--muted);} .verdict.skip{color:var(--ink-2);}
+  .st{display:inline-block;padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:700;border:1px solid var(--hair);color:var(--ink-2);}
+  .st.open{color:var(--accent);border-color:var(--accent-dim);}
+  .st.won{color:var(--good);} .st.lost{color:var(--bad);}
+  .bar-mini{display:inline-block;height:6px;border-radius:3px;background:var(--accent);vertical-align:middle;}
+
+  /* equity chart */
+  .plot{height:200px;position:relative;margin-top:4px;}
+  .plot svg{width:100%;height:100%;display:block;}
+  .gl{stroke:var(--hair-soft);stroke-width:1;}
+  .base{stroke:var(--hair);stroke-width:1;stroke-dasharray:3 3;}
+  .aline{fill:none;stroke:var(--crypto);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;}
+  .aarea{fill:var(--crypto);opacity:.09;}
+  .aend{fill:var(--crypto);stroke:var(--surface);stroke-width:2.5;}
+  .plot text{fill:var(--muted);font-size:10.5px;font-family:var(--mono);}
+
+  /* activity feed */
+  .feed{display:flex;flex-direction:column;max-height:320px;overflow-y:auto;}
+  .ev{display:grid;grid-template-columns:52px 10px 84px 1fr;gap:10px;align-items:baseline;padding:8px 2px;
+      border-bottom:1px solid var(--hair-soft);font-size:12.5px;}
+  .ev:last-child{border-bottom:none;}
+  .ev .t{color:var(--muted);font-family:var(--mono);font-size:11px;}
+  .ev .lv{width:7px;height:7px;border-radius:50%;background:var(--muted);position:relative;top:3px;}
+  .ev.info .lv{background:var(--accent);} .ev.warn .lv{background:var(--warn);} .ev.good .lv{background:var(--good);}
+  .ev .src{color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;}
+  .ev .x{color:var(--ink-2);}
+  .ev .x b{color:var(--ink);font-weight:600;}
+
+  .foot{margin-top:34px;padding-top:16px;border-top:1px solid var(--hair-soft);color:var(--muted);font-size:11.5px;
+        display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+
+  @media (max-width:900px){
+    .mast-in{grid-template-columns:1fr auto;gap:12px;}
+    .mast-figs{grid-column:1 / -1;order:3;justify-content:flex-start;gap:22px;}
+    .span3,.span4,.span5,.span6,.span7,.span8{grid-column:span 12;}
+    .kpi.span3{grid-column:span 6;}
+  }
+  @media (max-width:560px){
+    .kpi.span3{grid-column:span 12;}
+    .tabs{width:100%;} .tab{flex:1;text-align:center;padding:8px 6px;}
+  }
+</style>
+
+<header class="masthead">
+  <div class="mast-in">
+    <div class="brand">
+      <div class="mark"><span class="glyph">LW</span> LEWIS WEALTH GLOBAL</div>
+      <div class="sub">Two-desk control room · one account · shards 0 / 2 / 3</div>
+    </div>
+    <div class="mast-figs">
+      <div class="figs-item">
+        <span class="lbl">Account equity</span>
+        <span class="v big">$189.10</span>
+      </div>
+      <div class="figs-item">
+        <span class="lbl">Today, net of fees</span>
+        <span class="v up">+$14.59</span>
+      </div>
+      <div class="figs-item">
+        <span class="lbl">At risk now</span>
+        <span class="v">$50.00</span>
+      </div>
+    </div>
+    <div class="mast-ctrl">
+      <span class="live-tag"><span class="dot"></span>Live · real money</span>
+      <button class="kill" onclick="return false">Stop all</button>
+    </div>
+  </div>
+  <div class="health" id="health">
+    <div class="proc ok"><span class="d"></span><span class="nm">crypto&nbsp;record</span><span class="ago">3s</span></div>
+    <div class="proc ok"><span class="d"></span><span class="nm">sports&nbsp;record</span><span class="ago">6s</span></div>
+    <div class="proc ok"><span class="d"></span><span class="nm">crypto&nbsp;live</span><span class="ago">2s</span></div>
+    <div class="proc ok"><span class="d"></span><span class="nm">sports&nbsp;live</span><span class="ago">11s</span></div>
+    <div class="proc warnp"><span class="d"></span><span class="nm">learn</span><span class="ago">learns in 47m</span></div>
+    <div class="proc ok"><span class="d"></span><span class="nm">dashboard</span><span class="ago">:8790</span></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" aria-selected="true" data-t="overview">Overview</button>
+    <button class="tab" role="tab" aria-selected="false" data-t="crypto">Crypto <span class="badge c"></span></button>
+    <button class="tab" role="tab" aria-selected="false" data-t="sports">Sports <span class="badge s"></span></button>
+  </div>
+
+  <!-- ========================= OVERVIEW ========================= -->
+  <section class="panel on" id="overview">
+    <div class="grid">
+      <!-- desk summary: crypto -->
+      <div class="card desk-c kpi span3">
+        <span class="lbl">Crypto · realised P&amp;L</span>
+        <div class="v up">+$14.59</div>
+        <div class="d">19 settled · 17W / 2L · <span class="up">89%</span></div>
+      </div>
+      <div class="card desk-s kpi span3">
+        <span class="lbl">Sports · closing-line value</span>
+        <div class="v up">+2.1c</div>
+        <div class="d">vs sharp consensus · 6 settled · leading edge</div>
+      </div>
+      <div class="card kpi span3">
+        <span class="lbl">Combined net today</span>
+        <div class="v up">+$14.59</div>
+        <div class="d">crypto +$14.59 · sports +$0.00 (paper→live)</div>
+      </div>
+      <div class="card kpi span3">
+        <span class="lbl">Fees paid</span>
+        <div class="v">$0.98</div>
+        <div class="d">6.3% of gross · maker-first saving spread</div>
+      </div>
+
+      <!-- funding ledger -->
+      <div class="card span5">
+        <div class="cardhead"><h3>Funding ledger</h3><span class="meta">$189.10 across 3 shards</span></div>
+        <div class="shard">
+          <span class="tag">shard 0</span>
+          <span class="who"><b>Default</b> · deposits, non-MLB sports</span>
+          <span class="bal">$82.05</span>
+        </div>
+        <div class="shard">
+          <span class="tag">shard 2</span>
+          <span class="who"><b>Crypto</b> · BTC + DOGE 15m<span class="chip ok">funded</span></span>
+          <span class="bal">$57.04</span>
+        </div>
+        <div class="shard">
+          <span class="tag">shard 3</span>
+          <span class="who"><b>MLB</b> · sports moneyline<span class="chip ok">funded</span></span>
+          <span class="bal">$50.00</span>
+        </div>
+        <div class="meta" style="margin-top:11px">Preflight funds shard 2 from shard 0 only, by the shortfall. Never pulls shard 3.</div>
+      </div>
+
+      <!-- risk cockpit -->
+      <div class="card span7">
+        <div class="cardhead"><h3>Risk cockpit</h3><span class="meta">both desks · caps and breakers</span></div>
+        <div class="grid" style="gap:18px">
+          <div class="span6">
+            <span class="lbl" style="color:var(--crypto)">Crypto</span>
+            <div class="meter">
+              <div class="track"><div class="fill" style="width:0%"></div></div>
+              <div class="cap"><span>loss cap headroom</span><span>$50.00 of $50 left</span></div>
+            </div>
+            <div class="meta" style="margin-top:9px">Loss-streak breaker <b style="color:var(--ink)">0 / 3</b> · drawdown from peak <span class="flat">$0.00</span></div>
+          </div>
+          <div class="span6">
+            <span class="lbl" style="color:var(--sports)">Sports</span>
+            <div class="meter">
+              <div class="track"><div class="fill" style="width:12%"></div></div>
+              <div class="cap"><span>daily loss cap</span><span>$22.00 of $25 left</span></div>
+            </div>
+            <div class="meta" style="margin-top:9px">Open exposure <b style="color:var(--ink)">$50 / $60</b> · breaker <b style="color:var(--ink)">1 / 4</b> · per-game $10</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- unified activity -->
+      <div class="card span12">
+        <div class="cardhead"><h3>Activity — both desks, latest first</h3><span class="meta">18 shown · 1 needs attention</span></div>
+        <div class="feed">
+          <div class="ev good"><span class="t">18:48</span><span class="lv"></span><span class="src">crypto·live</span><span class="x">Loop started · <b>fairvalue</b>, KXBTC15M + KXDOGE15M, $10/trade, loss cap $50</span></div>
+          <div class="ev info"><span class="t">18:48</span><span class="lv"></span><span class="src">crypto·live</span><span class="x">Skip <b>KXBTC15M-2000</b>: best edge −0.019 (yes) below margin 0.020</span></div>
+          <div class="ev info"><span class="t">18:48</span><span class="lv"></span><span class="src">crypto·live</span><span class="x">Skip <b>KXDOGE15M-2000</b>: confidence 0.384 below min 0.65</span></div>
+          <div class="ev good"><span class="t">18:45</span><span class="lv"></span><span class="src">crypto·live</span><span class="x">Sold KXBTC15M-1930 ×8 @ 0.560 → <b class="up">+$0.42</b></span></div>
+          <div class="ev warn"><span class="t">18:44</span><span class="lv"></span><span class="src">sports·live</span><span class="x">Odds feed lag <b>112s</b> on MLB — forced fresh pull before confirm</span></div>
+          <div class="ev info"><span class="t">18:44</span><span class="lv"></span><span class="src">funding</span><span class="x">Transfer $50.00 shard 0 → shard 3 (MLB) confirmed</span></div>
+          <div class="ev good"><span class="t">18:31</span><span class="lv"></span><span class="src">crypto·live</span><span class="x">Sold KXBTC15M-1845 ×8 → settled <b class="up">+$3.36</b></span></div>
+          <div class="ev info"><span class="t">18:30</span><span class="lv"></span><span class="src">sports·live</span><span class="x">Entry <b>MLB LAD/SD</b> NO ×6 @ 0.44 · edge +3.1c vs consensus 0.61</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================= CRYPTO ========================= -->
+  <section class="panel" id="crypto">
+    <div class="grid">
+      <div class="card desk-c kpi span3"><span class="lbl">Realised P&amp;L, after fees</span><div class="v up">+$14.59</div><div class="d">last settlement 18:45</div></div>
+      <div class="card kpi span3"><span class="lbl">Win rate</span><div class="v">89%</div><div class="d">+$0.77 per settled trade</div></div>
+      <div class="card kpi span3"><span class="lbl">Per trade</span><div class="v">$10.00</div><div class="d">up to $20 when a tier earns it</div></div>
+      <div class="card kpi span3"><span class="lbl">Strategy</span><div class="v" style="font-size:20px">Fair value</div><div class="d">margin 0.02 · vol 30 min · calib +0.00 ×1.00</div></div>
+
+      <!-- equity curve -->
+      <div class="card span8">
+        <div class="cardhead"><h3>Equity curve — cumulative net by settlement</h3><span class="meta">peak +$14.59 · trough −$2.40</span></div>
+        <div class="plot" id="plot"></div>
+      </div>
+
+      <!-- open positions + series -->
+      <div class="card span4">
+        <div class="cardhead"><h3>Open positions</h3><span class="meta">1 open</span></div>
+        <div class="shard" style="grid-template-columns:auto 1fr auto">
+          <span class="side no">NO</span>
+          <span class="who"><b class="mono">KXBTC15M-2000</b> ×8 · filled @ 0.570</span>
+          <span class="bal mono">3:41</span>
+        </div>
+        <div class="cardhead" style="margin-top:16px"><h3>By series</h3></div>
+        <div class="shard" style="grid-template-columns:auto 1fr auto"><span></span><span class="who">KXBTC15M · 14 trades · 93%</span><span class="bal up">+$12.14</span></div>
+        <div class="shard" style="grid-template-columns:auto 1fr auto"><span></span><span class="who">KXDOGE15M · 5 trades · 80%</span><span class="bal up">+$2.45</span></div>
+      </div>
+
+      <!-- LIVE SIGNAL TABLE (the new panel) -->
+      <div class="card span12">
+        <div class="cardhead"><h3>Live model view — what the fair-value model sees this tick</h3><span class="meta">updated 2s ago · trades only when confident</span></div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Market</th><th class="num">Model fair</th><th class="num">Ask</th><th class="num">Edge</th><th class="num">Confidence</th><th class="num">TTC</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr><td class="tk">KXBTC15M-2000</td><td class="num">0.561</td><td class="num">0.580</td><td class="num down">−0.019</td><td class="num">0.71</td><td class="num">6:12</td>
+                <td><span class="verdict skip"><span class="vd"></span>Skip · edge below margin 0.020</span></td></tr>
+            <tr><td class="tk">KXDOGE15M-2000</td><td class="num">0.384</td><td class="num">0.470</td><td class="num down">−0.086</td><td class="num down">0.384</td><td class="num">6:12</td>
+                <td><span class="verdict skip"><span class="vd"></span>Skip · confidence below 0.65</span></td></tr>
+            <tr><td class="tk">KXBTC15M-2015</td><td class="num">0.642</td><td class="num">0.590</td><td class="num up">+0.037</td><td class="num up">0.79</td><td class="num">21:12</td>
+                <td><span class="verdict take"><span class="vd"></span>Trade · YES ×9 @ 0.590, maker-first</span></td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <!-- settled trades -->
+      <div class="card span12">
+        <div class="cardhead"><h3>Settled trades — latest first</h3></div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Time</th><th>Market</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Result</th><th class="num">Net</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">18:45</td><td class="tk">KXBTC15M-1930</td><td><span class="side no">NO</span></td><td class="num">8</td><td class="num">0.560</td><td>SOLD</td><td class="num up">+$0.42</td></tr>
+            <tr><td class="mono">18:31</td><td class="tk">KXBTC15M-1845</td><td><span class="side no">NO</span></td><td class="num">8</td><td class="num">0.580</td><td>NO</td><td class="num up">+$3.36</td></tr>
+            <tr><td class="mono">18:30</td><td class="tk">KXDOGE15M-1830</td><td><span class="side no">NO</span></td><td class="num">8</td><td class="num">0.600</td><td>SOLD</td><td class="num up">+$0.19</td></tr>
+            <tr><td class="mono">18:15</td><td class="tk">KXBTC15M-1815</td><td><span class="side no">NO</span></td><td class="num">9</td><td class="num">0.540</td><td>SOLD</td><td class="num up">+$3.91</td></tr>
+            <tr><td class="mono">17:00</td><td class="tk">KXBTC15M-1700</td><td><span class="side no">NO</span></td><td class="num">4</td><td class="num">0.600</td><td>YES</td><td class="num down">−$2.40</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================= SPORTS ========================= -->
+  <section class="panel" id="sports">
+    <div class="grid">
+      <div class="card desk-s kpi span3"><span class="lbl">Closing-line value</span><div class="v up">+2.1c</div><div class="d">vs consensus · the leading edge signal</div></div>
+      <div class="card kpi span3"><span class="lbl">Net, after fees</span><div class="v flat">+$0.00</div><div class="d">6 settled · 4W · early live sample</div></div>
+      <div class="card kpi span3"><span class="lbl">Open positions</span><div class="v">3</div><div class="d">$50.00 at risk · 2 MLB · 1 NFL</div></div>
+      <div class="card kpi span3"><span class="lbl">Strategy</span><div class="v" style="font-size:20px">Consensus gap</div><div class="d">margin 0.03 · size ×1.00 · v3</div></div>
+
+      <div class="card span12">
+        <div class="cardhead"><h3>Sports positions — open first, then latest settled</h3><span class="meta">3 open · 6 settled shown</span></div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Opened</th><th>Market</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Consensus</th><th class="num">Edge</th><th>Status</th><th class="num">Net</th><th class="num">CLV</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">18:30</td><td class="tk">MLB-LAD-SD</td><td><span class="side no">NO</span> <span class="meta">SD</span></td><td class="num">6</td><td class="num">0.44</td><td class="num">0.610</td><td class="num up">+3.1c</td><td><span class="st open">open</span></td><td class="num flat">–</td><td class="num up">+1.4c</td></tr>
+            <tr><td class="mono">17:55</td><td class="tk">MLB-NYY-BOS</td><td><span class="side yes">YES</span> <span class="meta">NYY</span></td><td class="num">5</td><td class="num">0.53</td><td class="num">0.575</td><td class="num up">+2.9c</td><td><span class="st open">open</span></td><td class="num flat">–</td><td class="num up">+0.8c</td></tr>
+            <tr><td class="mono">16:40</td><td class="tk">NFL-KC-BUF</td><td><span class="side yes">YES</span> <span class="meta">KC</span></td><td class="num">4</td><td class="num">0.61</td><td class="num">0.660</td><td class="num up">+3.4c</td><td><span class="st open">open</span></td><td class="num flat">–</td><td class="num down">−0.5c</td></tr>
+            <tr><td class="mono">Sat</td><td class="tk">MLB-HOU-SEA</td><td><span class="side yes">YES</span> <span class="meta">HOU</span></td><td class="num">5</td><td class="num">0.48</td><td class="num">0.520</td><td class="num up">+2.2c</td><td><span class="st won">settled · WON</span></td><td class="num up">+$2.35</td><td class="num up">+3.0c</td></tr>
+            <tr><td class="mono">Sat</td><td class="tk">MLB-ATL-NYM</td><td><span class="side no">NO</span> <span class="meta">NYM</span></td><td class="num">6</td><td class="num">0.51</td><td class="num">0.560</td><td class="num up">+2.6c</td><td><span class="st lost">settled · LOST</span></td><td class="num down">−$3.06</td><td class="num up">+1.9c</td></tr>
+          </tbody>
+        </table></div>
+        <div class="meta" style="margin-top:11px">Short-run P&amp;L is noise; <b style="color:var(--sports)">CLV positive</b> across the book is the honest sign the edge is real. Sharp books weighted 3:1, dispersion ≤4pp.</div>
+      </div>
+
+      <div class="card span12">
+        <div class="cardhead"><h3>Sports activity — latest first</h3></div>
+        <div class="feed">
+          <div class="ev warn"><span class="t">18:44</span><span class="lv"></span><span class="src">sports·live</span><span class="x">Odds feed lag <b>112s</b> on MLB — forced fresh pull before confirm</span></div>
+          <div class="ev info"><span class="t">18:30</span><span class="lv"></span><span class="src">sports·live</span><span class="x">Entry <b>MLB LAD/SD</b> NO ×6 @ 0.44 · edge +3.1c · consensus 0.610 (5 books, 2 sharp)</span></div>
+          <div class="ev info"><span class="t">18:12</span><span class="lv"></span><span class="src">sports·live</span><span class="x">Skip <b>NBA-DEN-GSW</b>: dispersion 5.1pp above 4pp gate</span></div>
+          <div class="ev good"><span class="t">15:20</span><span class="lv"></span><span class="src">sports·learn</span><span class="x">Params v3: CLV CI[0] &gt; 0 over 50 results → size ×1.25</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <span>Design mockup · Lewis Wealth Global control room · data from tonight's live session</span>
+    <span>Stop files: <span class="mono">STOP</span> · <span class="mono">SPORTS_STOP</span> · dashboard :8790</span>
+  </div>
+</main>
+
+<script>
+  // tab switching
+  const tabs=[...document.querySelectorAll('.tab')];
+  const panels={overview:document.getElementById('overview'),crypto:document.getElementById('crypto'),sports:document.getElementById('sports')};
+  tabs.forEach(t=>t.addEventListener('click',()=>{
+    tabs.forEach(x=>x.setAttribute('aria-selected',x===t));
+    for(const k in panels)panels[k].classList.toggle('on',k===t.dataset.t);
+    if(t.dataset.t==='crypto')drawCurve();
+  }));
+
+  // equity curve (real settlement nets from tonight, cumulative)
+  const nets=[1.68,0.09,0.61,0.79,-2.40,3.91,0.19,0.34,3.36,0.42];
+  function drawCurve(){
+    const plot=document.getElementById('plot'); if(!plot||plot.dataset.drawn)return;
+    const W=plot.clientWidth||760,H=plot.clientHeight||200,L=46,R=54,T=14,B=24;
+    const pts=[{i:0,y:0}];let acc=0;nets.forEach((n,i)=>{acc+=n;pts.push({i:i+1,y:acc});});
+    const ys=pts.map(p=>p.y);let lo=Math.min(0,...ys),hi=Math.max(0,...ys);const pad=(hi-lo)*0.12;lo-=pad;hi+=pad;
+    const x=i=>L+(W-L-R)*(i/(pts.length-1)),y=v=>T+(H-T-B)*(1-(v-lo)/(hi-lo));
+    const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+    const mk=(tag,a,txt)=>{const e=document.createElementNS(ns,tag);for(const k in a)e.setAttribute(k,a[k]);if(txt!==undefined)e.textContent=txt;svg.appendChild(e);return e;};
+    for(let k=0;k<=4;k++){const v=lo+(hi-lo)*k/4,yy=y(v);mk('line',{x1:L,x2:W-R,y1:yy,y2:yy,class:'gl'});
+      mk('text',{x:L-8,y:yy+3.5,'text-anchor':'end'},(v>=0?'+':'−')+'$'+Math.abs(v).toFixed(0));}
+    mk('line',{x1:L,x2:W-R,y1:y(0),y2:y(0),class:'base'});
+    const d=pts.map((p,k)=>(k?'L':'M')+x(p.i).toFixed(1)+' '+y(p.y).toFixed(1)).join(' ');
+    mk('path',{d:d+` L${x(pts[pts.length-1].i).toFixed(1)} ${y(0)} L${x(0)} ${y(0)} Z`,class:'aarea'});
+    mk('path',{d,class:'aline'});
+    const last=pts[pts.length-1];mk('circle',{cx:x(last.i),cy:y(last.y),r:4,class:'aend'});
+    mk('text',{x:x(last.i)+9,y:y(last.y)+3.5,fill:'var(--crypto)'},'+$'+last.y.toFixed(2));
+    plot.appendChild(svg);plot.dataset.drawn='1';
+  }
+  window.addEventListener('resize',()=>{const p=document.getElementById('plot');if(p){p.innerHTML='';delete p.dataset.drawn;}if(panels.crypto.classList.contains('on'))drawCurve();});
+</script>
