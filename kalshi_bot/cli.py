@@ -478,6 +478,7 @@ def _loop_config(args: argparse.Namespace):  # -> LoopConfig
         max_dollars=args.max_dollars,
         max_open_dollars=args.max_open_dollars,
         min_history_s=args.min_history,
+        allow_external_positions=args.allow_external_positions,
         entry=args.entry,
         maker_wait_s=args.maker_wait,
         reconcile_s=args.reconcile,
@@ -1285,6 +1286,12 @@ def _add_loop_args(
         default=None,
         help="fairvalue: require this many seconds of spot history before a market "
         "may trade (default: a full vol window); guards against thin/young feeds",
+    )
+    s.add_argument(
+        "--allow-external-positions",
+        action="store_true",
+        help="do not halt on positions in the loop's series that it did not open "
+        "(e.g. you trade the same series manually); ignores those tickers instead",
     )
     s.add_argument(
         "--entry",

@@ -44,7 +44,7 @@ $specs = @(
      match='kalshi-bot\.exe" learn'; stop=$null; state=$null },
   @{ name='dashboard';     exe=$bot;    args=@('demo-ui','--port','8790');
      match='kalshi-bot\.exe" demo-ui'; stop=$null; state=$null },
-  @{ name='crypto-live';   exe=$bot;    args=@('--env','prod','live-trade','--dollars','10','--max-dollars','20','--real-money','--yes');
+  @{ name='crypto-live';   exe=$bot;    args=@('--env','prod','live-trade','--dollars','10','--max-dollars','20','--allow-external-positions','--real-money','--yes');
      match='kalshi-bot\.exe" --env prod live-trade(?!.*--series)'; stop=(Join-Path $state 'STOP'); state=(Join-Path $state 'live_loop.json') },
   @{ name='sports-live';   exe=$sports; args=@('--env','prod','live-trade','--real-money','--dollars','5','--max-dollars','10','--loss-cap','50','--yes');
      match='kalshi-sports\.exe" --env prod live-trade'; stop=(Join-Path $state 'SPORTS_STOP'); state=$null }

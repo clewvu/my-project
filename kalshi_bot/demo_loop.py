@@ -140,6 +140,10 @@ class LoopConfig:
     pause_file: Path = Path("state/PAUSE")  # while present: no new entries, keep ticking
     alerts_path: Path | None = Path("state/alerts.jsonl")  # the dashboard's event feed
     reconcile_s: float = 120.0  # compare positions with the exchange this often; 0 = never
+    # tolerate positions on the loop's series that it did not open (e.g. the owner
+    # trading the same series by hand): ignore those extra tickers instead of
+    # halting. Own-position discrepancies still halt. Off by default (strict).
+    allow_external_positions: bool = False
     spot_source: str = "auto"  # fairvalue spot: auto (fresh DB tick, else REST) | db | rest
     spot_smooth_s: float = 10.0  # fairvalue: model spot is the mean over this many seconds
     stop_value: float = 0.10  # fairvalue: sell at a loss only when the model values the
@@ -669,6 +673,16 @@ class DemoLoop:
         problems: dict[str, str] = {}
         for ticker, qty in exchange.items():
             if ticker not in ours:
+                if self.cfg.allow_external_positions:
+                    # a position on our series the loop never opened: treat it as the
+                    # owner's own manual trade, ignore it, and keep trading ours.
+                    self.alerts.record(
+                        "info",
+                        self._alert_src,
+                        f"ignoring external position {qty:+.0f} on {ticker} (not opened by this loop)",
+                        now=now,
+                    )
+                    continue
                 problems[ticker] = (
                     f"exchange holds {qty:+.0f} on {ticker} that this loop did not open"
                 )

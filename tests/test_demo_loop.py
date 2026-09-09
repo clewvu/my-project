@@ -1441,3 +1441,17 @@ def test_cluster_exposure_cap_blocks_correlated_overexposure(tmp_path):
     loop2, _ = make(d2, client2, loss_cap=100, profit_target=100, dollars=2.0)
     loop2.run(max_ticks=1)
     assert len(client2.orders) == 2
+
+
+def test_allow_external_positions_ignores_manual_trades(tmp_path):
+    """With allow_external_positions, a position the loop never opened (the owner's
+    manual trade on the same series) is ignored, not halted."""
+    client = FakeClient({i: "yes" for i in range(6)}, fill=False)  # loop holds nothing of its own
+    client.positions_override = {"KXBTC15M-77": 3}  # a manual position the loop never opened
+    loop, _ = make(tmp_path, client, reconcile_s=60.0, max_trades=2,
+                   allow_external_positions=True)
+    reason = loop.run()
+    assert not loop.state.halted                    # the manual position did not halt it
+    alerts = _alerts(tmp_path)
+    assert any("ignoring external position" in a["text"] for a in alerts)
+    assert not [a for a in alerts if a["level"] == "halt"]
