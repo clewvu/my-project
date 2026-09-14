@@ -137,6 +137,7 @@ def make(tmp_path, client, **cfg_kw):
     cfg_kw.setdefault("spot_db", None)
     cfg_kw.setdefault("alerts_path", tmp_path / "alerts.jsonl")
     cfg_kw.setdefault("pause_file", tmp_path / "PAUSE")
+    cfg_kw.setdefault("event_calendar", None)  # isolate tests from the real calendar file
     cfg = LoopConfig(
         interval=1.0,
         stop_file=tmp_path / "STOP",
@@ -1455,3 +1456,33 @@ def test_allow_external_positions_ignores_manual_trades(tmp_path):
     alerts = _alerts(tmp_path)
     assert any("ignoring external position" in a["text"] for a in alerts)
     assert not [a for a in alerts if a["level"] == "halt"]
+
+
+def test_event_calendar_window_and_reload(tmp_path):
+    import datetime as _dt
+    import json as _json
+    from kalshi_bot.event_calendar import EventCalendar
+    p = tmp_path / "cal.json"
+    p.write_text(_json.dumps([{"time": 1000.0, "label": "CPI", "before_s": 60, "after_s": 60}]))
+    cal = EventCalendar(p)
+    assert cal.active(1000.0) == "CPI"          # at the event
+    assert cal.active(940.0) == "CPI"           # edge of the window
+    assert cal.active(939.0) is None            # just before
+    assert cal.active(1061.0) is None           # just after
+    # ISO time + default pads, reloaded when the file changes
+    p.write_text(_json.dumps([{"time": "2027-01-15T00:00:00Z", "label": "FOMC"}]))
+    ts = _dt.datetime.fromisoformat("2027-01-15T00:00:00+00:00").timestamp()
+    assert cal.active(ts) == "FOMC" and cal.active(ts - 1000) is None  # within default 900s pad
+
+
+def test_event_risk_filter_blocks_entries_during_blackout(tmp_path):
+    import json as _json
+    cal = tmp_path / "cal.json"
+    cal.write_text(_json.dumps([{"time": T0, "label": "FOMC", "before_s": 300, "after_s": 300}]))
+    client = FakeClient({0: "yes"})
+    loop, _ = make(tmp_path, client, loss_cap=100, profit_target=100, event_calendar=cal,
+                   event_before_s=300, event_after_s=300)
+    loop.run(max_ticks=1)
+    assert client.orders == []                    # blacked out: nothing opened
+    assert loop.state.event_blackout == "FOMC"
+    assert any("event-risk blackout (FOMC)" in a["text"] for a in _alerts(tmp_path))

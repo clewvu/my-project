@@ -65,6 +65,7 @@ from typing import Any
 
 from .alerts import AlertLog
 from .client import DryRunOrder, KalshiClient
+from .event_calendar import EventCalendar
 from .fees import order_fee
 from .models import Market
 from .sizing import TrackRecord, kelly_dollars
@@ -144,6 +145,12 @@ class LoopConfig:
     # trading the same series by hand): ignore those extra tickers instead of
     # halting. Own-position discrepancies still halt. Off by default (strict).
     allow_external_positions: bool = False
+    # event-risk filter: pause new entries during a blackout window around scheduled
+    # high-impact events (FOMC/CPI/EIA...) listed in this file. Open positions are
+    # still managed. None or a missing file = no blackouts.
+    event_calendar: Path | None = Path("state/event_calendar.json")
+    event_before_s: float = 900.0
+    event_after_s: float = 900.0
     spot_source: str = "auto"  # fairvalue spot: auto (fresh DB tick, else REST) | db | rest
     spot_smooth_s: float = 10.0  # fairvalue: model spot is the mean over this many seconds
     stop_value: float = 0.10  # fairvalue: sell at a loss only when the model values the
@@ -300,6 +307,7 @@ class LoopState:
     reconciled_ts: float | None = None  # last successful check against the exchange
     breaker_until: float | None = None  # consecutive-loss breaker: no entries until then
     loss_streak: int = 0  # losing results in a row, sales and settlements alike
+    event_blackout: str | None = None  # active event-risk blackout label, for the dashboard
     config: dict[str, Any] = field(default_factory=dict)  # what the last run was told
     # last balance seen, for the dashboard's funding ledger (shard index -> dollars)
     shard_balances: dict[str, float] = field(default_factory=dict)
@@ -427,6 +435,9 @@ class DemoLoop:
             min_history_s=config.min_history_s,
         )
         self.decisions = DecisionLog(config.decision_log)
+        self.events = EventCalendar(
+            config.event_calendar, config.event_before_s, config.event_after_s
+        )
         self.state.config["strategy"] = self.strategy.name
         if config.strategy == "fairvalue":
             self.state.config["margin"] = config.margin
@@ -615,7 +626,19 @@ class DemoLoop:
             self.alerts.record(
                 "info", self._alert_src, "loss breaker cleared; entries resume", now=now
             )
-        blocked = halt or paused or self.state.breaker_until is not None
+        event = self.events.active(now)
+        if event != self.state.event_blackout:
+            if event:
+                self.alerts.record(
+                    "warn", self._alert_src,
+                    f"event-risk blackout ({event}): no new entries until it passes", now=now,
+                )
+            else:
+                self.alerts.record(
+                    "info", self._alert_src, "event-risk blackout cleared; entries resume", now=now
+                )
+            self.state.event_blackout = event
+        blocked = halt or paused or event is not None or self.state.breaker_until is not None
         for name in self.cfg.series:
             ss = self.state.for_series(name)
             if ss.open is not None:
