@@ -64,3 +64,18 @@ def test_markets_raw_prints_json(monkeypatch, capsys):
     args = cli.build_parser().parse_args(["markets"])
     cli.cmd_markets(settings, args)
     assert "21.0c" in capsys.readouterr().out
+
+
+def test_public_commands_survive_missing_key(monkeypatch, tmp_path):
+    import kalshi_bot.cli as cli
+
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "id")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(tmp_path / "missing.pem"))
+    settings = cli.Settings.from_env("/nonexistent")
+    client = cli._client(settings, need_auth=False)
+    assert client.signer is None
+    client.close()
+    import pytest
+
+    with pytest.raises(cli.KalshiError, match="cannot read private key"):
+        cli._client(settings, need_auth=True)

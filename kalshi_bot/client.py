@@ -103,7 +103,13 @@ class KalshiClient:
     ) -> KalshiClient:
         signer = None
         if settings.has_credentials:
-            signer = Signer.from_pem_path(settings.api_key_id, settings.private_key_path)  # type: ignore[arg-type]
+            try:
+                signer = Signer.from_pem_path(settings.api_key_id, settings.private_key_path)  # type: ignore[arg-type]
+            except OSError as exc:
+                raise KalshiError(
+                    f"cannot read private key at {settings.private_key_path}: {exc.strerror}. "
+                    "Check KALSHI_PRIVATE_KEY_PATH in .env (run `kalshi-bot check`)."
+                ) from exc
         return cls(
             settings.base_url,
             signer,

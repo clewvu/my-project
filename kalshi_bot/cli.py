@@ -41,7 +41,14 @@ def _client(settings: Settings, *, need_auth: bool) -> KalshiClient:
             "KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH must be set for this command "
             "(see .env.example)"
         )
-    return KalshiClient.from_settings(settings)
+    try:
+        return KalshiClient.from_settings(settings)
+    except KalshiError as exc:
+        if need_auth:
+            raise
+        # public-data commands must not depend on the key being readable
+        logging.getLogger(__name__).warning("%s; continuing without credentials", exc)
+        return KalshiClient.from_settings(dataclasses.replace(settings, api_key_id=""))
 
 
 def _px(price: float | None) -> str:
