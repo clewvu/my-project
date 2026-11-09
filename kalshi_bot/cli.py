@@ -7,8 +7,10 @@ import dataclasses
 import json
 import logging
 import sys
+import threading
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from . import __version__
 from .client import KalshiClient, KalshiError
@@ -588,7 +590,167 @@ def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_pem_files() -> list[Path]:
+    home = Path.home()
+    roots = [home / "Downloads", home / "Desktop", home / "Documents", home / ".kalshi", Path.cwd()]
+    found: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            found.extend(p for p in root.glob("*.pem") if p.is_file())
+            found.extend(p for p in root.glob("*.txt") if "key" in p.name.lower())
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return found
+
+
+def cmd_setup(settings: Settings, args: argparse.Namespace) -> int:
+    """One-time interactive setup: find the API key file, write .env, verify the balance."""
+    print("kalshi-bot setup\n")
+    print("1. Private key file")
+    candidates = _find_pem_files()
+    key_path: Path | None = None
+    if candidates:
+        for i, p in enumerate(candidates[:8], 1):
+            print(f"   [{i}] {p}")
+        print("   [0] type a path")
+        choice = input("   which file is your Kalshi private key? ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= min(8, len(candidates)):
+            key_path = candidates[int(choice) - 1]
+    if key_path is None:
+        typed = input("   full path to the .pem file: ").strip().strip('"')
+        key_path = Path(typed).expanduser()
+    if not key_path.is_file():
+        print(f"   not found: {key_path}")
+        print(
+            "   Create a key on kalshi.com (Account -> API keys), save the download, rerun setup."
+        )
+        return 1
+    dest = Path.home() / ".kalshi" / "prod.pem"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if key_path.resolve() != dest.resolve():
+        dest.write_bytes(key_path.read_bytes())
+    try:
+        from .auth import Signer
+
+        Signer.from_pem_path("x", dest)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   that file is not a valid RSA private key: {exc}")
+        return 1
+    print(f"   ok -> {dest}\n")
+
+    print("2. API key ID (shown next to the key on kalshi.com)")
+    current = settings.api_key_id
+    prompt = f"   key id [{current}]: " if current else "   key id: "
+    key_id = input(prompt).strip() or current
+    if not key_id:
+        print("   a key id is required")
+        return 1
+
+    env_path = Path(args.env_file or ".env")
+    env_path.write_text(
+        "KALSHI_ENV=prod\n"
+        f"KALSHI_API_KEY_ID={key_id}\n"
+        f"KALSHI_PRIVATE_KEY_PATH={dest}\n"
+        "KALSHI_DRY_RUN=false\n",
+        encoding="ascii",
+    )
+    print(f"   wrote {env_path.resolve()}\n")
+
+    print("3. Checking the key against Kalshi")
+    new_settings = dataclasses.replace(
+        settings, env="prod", api_key_id=key_id, private_key_path=dest, dry_run=False
+    )
+    try:
+        with KalshiClient.from_settings(new_settings) as client:
+            bal = client.get_balance()
+    except KalshiError as exc:
+        print(f"   FAILED: {exc}")
+        print("   Check the key id, and that the key was created on kalshi.com (not demo).")
+        return 1
+    print(f"   balance ${bal.balance:,.2f}\n")
+    print("Setup complete. Double-click start-paper.cmd (no real orders) or start-live.cmd.")
+    return 0
+
+
+def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
+    """Run recorder and trader together in one window. Paper unless --live."""
+    uni = load_universe(args.universe)
+    mode = "live" if args.live else "paper"
+    if args.live:
+        problems = []
+        if settings.env != "prod":
+            problems.append("KALSHI_ENV must be prod")
+        if settings.dry_run:
+            problems.append("KALSHI_DRY_RUN must be false")
+        if not settings.has_credentials:
+            problems.append("run `kalshi-bot setup` first")
+        if args.acknowledge != LIVE_ACK:
+            problems.append(f"pass --acknowledge {LIVE_ACK}")
+        if problems:
+            sys.exit("refusing live mode:\n  " + "\n  ".join(problems))
+    strategy = FairValueStrategy(
+        FairValueParams(
+            margin=args.margin,
+            count=args.count,
+            vol_window=args.vol_window,
+            max_price=args.max_price,
+            min_price=args.min_price,
+        )
+    )
+    trade_client = KalshiClient.from_settings(settings, allow_live=args.live)
+    record_client = KalshiClient(settings.base_url, None, min_request_interval=0.15)
+    with trade_client, record_client, MarketDataStore(args.db) as store:
+        spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
+        pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols else None
+        recorder = Recorder(record_client, store, series=uni.series, interval=5.0)
+        trader = Trader(
+            trade_client,
+            store,
+            uni,
+            strategy,
+            _limits(args),
+            mode=mode,
+            interval=args.interval,
+            spot_ws=spot_ws,
+            pyth=pyth,
+        )
+        if args.live:
+            bal = trade_client.get_balance()
+            print(f"LIVE TRADING on production. Balance ${bal.balance:,.2f}.")
+            print(f"Limits: {trader.risk.limits}")
+            print("Starting in 10 seconds; Ctrl-C to abort.")
+            time.sleep(10)
+        rec_thread = threading.Thread(
+            target=lambda: recorder.run(install_signals=False), name="recorder", daemon=True
+        )
+        rec_thread.start()
+        try:
+            trader.run(max_ticks=args.ticks)
+        finally:
+            recorder.stop()
+            rec_thread.join(timeout=10)
+    return 0
+
+
 # ---------------------------------------------------------------- parser
+
+
+def _strategy_and_risk_args(s: argparse.ArgumentParser) -> None:
+    g = s.add_argument_group("strategy")
+    g.add_argument("--margin", type=float, default=0.03, help="edge beyond fees required")
+    g.add_argument("--count", type=int, default=2, help="contracts per order before sizing")
+    g.add_argument("--vol-window", type=float, default=1800.0)
+    g.add_argument("--max-price", type=float, default=0.90)
+    g.add_argument("--min-price", type=float, default=0.05)
+    r = s.add_argument_group("risk")
+    r.add_argument("--bankroll", type=float, default=200.0)
+    r.add_argument("--daily-loss-cap", type=float, default=20.0)
+    r.add_argument("--max-contracts", type=int, default=5)
+    r.add_argument("--max-open", type=int, default=3)
+    r.add_argument("--max-fraction", type=float, default=0.25)
+    r.add_argument("--loss-streak", type=int, default=4)
+    r.add_argument("--no-entry", type=float, default=120.0)
+    r.add_argument("--max-data-age", type=float, default=10.0)
+    r.add_argument("--kill-file", default="state/KILL")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -679,6 +841,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--universe", default=None)
     s.set_defaults(func=cmd_crossasset)
 
+    s = sub.add_parser("setup", help=cmd_setup.__doc__)
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("go", help=cmd_go.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--universe", default=None)
+    s.add_argument("--interval", type=float, default=5.0)
+    s.add_argument("--ticks", type=int, default=None)
+    s.add_argument("--live", action="store_true")
+    s.add_argument("--acknowledge", default="")
+    _strategy_and_risk_args(s)
+    s.set_defaults(func=cmd_go, default_env="prod")
+
     s = sub.add_parser("trade", help=cmd_trade.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)
     s.add_argument("--universe", default=None)
@@ -686,22 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ticks", type=int, default=None)
     s.add_argument("--live", action="store_true", help="real orders (see README gates)")
     s.add_argument("--acknowledge", default="", help=f"must equal {LIVE_ACK} for --live")
-    g = s.add_argument_group("strategy")
-    g.add_argument("--margin", type=float, default=0.03, help="edge beyond fees required")
-    g.add_argument("--count", type=int, default=2, help="contracts per order before sizing")
-    g.add_argument("--vol-window", type=float, default=1800.0)
-    g.add_argument("--max-price", type=float, default=0.90)
-    g.add_argument("--min-price", type=float, default=0.05)
-    r = s.add_argument_group("risk")
-    r.add_argument("--bankroll", type=float, default=200.0)
-    r.add_argument("--daily-loss-cap", type=float, default=20.0)
-    r.add_argument("--max-contracts", type=int, default=5)
-    r.add_argument("--max-open", type=int, default=3)
-    r.add_argument("--max-fraction", type=float, default=0.25)
-    r.add_argument("--loss-streak", type=int, default=4)
-    r.add_argument("--no-entry", type=float, default=120.0)
-    r.add_argument("--max-data-age", type=float, default=10.0)
-    r.add_argument("--kill-file", default="state/KILL")
+    _strategy_and_risk_args(s)
     s.set_defaults(func=cmd_trade, default_env="prod")
 
     s = sub.add_parser("learn", help=cmd_learn.__doc__)
@@ -782,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
         "trade-status",
         "risk-reset",
         "learn",
+        "setup",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:

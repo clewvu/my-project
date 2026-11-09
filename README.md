@@ -8,7 +8,19 @@ So far: configuration, request signing, a throttled and retrying HTTP client,
 typed models, a CLI for looking at markets and your account, and a market-data
 recorder. No strategy yet, and `dry_run` is on by default so nothing can trade.
 
-## Setup
+## Quick start (Windows, no command line)
+
+1. Create an API key on kalshi.com (Account -> API keys) and save the
+   downloaded private key file anywhere, e.g. Downloads.
+2. Double-click `setup.cmd`. It finds the key file, asks for the key ID,
+   writes `.env`, and shows your balance.
+3. Double-click `start-paper.cmd` to run with real prices and no real orders,
+   or `start-live.cmd` to trade for real at minimum size. One window runs
+   the recorder and the trader together.
+4. `status.cmd` shows P&L and recent decisions. `STOP.cmd` sets the kill
+   switch. `learn.cmd` runs the daily retraining report.
+
+## Setup (manual)
 
 1. Python 3.11+.
 2. Create a virtualenv and install:
