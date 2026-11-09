@@ -23,9 +23,13 @@ Phases:
 3. Tooling done, awaiting data: research reports (`analyze`, `whale`,
    `crossasset`). Universe widened on 2026-11-09 to ETH, SOL, XRP, gold,
    silver (oil pending ticker/feed confirmation); Pyth feed added.
-4. Not started: risk engine, decision log / feature store, strategy interface.
-5. Not started: demo run with paper orders.
-6. Not started: production at minimum size.
+4. Done 2026-11-09 (at Cameron's request to "use it today"): risk engine
+   (risk.py), fair-value strategy (strategy.py), trading loop (trader.py),
+   `trade` / `trade-status` / `risk-reset` commands. Paper mode by default
+   against production prices; decisions and positions logged in SQLite.
+5. Current: paper trading. Live is gated (prod env, dry_run false, key,
+   `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`) and NOT yet run.
+6. Not started: production at minimum size. Only after paper results are read.
 
 The recorder is currently running on Cameron's laptop against production
 public endpoints. It started collecting clean data (schema v3) around
@@ -88,6 +92,8 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | universe-check [--rules] | no | live market + settlement source per universe series |
 | pyth-feeds --query Q / pyth-check | no | find Pyth symbols; resolve and price the universe's |
 | crossasset [--universe f] | no | cross-asset report |
+| trade [--live --acknowledge ...] | live only | fair-value trading loop, paper by default |
+| trade-status / risk-reset | no | paper or live P&L, decisions, risk state; clear a halt |
 | record-stats / record-dump | no | what has been captured; latest raw rows |
 | spot-ws --seconds N | no | test the WebSocket feed alone |
 | analyze | no | research report over the database |
@@ -197,7 +203,7 @@ reality: distinguishing a 2-cent/contract difference needs ~9,800 windows
 per arm unpaired (about 50 days at one trade per window on both series);
 1 cent needs ~39,000. Not yet written into the brief.
 
-## 7. Risk framework design (agreed, not built)
+## 7. Risk framework (built in risk.py; design notes below still apply)
 
 `RiskEngine.check(order, state)` between strategy and client, state in
 SQLite so restarts cannot reset limits. Hard cutoffs: daily loss cap with

@@ -15,9 +15,12 @@ from .client import KalshiClient, KalshiError
 from .config import BASE_URLS, Settings
 from .pyth import PythClient, PythStream
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
+from .risk import RiskEngine, RiskLimits
 from .spot import SpotFeed
 from .spot_ws import FEEDS, SpotWebSocket
 from .storage import MarketDataStore, SchemaMismatch
+from .strategy import FairValueParams, FairValueStrategy
+from .trader import Trader
 from .universe import load_universe
 
 DEFAULT_DB = "state/market_data.sqlite"
@@ -427,6 +430,132 @@ def cmd_whale(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+LIVE_ACK = "I-ACCEPT-LIVE-TRADING-RISK"
+
+
+def _limits(args: argparse.Namespace) -> RiskLimits:
+    return RiskLimits(
+        bankroll=args.bankroll,
+        daily_loss_cap=args.daily_loss_cap,
+        max_contracts_per_order=args.max_contracts,
+        max_open_positions=args.max_open,
+        max_bankroll_fraction=args.max_fraction,
+        consecutive_loss_limit=args.loss_streak,
+        no_entry_seconds=args.no_entry,
+        max_data_age=args.max_data_age,
+        kill_file=args.kill_file,
+    )
+
+
+def cmd_trade(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the trading loop. Paper by default; --live needs every gate open."""
+    uni = load_universe(args.universe)
+    mode = "live" if args.live else "paper"
+    if args.live:
+        problems = []
+        if settings.env != "prod":
+            problems.append("KALSHI_ENV must be prod")
+        if settings.dry_run:
+            problems.append("KALSHI_DRY_RUN must be false")
+        if not settings.has_credentials:
+            problems.append("KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH must be set")
+        if args.acknowledge != LIVE_ACK:
+            problems.append(f"pass --acknowledge {LIVE_ACK}")
+        if problems:
+            sys.exit("refusing live mode:\n  " + "\n  ".join(problems))
+    client = KalshiClient.from_settings(settings, allow_live=args.live)
+    strategy = FairValueStrategy(
+        FairValueParams(
+            margin=args.margin,
+            count=args.count,
+            vol_window=args.vol_window,
+            max_price=args.max_price,
+            min_price=args.min_price,
+        )
+    )
+    with client, MarketDataStore(args.db) as store:
+        spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
+        pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols else None
+        trader = Trader(
+            client,
+            store,
+            uni,
+            strategy,
+            _limits(args),
+            mode=mode,
+            interval=args.interval,
+            spot_ws=spot_ws,
+            pyth=pyth,
+        )
+        if args.live:
+            bal = client.get_balance()
+            print(
+                f"LIVE TRADING on production. Balance ${bal.balance:,.2f}. "
+                f"Limits: {trader.risk.limits}"
+            )
+            print("Starting in 10 seconds; Ctrl-C to abort.")
+            time.sleep(10)
+        trader.run(max_ticks=args.ticks)
+    return 0
+
+
+def cmd_trade_status(_: Settings, args: argparse.Namespace) -> int:
+    """Paper/live P&L, open positions, risk state and recent decisions."""
+    mode = "live" if args.live else "paper"
+    with MarketDataStore(args.db) as store:
+        risk = RiskEngine(store, RiskLimits(), mode)
+        summary = store.pnl_summary(mode)
+        open_pos = store.positions(mode, "open")
+        settled = [p for p in store.positions(mode, "settled")][-args.limit :]
+        decisions = store.decisions(mode, args.limit)
+    st = risk.state
+    print(f"mode:       {mode}")
+    print(
+        f"risk:       {'HALTED: ' + st.halt_reason if st.halted else 'ok'}  "
+        f"day_pnl={st.day_pnl:+.2f}  loss_streak={st.consecutive_losses}"
+    )
+    n = summary["settled"]
+    wr = f"{summary['wins'] / n:.0%}" if n else "-"
+    print(
+        f"settled:    {n} positions, win rate {wr}, pnl ${summary['pnl']:+.2f} "
+        f"(fees ${summary['fees']:.2f}, staked ${summary['staked']:.2f})"
+    )
+    print(f"decisions:  {summary['decisions']}")
+    print(f"open:       {len(open_pos)}")
+    for p in open_pos:
+        print(
+            f"  {p['ticker']:30} {p['side']:3} x{p['count']:<4g} @{_px(p['price'])} "
+            f"closes {_fmt_time(datetime.fromtimestamp(p['close_ts'], tz=UTC))}"
+        )
+    if settled:
+        print("recent settled:")
+        for p in settled:
+            print(
+                f"  {p['ticker']:30} {p['side']:3} x{p['count']:<4g} @{_px(p['price'])} "
+                f"-> {p['result']:3} {p['pnl']:+.2f}"
+            )
+    print("recent decisions:")
+    for d in decisions[: args.limit]:
+        ts = _fmt_time(datetime.fromtimestamp(d["ts"], tz=UTC))
+        fair = f"{d['fair_p']:.2f}" if d["fair_p"] is not None else "-"
+        print(
+            f"  {ts} {d['ticker'] or '-':30} fair={fair} yes={_px(d['yes_ask'])} "
+            f"no={_px(d['no_ask'])} {d['action']:8} {d['reason']}"
+        )
+    return 0
+
+
+def cmd_risk_reset(_: Settings, args: argparse.Namespace) -> int:
+    """Clear a risk halt / cool-off after a manual review."""
+    mode = "live" if args.live else "paper"
+    with MarketDataStore(args.db) as store:
+        risk = RiskEngine(store, RiskLimits(), mode)
+        was = risk.state.halt_reason or "(not halted)"
+        risk.reset()
+    print(f"{mode}: reset. previous halt reason: {was}")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -518,6 +647,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--universe", default=None)
     s.set_defaults(func=cmd_crossasset)
 
+    s = sub.add_parser("trade", help=cmd_trade.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--universe", default=None)
+    s.add_argument("--interval", type=float, default=5.0)
+    s.add_argument("--ticks", type=int, default=None)
+    s.add_argument("--live", action="store_true", help="real orders (see README gates)")
+    s.add_argument("--acknowledge", default="", help=f"must equal {LIVE_ACK} for --live")
+    g = s.add_argument_group("strategy")
+    g.add_argument("--margin", type=float, default=0.03, help="edge beyond fees required")
+    g.add_argument("--count", type=int, default=2, help="contracts per order before sizing")
+    g.add_argument("--vol-window", type=float, default=1800.0)
+    g.add_argument("--max-price", type=float, default=0.90)
+    g.add_argument("--min-price", type=float, default=0.05)
+    r = s.add_argument_group("risk")
+    r.add_argument("--bankroll", type=float, default=200.0)
+    r.add_argument("--daily-loss-cap", type=float, default=20.0)
+    r.add_argument("--max-contracts", type=int, default=5)
+    r.add_argument("--max-open", type=int, default=3)
+    r.add_argument("--max-fraction", type=float, default=0.25)
+    r.add_argument("--loss-streak", type=int, default=4)
+    r.add_argument("--no-entry", type=float, default=120.0)
+    r.add_argument("--max-data-age", type=float, default=10.0)
+    r.add_argument("--kill-file", default="state/KILL")
+    s.set_defaults(func=cmd_trade, default_env="prod")
+
+    s = sub.add_parser("trade-status", help=cmd_trade_status.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--live", action="store_true")
+    s.add_argument("--limit", type=int, default=15)
+    s.set_defaults(func=cmd_trade_status)
+
+    s = sub.add_parser("risk-reset", help=cmd_risk_reset.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--live", action="store_true")
+    s.set_defaults(func=cmd_risk_reset)
+
     s = sub.add_parser("spot-ws", help=cmd_spot_ws.__doc__)
     s.add_argument("--seconds", type=int, default=15)
     s.add_argument("--db", default=DEFAULT_DB)
@@ -573,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
         "pyth-feeds",
         "pyth-check",
         "crossasset",
+        "trade-status",
+        "risk-reset",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:

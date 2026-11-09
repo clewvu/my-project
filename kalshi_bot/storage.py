@@ -22,7 +22,7 @@ from typing import Any
 
 from .models import Market, Orderbook, Trade
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -93,10 +93,55 @@ CREATE TABLE IF NOT EXISTS spot (
     exchange_ts     REAL
 );
 CREATE INDEX IF NOT EXISTS idx_spot_symbol_ts ON spot(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id              INTEGER PRIMARY KEY,
+    ts              REAL NOT NULL,
+    mode            TEXT NOT NULL,
+    series          TEXT,
+    ticker          TEXT,
+    secs_to_close   REAL,
+    spot            REAL,
+    spot_age        REAL,
+    strike          REAL,
+    sigma           REAL,
+    fair_p          REAL,
+    yes_ask         REAL,
+    no_ask          REAL,
+    side            TEXT,
+    count           INTEGER,
+    price           REAL,
+    edge            REAL,
+    action          TEXT NOT NULL,
+    reason          TEXT,
+    features        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id              INTEGER PRIMARY KEY,
+    mode            TEXT NOT NULL,
+    ticker          TEXT NOT NULL,
+    series          TEXT,
+    side            TEXT NOT NULL,
+    count           REAL NOT NULL,
+    price           REAL NOT NULL,
+    fee             REAL NOT NULL,
+    opened_ts       REAL NOT NULL,
+    close_ts        REAL,
+    order_id        TEXT,
+    client_order_id TEXT,
+    status          TEXT NOT NULL,
+    result          TEXT,
+    pnl             REAL,
+    settled_ts      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
 """
 
 # Applied in order to bring an older database up to SCHEMA_VERSION.
 MIGRATIONS: dict[int, list[str]] = {
+    4: [],  # new tables only; created by SCHEMA
     3: [
         "ALTER TABLE markets ADD COLUMN expiration_value REAL",
         "ALTER TABLE spot ADD COLUMN exchange_ts REAL",
@@ -353,6 +398,136 @@ class MarketDataStore:
                 "INSERT INTO spot (ts, source, symbol, price, exchange_ts) VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
+
+    # ------------------------------------------------------------ meta / risk state
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, values: dict[str, str]) -> None:
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", list(values.items())
+            )
+
+    # ------------------------------------------------------------ decisions / positions
+
+    def insert_decision(self, row: dict[str, Any]) -> None:
+        cols = [
+            "ts",
+            "mode",
+            "series",
+            "ticker",
+            "secs_to_close",
+            "spot",
+            "spot_age",
+            "strike",
+            "sigma",
+            "fair_p",
+            "yes_ask",
+            "no_ask",
+            "side",
+            "count",
+            "price",
+            "edge",
+            "action",
+            "reason",
+            "features",
+        ]
+        values = [row.get(c) for c in cols]
+        if isinstance(values[-1], dict | list):
+            values[-1] = _json(values[-1])
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"INSERT INTO decisions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                values,
+            )
+
+    def open_position(self, row: dict[str, Any]) -> int:
+        cols = [
+            "mode",
+            "ticker",
+            "series",
+            "side",
+            "count",
+            "price",
+            "fee",
+            "opened_ts",
+            "close_ts",
+            "order_id",
+            "client_order_id",
+            "status",
+        ]
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"INSERT INTO positions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                [row.get(c) for c in cols],
+            )
+            return int(cur.lastrowid)
+
+    def positions(self, mode: str, status: str | None = None) -> list[dict[str, Any]]:
+        q = "SELECT * FROM positions WHERE mode = ?"
+        args: list[Any] = [mode]
+        if status:
+            q += " AND status = ?"
+            args.append(status)
+        with self._lock:
+            rows = self._conn.execute(q + " ORDER BY opened_ts", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_position(self, position_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE positions SET {sets} WHERE id = ?", [*fields.values(), position_id]
+            )
+
+    def decisions(self, mode: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM decisions WHERE mode = ? ORDER BY ts DESC LIMIT ?", (mode, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def pnl_summary(self, mode: str) -> dict[str, Any]:
+        with self._lock:
+            c = self._conn
+            row = c.execute(
+                """
+                SELECT COUNT(*) AS n, SUM(pnl) AS pnl, SUM(pnl > 0) AS wins,
+                       SUM(fee) AS fees, SUM(count * price) AS staked
+                FROM positions WHERE mode = ? AND status = 'settled'
+                """,
+                (mode,),
+            ).fetchone()
+            open_n = c.execute(
+                "SELECT COUNT(*) FROM positions WHERE mode = ? AND status = 'open'", (mode,)
+            ).fetchone()[0]
+            dec = c.execute(
+                "SELECT action, COUNT(*) FROM decisions WHERE mode = ? GROUP BY action", (mode,)
+            ).fetchall()
+        return {
+            "settled": row["n"] or 0,
+            "pnl": row["pnl"] or 0.0,
+            "wins": row["wins"] or 0,
+            "fees": row["fees"] or 0.0,
+            "staked": row["staked"] or 0.0,
+            "open": open_n,
+            "decisions": {r[0]: r[1] for r in dec},
+        }
+
+    def recent_spot(self, source: str, symbol: str, since: float) -> list[tuple[float, float]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, price FROM spot "
+                "WHERE source = ? AND symbol = ? AND ts >= ? ORDER BY ts",
+                (source, symbol, since),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     # ------------------------------------------------------------ inspection
 

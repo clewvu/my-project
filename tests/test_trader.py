@@ -1,0 +1,144 @@
+from kalshi_bot.client import KalshiAPIError
+from kalshi_bot.models import Market, Orderbook
+from kalshi_bot.risk import RiskLimits
+from kalshi_bot.spot_ws import Tick
+from kalshi_bot.storage import MarketDataStore
+from kalshi_bot.strategy import FairValueParams, FairValueStrategy
+from kalshi_bot.trader import Trader
+from kalshi_bot.universe import Asset, Universe
+
+UNI = Universe([Asset("KXBTC15M", "BTC", "crypto", "Crypto.BTC/USD", "BTC-USD")])
+CLOSE = 1_700_000_900.0
+
+
+class FakeFeed:
+    def __init__(self):
+        self.buffer = type("B", (), {"latest": {}})()
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+
+class FakeClient:
+    dry_run = True
+    allow_live = False
+
+    def __init__(self, mid=0.5, result=None):
+        self.mid = mid
+        self.result = result
+        self.calls = []
+
+    def get_markets(self, *, series_ticker, status, max_pages):
+        return [
+            Market.from_dict(
+                {
+                    "ticker": "KXBTC15M-1",
+                    "status": "active",
+                    "floor_strike": 100.0,
+                    "open_time": CLOSE - 900,
+                    "close_time": CLOSE,
+                    "result": self.result,
+                }
+            )
+        ]
+
+    def get_orderbook(self, ticker, depth):
+        m = self.mid
+        return Orderbook.from_dict(
+            ticker,
+            {
+                "orderbook_fp": {
+                    "yes_dollars": [[f"{m - 0.01:.3f}", "100"]],
+                    "no_dollars": [[f"{1 - m - 0.01:.3f}", "100"]],
+                }
+            },
+        )
+
+    def get_market(self, ticker):
+        self.calls.append(("market", ticker))
+        return self.get_markets(series_ticker="", status="", max_pages=1)[0]
+
+
+def make_trader(client, tmp_path, **limits):
+    store = MarketDataStore(tmp_path / "t.sqlite")
+    feed = FakeFeed()
+    trader = Trader(
+        client,
+        store,
+        UNI,
+        FairValueStrategy(FairValueParams(margin=0.02, count=2)),
+        RiskLimits(**limits),
+        mode="paper",
+        spot_ws=feed,
+    )
+    return trader, store, feed
+
+
+def seed_vol(feed, trader, now, spot):
+    # feed history: 30 minutes of small moves, ending at `spot`
+    key = trader._hist_key("coinbase_ws", "BTC-USD")
+    p = spot
+    for i in range(200, 0, -1):
+        trader.history.push(key, now - 10 * i, p * (1 + 0.0001 * ((i % 2) * 2 - 1)))
+    feed.buffer.latest["BTC-USD"] = Tick("BTC-USD", spot, now, now)
+
+
+def test_paper_order_then_settlement(tmp_path):
+    client = FakeClient(mid=0.5)
+    trader, store, feed = make_trader(client, tmp_path, max_contracts_per_order=5)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)  # well above strike -> buy YES at 0.51
+    s = trader.tick(now)
+    assert s.markets == 1 and s.orders == 1 and s.rejected == 0
+    pos = store.positions("paper", "open")
+    assert len(pos) == 1 and pos[0]["side"] == "yes" and pos[0]["price"] == 0.51
+    assert store.decisions("paper")[0]["action"] == "order"
+    # second tick: no duplicate position in the same market
+    s = trader.tick(now + 5)
+    assert s.orders == 0 and s.rejected == 1
+    assert "already have" in store.decisions("paper")[0]["reason"]
+    # settle after close with a YES result
+    client.result = "yes"
+    s = trader.tick(CLOSE + 60)
+    assert s.settled == 1
+    settled = store.positions("paper", "settled")[0]
+    assert settled["result"] == "yes" and abs(settled["pnl"] - (2 * 0.49 - settled["fee"])) < 1e-9
+    assert trader.risk.state.day_pnl > 0
+    summary = store.pnl_summary("paper")
+    assert summary["settled"] == 1 and summary["wins"] == 1
+
+
+def test_no_entry_window_and_stale_spot(tmp_path):
+    client = FakeClient(mid=0.5)
+    trader, store, feed = make_trader(client, tmp_path)
+    now = CLOSE - 60  # inside no-entry window
+    seed_vol(feed, trader, now, spot=100.3)
+    s = trader.tick(now)
+    assert s.rejected == 1 and "no-entry" in store.decisions("paper")[0]["reason"]
+    trader2, store2, feed2 = make_trader(FakeClient(mid=0.5), tmp_path / "b")
+    now = CLOSE - 600
+    seed_vol(feed2, trader2, now - 100, spot=100.3)  # spot 100 s old
+    s = trader2.tick(now)
+    assert s.skips == 1 and "stale" in store2.decisions("paper")[0]["reason"]
+
+
+def test_live_mode_requires_unlocked_client(tmp_path):
+    import pytest
+
+    store = MarketDataStore(tmp_path / "l.sqlite")
+    with pytest.raises(ValueError, match="live mode"):
+        Trader(FakeClient(), store, UNI, FairValueStrategy(), RiskLimits(), mode="live")
+
+
+def test_errors_do_not_crash_tick(tmp_path):
+    class Broken(FakeClient):
+        def get_orderbook(self, ticker, depth):
+            raise KalshiAPIError(500, "GET", "/x", "boom")
+
+    trader, store, feed = make_trader(Broken(), tmp_path)
+    s = trader.tick(CLOSE - 600)
+    assert s.errors == 1 and s.orders == 0

@@ -63,6 +63,9 @@ kalshi_bot/
   pyth.py     Pyth Hermes feed lookup, REST poll and SSE stream (settlement source for metals/oil)
   universe.py series universe, spot preferences, cross-asset hypotheses (+ universe.yaml)
   crossasset.py cross-asset co-movement, lead-lag, predictor and divergence tests
+  risk.py     RiskEngine: hard limits, persisted state, kill switch
+  strategy.py FairValueStrategy + SpotHistory (realized vol)
+  trader.py   trading loop: paper fills or live orders, settlement scoring
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
   whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
@@ -157,6 +160,39 @@ import pandas as pd, sqlite3
 con = sqlite3.connect("state/market_data.sqlite")
 snaps = pd.read_sql("select * from snapshots", con, parse_dates={"ts": "s"})
 ```
+
+## Trading (paper by default)
+
+`kalshi-bot trade` runs the fair-value strategy against live production
+prices. In **paper** mode (the default) it never sends an order: it records
+each would-be fill at the ask, scores it at settlement with the exact fee, and
+tracks P&L, so a day of paper trading tells you what the strategy would have
+done with real money. Every decision, including skips and risk rejections, is
+logged with its full feature vector.
+
+```bash
+kalshi-bot trade                    # paper, whole universe, default limits
+kalshi-bot trade-status             # P&L, open positions, risk state, recent decisions
+kalshi-bot risk-reset               # clear a halt after you have looked at why it fired
+touch state/KILL                    # kill switch: blocks all new orders while the file exists
+```
+
+Strategy: `p_up = Phi(ln(S/K) / (sigma * sqrt(tau)))` with realized vol over
+the last 30 minutes; buy the side whose fair probability beats the ask by
+more than the taker fee plus `--margin` (default 3 points). Tune with
+`--margin`, `--count`, `--max-price`, `--min-price`, `--vol-window`.
+
+Risk limits are hard cutoffs, persisted in SQLite so a restart cannot reset
+them: `--daily-loss-cap` (halts until `risk-reset`), `--max-contracts`,
+`--max-open`, `--max-fraction` of `--bankroll`, `--loss-streak` cool-off,
+`--no-entry` seconds before close, `--max-data-age`, and the kill file.
+
+**Live mode** sends real limit orders at the ask with a 15-second expiry. It
+refuses to start unless all of these hold: `KALSHI_ENV=prod`,
+`KALSHI_DRY_RUN=false`, API key configured, and
+`--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`. It then prints the balance
+and limits and waits 10 seconds. Run paper first, for at least a day, and read
+`trade-status` before considering it.
 
 ## Research (phase 3)
 
