@@ -21,13 +21,15 @@ from dataclasses import dataclass, field
 
 from .client import KalshiClient, KalshiError
 from .models import Market
+from .pyth import PythStream
 from .spot import SpotFeed
 from .spot_ws import SpotWebSocket
 from .storage import MarketDataStore
+from .universe import default_universe
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SERIES = ["KXBTC15M", "KXDOGE15M"]
+DEFAULT_SERIES = default_universe().series
 DEAD_STATUSES = {"closed", "settled", "finalized", "determined"}
 
 
@@ -40,7 +42,7 @@ def is_live(market: Market, now: float) -> bool:
     return True
 
 
-DEFAULT_SPOT_SYMBOLS = ["BTC-USD", "DOGE-USD"]
+DEFAULT_SPOT_SYMBOLS = default_universe().coinbase_symbols
 
 
 @dataclass
@@ -52,6 +54,7 @@ class TickResult:
     values: int = 0
     spot: int = 0
     spot_ws: int = 0
+    pyth: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -67,6 +70,7 @@ class Recorder:
         settle_interval: float = 60.0,
         spot: SpotFeed | None = None,
         spot_ws: SpotWebSocket | None = None,
+        pyth: PythStream | None = None,
     ) -> None:
         self.client = client
         self.store = store
@@ -76,6 +80,8 @@ class Recorder:
         self.settle_interval = settle_interval
         self.spot = spot
         self.spot_ws = spot_ws
+        self.pyth = pyth
+        self._pyth_written = 0
         self._ws_written = 0
         self._last_settle_check = 0.0
         self._stop = threading.Event()
@@ -114,6 +120,11 @@ class Recorder:
             self.spot_ws.flush()
             result.spot_ws = self.spot_ws.written - self._ws_written
             self._ws_written = self.spot_ws.written
+
+        if self.pyth is not None:
+            self.pyth.flush()
+            result.pyth = self.pyth.written - self._pyth_written
+            self._pyth_written = self.pyth.written
 
         return result
 
@@ -191,6 +202,8 @@ class Recorder:
         )
         if self.spot_ws is not None:
             self.spot_ws.start()
+        if self.pyth is not None:
+            self.pyth.start()
         ticks = 0
         consecutive_failures = 0
         while not self._stop.is_set():
@@ -200,7 +213,7 @@ class Recorder:
                 consecutive_failures = 0 if not res.errors else consecutive_failures + 1
                 log.info(
                     "tick markets=%d snapshots=%d trades+%d settled=%d values=%d "
-                    "spot=%d ws=%d errors=%d",
+                    "spot=%d ws=%d pyth=%d errors=%d",
                     res.markets,
                     res.snapshots,
                     res.new_trades,
@@ -208,6 +221,7 @@ class Recorder:
                     res.values,
                     res.spot,
                     res.spot_ws,
+                    res.pyth,
                     len(res.errors),
                 )
             except Exception:  # noqa: BLE001 - keep the loop alive
@@ -226,5 +240,7 @@ class Recorder:
             self._stop.wait(max(0.0, delay - elapsed))
         if self.spot_ws is not None:
             self.spot_ws.stop()
+        if self.pyth is not None:
+            self.pyth.stop()
         log.info("recorder stopped after %d ticks", ticks)
         return ticks

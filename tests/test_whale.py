@@ -17,7 +17,7 @@ def build_db(path, n_markets=40, seed=7, whale_knows=False):
     t0 = 1_700_000_000.0
     for i in range(n_markets):
         series = "KXBTC15M" if i % 2 == 0 else "KXDOGE15M"
-        symbol = whale.SPOT_SYMBOLS[series]
+        symbol = whale.load_universe().by_series(series).coinbase_symbol
         strike = 80_000.0 if series == "KXBTC15M" else 0.25
         open_ts, close_ts = t0 + i * 900, t0 + i * 900 + 900
         ticker = f"{series}-{i}"

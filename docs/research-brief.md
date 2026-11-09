@@ -203,3 +203,52 @@ series, that is about $0.40 per traded window and, trading every window,
 roughly $38 per day before variance. The edge, if it exists, will be sparse:
 most windows will not qualify. A realistic path is weeks to months, and
 only if a pre-registered test passes out of sample.
+
+## 8. Cross-asset hypotheses (added 2026-11-09, pre-registered)
+
+Cameron's observation: gold and silver, and BTC, ETH and SOL, usually settle
+the same way; oil may move against the metals. The universe
+(`kalshi_bot/universe.py`) declares these as directed hypotheses with a sign,
+and `kalshi-bot crossasset` tests them.
+
+**What co-movement does and does not prove.** If ETH and BTC finish the same
+window up together, that is contemporaneous correlation. BTC's own spot and
+BTC's own market price already carry that information. A cross-asset signal is
+only useful if the leader tells us something about the follower's settlement
+*that the follower's price does not yet reflect*: the follower's book lags the
+leader's move, or the leader's market is better informed than the follower's.
+Everything below is built to separate those two cases.
+
+**Tests, in order.**
+
+1. Outcome co-movement: pairwise agreement rate and phi across common
+   windows, bootstrapped over windows. For each declared hypothesis, report
+   whether the realised sign matches the claim ("Brent vs gold" is a claim
+   of negative phi; the literature often finds the opposite, so the data
+   decides).
+2. Spot lead-lag: cross-correlation of 10-second log returns on a 5-second
+   grid at lags from -60 s to +60 s. Peak at lag 0 means simultaneous and
+   nothing to trade. Peak at a positive lag with higher correlation than at
+   lag 0 means the leader leads.
+3. Predictor test at T-300 s and T-60 s: logistic regression of the
+   follower's outcome on logit(follower implied) plus one leader feature
+   (leader's implied, leader's return since window open, leader's return over
+   the last 60 s), sign-adjusted. Bootstrap CI on the coefficient over
+   windows. "Informative" only if the CI excludes zero.
+4. Divergence backtest: buy the follower side the leader's market favours
+   when the two markets disagree by at least 10, 20 or 30 points, at the
+   follower's ask, fee-inclusive, hold to settlement.
+
+**Pre-registered bar.** A hypothesis is tradeable only if (3) is informative
+at a horizon where the follower's book is still liquid, AND (4) shows net per
+contract >= +1 cent with a 95% CI excluding zero, both in a time-ordered
+held-out 30% of windows, with at least 200 windows in the held-out set.
+Co-movement that passes (1) but fails (3) is "confirmed but already priced".
+
+**Known traps.** Commodity series trade on a weekday schedule, so overlap
+with 24/7 crypto is partial; pair statistics only use common windows. Pyth is
+the settlement source for metals and oil, so for those series the spot series
+is exact, while for crypto Coinbase remains a proxy for CF Benchmarks.
+Multiple hypotheses are tested at once; with nine hypotheses and two horizons,
+roughly one spurious "informative" result at the 95% level is expected by
+chance, so a single pass means nothing until it repeats on the next batch.

@@ -20,14 +20,8 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .fees import fee_per_contract
+from .universe import Universe, load_universe
 
-SPOT_SYMBOLS = {
-    "KXBTC15M": "BTC-USD",
-    "KXETH15M": "ETH-USD",
-    "KXSOL15M": "SOL-USD",
-    "KXDOGE15M": "DOGE-USD",
-    "KXXRP15M": "XRP-USD",
-}
 HORIZONS = (840, 600, 300, 180, 120, 60, 30, 10)
 SPOT_TOLERANCE_S = 30.0
 DIST_BINS = (0, 1, 2, 5, 10, 20, float("inf"))
@@ -51,8 +45,12 @@ class Dataset:
 
 
 def load(
-    db_path: str, series: list[str] | None = None, horizons: tuple[int, ...] = HORIZONS
+    db_path: str,
+    series: list[str] | None = None,
+    horizons: tuple[int, ...] = HORIZONS,
+    universe: Universe | None = None,
 ) -> Dataset:
+    universe = universe or load_universe()
     con = sqlite3.connect(db_path)
     try:
         markets = pd.read_sql(
@@ -70,7 +68,6 @@ def load(
         spot = pd.read_sql("SELECT ts, source, symbol, price FROM spot", con)
     finally:
         con.close()
-    spot = prefer_websocket_spot(spot)
 
     if series:
         markets = markets[markets["series_ticker"].isin(series)]
@@ -83,7 +80,7 @@ def load(
         how="inner",
     )
     snaps["yes_mid"] = (snaps["yes_bid"] + snaps["yes_ask"]) / 2
-    snaps = _attach_spot(snaps, spot)
+    snaps = attach_spot(snaps, spot, universe)
     snaps["spot_dist_bps"] = (snaps["spot"] - snaps["strike"]) / snaps["strike"] * 1e4
     # 1.0 / 0.0, NaN when no spot was attached
     snaps["spot_above"] = (snaps["spot"] >= snaps["strike"]).astype(float)
@@ -92,37 +89,47 @@ def load(
     return Dataset(markets=markets, snapshots=snaps, spot=spot, horizons=horizons)
 
 
-def prefer_websocket_spot(spot: pd.DataFrame) -> pd.DataFrame:
-    """Per symbol, use WebSocket ticks where they exist and REST polls elsewhere.
+def spot_for_series(spot: pd.DataFrame, preference: list[tuple[str, str]]) -> pd.DataFrame:
+    """Build one spot series from several sources, best source first.
 
-    The two sources overlap in time once the WebSocket is running; keeping both
-    would let a 5-second REST value shadow a fresher tick in merge_asof.
+    Rows from the first (source, symbol) with any data are used in full; each
+    later preference only fills time outside the spans already covered by
+    higher-priority sources, so a slow REST poll never shadows a fresher tick
+    inside a WebSocket's coverage.
     """
-    if spot.empty or "source" not in spot.columns:
-        return spot
-    parts = []
-    for _, g in spot.groupby("symbol"):
-        ws = g[g["source"] == "coinbase_ws"]
-        if ws.empty:
-            parts.append(g)
+    parts: list[pd.DataFrame] = []
+    spans: list[tuple[float, float]] = []
+    for source, symbol in preference:
+        rows = spot[(spot["source"] == source) & (spot["symbol"] == symbol)][["ts", "price"]]
+        if rows.empty:
             continue
-        rest = g[g["source"] != "coinbase_ws"]
-        rest = rest[(rest["ts"] < ws["ts"].min()) | (rest["ts"] > ws["ts"].max())]
-        parts.append(pd.concat([ws, rest]))
+        for lo, hi in spans:
+            rows = rows[(rows["ts"] < lo) | (rows["ts"] > hi)]
+        if rows.empty:
+            continue
+        spans.append((float(rows["ts"].min()), float(rows["ts"].max())))
+        parts.append(rows)
+    if not parts:
+        return pd.DataFrame(columns=["ts", "price"])
     return pd.concat(parts).sort_values("ts").reset_index(drop=True)
 
 
-def _attach_spot(snaps: pd.DataFrame, spot: pd.DataFrame) -> pd.DataFrame:
-    snaps = snaps.copy()
-    snaps["spot"] = float("nan")
-    if spot.empty or snaps.empty:
-        return snaps
+def attach_spot(
+    frame: pd.DataFrame,
+    spot: pd.DataFrame,
+    universe: Universe,
+    tolerance: float = SPOT_TOLERANCE_S,
+) -> pd.DataFrame:
+    """Add a ``spot`` column: the latest spot at or before each row's ``ts``, per series."""
+    frame = frame.copy()
+    frame["spot"] = float("nan")
+    if spot.empty or frame.empty:
+        return frame
     parts = []
-    for series, group in snaps.groupby("series_ticker", sort=False):
-        symbol = SPOT_SYMBOLS.get(str(series))
-        s = spot[spot["symbol"] == symbol][["ts", "price"]].sort_values("ts")
+    for series, group in frame.groupby("series_ticker", sort=False):
+        s = spot_for_series(spot, universe.spot_preference(str(series)))
         g = group.drop(columns=["spot"]).sort_values("ts")
-        if symbol is None or s.empty:
+        if s.empty:
             g["spot"] = float("nan")
         else:
             g = pd.merge_asof(
@@ -130,7 +137,7 @@ def _attach_spot(snaps: pd.DataFrame, spot: pd.DataFrame) -> pd.DataFrame:
                 s.rename(columns={"price": "spot"}),
                 on="ts",
                 direction="backward",
-                tolerance=SPOT_TOLERANCE_S,
+                tolerance=tolerance,
             )
         parts.append(g)
     return pd.concat(parts, ignore_index=True)

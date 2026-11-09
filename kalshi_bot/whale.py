@@ -34,9 +34,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .analysis import SPOT_SYMBOLS, SPOT_TOLERANCE_S, prefer_websocket_spot
+from .analysis import attach_spot
 from .fees import fee_per_contract
 from .models import TICK
+from .universe import Universe, load_universe
 
 SWEEP_WINDOW_S = 0.25
 THRESHOLDS = (250.0, 1000.0, 5000.0)
@@ -56,9 +57,12 @@ class WhaleData:
 # ---------------------------------------------------------------- loading
 
 
-def load(db_path: str, series: list[str] | None = None) -> WhaleData:
+def load(
+    db_path: str, series: list[str] | None = None, universe: Universe | None = None
+) -> WhaleData:
     import sqlite3
 
+    universe = universe or load_universe()
     con = sqlite3.connect(db_path)
     try:
         markets = pd.read_sql(
@@ -73,7 +77,7 @@ def load(db_path: str, series: list[str] | None = None) -> WhaleData:
         snaps = pd.read_sql(
             "SELECT ts, ticker, yes_bid, yes_ask, no_bid, no_ask FROM snapshots", con
         )
-        spot = prefer_websocket_spot(pd.read_sql("SELECT ts, source, symbol, price FROM spot", con))
+        spot = pd.read_sql("SELECT ts, source, symbol, price FROM spot", con)
     finally:
         con.close()
     if series:
@@ -90,7 +94,7 @@ def load(db_path: str, series: list[str] | None = None) -> WhaleData:
     # prints stamped after close are settlement artefacts, not tradeable signals
     sweeps = sweeps[sweeps["secs_to_close"] >= 0]
     sweeps = _attach_books(sweeps, snaps)
-    sweeps = _attach_spot(sweeps, spot)
+    sweeps = attach_spot(sweeps, spot, universe)
     sweeps = _attach_maker_fills(sweeps, trades)
     sweeps = _score(sweeps)
     return WhaleData(sweeps=sweeps.reset_index(drop=True), n_markets=int(markets.shape[0]))
@@ -164,30 +168,6 @@ def _attach_books(sweeps: pd.DataFrame, snaps: pd.DataFrame) -> pd.DataFrame:
     for col in ("post_yes_bid", "post_yes_ask", "post_no_bid", "post_no_ask"):
         before[col] = after[col].to_numpy()
     return before
-
-
-def _attach_spot(sweeps: pd.DataFrame, spot: pd.DataFrame) -> pd.DataFrame:
-    sweeps = sweeps.copy()
-    sweeps["spot"] = np.nan
-    if spot.empty:
-        return sweeps
-    parts = []
-    for series, g in sweeps.groupby("series_ticker", sort=False):
-        symbol = SPOT_SYMBOLS.get(str(series))
-        s = spot[spot["symbol"] == symbol][["ts", "price"]].sort_values("ts")
-        g = g.drop(columns=["spot"]).sort_values("ts")
-        if s.empty:
-            g["spot"] = np.nan
-        else:
-            g = pd.merge_asof(
-                g,
-                s.rename(columns={"price": "spot"}),
-                on="ts",
-                direction="backward",
-                tolerance=SPOT_TOLERANCE_S,
-            )
-        parts.append(g)
-    return pd.concat(parts, ignore_index=True)
 
 
 def _attach_maker_fills(sweeps: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:

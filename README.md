@@ -1,6 +1,8 @@
 # kalshi-bot
 
-Automated trading for Kalshi's 15-minute crypto markets (`KXBTC15M`, `KXDOGE15M`).
+Research and (eventually) automated trading for Kalshi's 15-minute up/down
+markets on crypto (BTC, ETH, SOL, DOGE, XRP) and commodities (gold, silver,
+oil). Nothing trades yet; the current phase records data and tests hypotheses.
 
 So far: configuration, request signing, a throttled and retrying HTTP client,
 typed models, a CLI for looking at markets and your account, and a market-data
@@ -58,6 +60,9 @@ kalshi_bot/
   recorder.py polling loop: books, trades, settlements, spot
   spot.py     Coinbase REST spot price poll
   spot_ws.py  Coinbase WebSocket spot feed (background thread)
+  pyth.py     Pyth Hermes feed lookup, REST poll and SSE stream (settlement source for metals/oil)
+  universe.py series universe, spot preferences, cross-asset hypotheses (+ universe.yaml)
+  crossasset.py cross-asset co-movement, lead-lag, predictor and divergence tests
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
   whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
@@ -75,6 +80,27 @@ Each 15-minute market carries its reference price in `floor_strike`: the
 average of the CF Benchmarks real-time index over the last minute before the
 window opened. It settles YES if the same average over the last minute before
 close is at least that value.
+
+## Universe
+
+`kalshi_bot/universe.py` declares which series the bot follows, which asset
+class each belongs to, and where its spot price comes from. Crypto series
+settle on the CF Benchmarks index, so Coinbase ticks are a proxy. Metal and
+energy series settle on **Pyth Network** prices, so the Pyth feed is the
+settlement reference itself and is preferred for them. Override any of it with
+a `universe.yaml` (see `universe.example.yaml`); oil series are disabled until
+their tickers and Pyth symbols are confirmed:
+
+```bash
+kalshi-bot series --category Commodities        # discover series tickers
+kalshi-bot universe-check --rules               # live markets + settlement source per series
+kalshi-bot pyth-feeds --query WTI               # find a Pyth symbol
+kalshi-bot pyth-check                           # resolve + price every Pyth symbol in the universe
+```
+
+The universe also declares the cross-asset **hypotheses** under test (ETH leads
+BTC and SOL, gold leads silver, Brent moves against gold and silver, and so
+on), each with a direction. They are tested, not assumed.
 
 ## Recording market data (phase 2)
 
@@ -101,7 +127,9 @@ minute until their settlement result and settlement index value
 (`expiration_value`) are known. No credentials are needed; every endpoint used
 is public.
 
-Alongside the 5-second poll, a WebSocket client subscribes to Coinbase's
+Alongside the 5-second poll, a Pyth Hermes server-sent-events stream records
+every price change for the universe's Pyth symbols (source `pyth`), and a
+WebSocket client subscribes to Coinbase's
 public ticker channel and writes sub-second price changes to the same `spot`
 table with source `coinbase_ws` (rate-limited to five rows per second per
 symbol, with the exchange timestamp kept for latency measurement). It
@@ -154,6 +182,15 @@ verdict with confidence intervals bootstrapped over markets, copy P&L as taker
 and maker after fees, spot conditioning, a time-ordered validation split, and
 splits by threshold, time to close, series, and aggressor side. Under 200
 whale sweeps it reports "inconclusive" by construction.
+
+`kalshi-bot crossasset` tests the cross-asset hypotheses: pairwise outcome
+co-movement (agreement rate and phi, bootstrapped over windows), the realised
+sign of each declared hypothesis, spot lead-lag cross-correlation at lags up to
+a minute, a predictor test (does the leader's market or recent return add
+information about the follower's settlement after controlling for the
+follower's own implied probability?), and a fee-inclusive divergence backtest.
+Co-movement alone is not an edge; only an informative predictor with positive
+held-out P&L counts.
 
 `kalshi_bot/fees.py` holds the fee model (7% x price x (1 - price) per
 contract for takers, rounded up to the cent per order). Check it against

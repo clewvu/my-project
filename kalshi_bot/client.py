@@ -208,6 +208,22 @@ class KalshiClient:
     def exchange_status(self) -> dict[str, Any]:
         return self._request("GET", "/exchange/status", auth=False)
 
+    def get_series(
+        self, *, category: str | None = None, tags: str | None = None, include_volume: bool = False
+    ) -> list[dict[str, Any]]:
+        """All series (public). ``category`` e.g. 'Crypto', 'Commodities' narrows the list."""
+        data = self._request(
+            "GET",
+            "/series",
+            params={
+                "category": category,
+                "tags": tags,
+                "include_product_metadata": "true" if include_volume else None,
+            },
+            auth=False,
+        )
+        return list(data.get("series", []))
+
     # ------------------------------------------------------------------ markets
 
     def get_markets(

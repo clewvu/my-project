@@ -1,15 +1,17 @@
 # Kalshi 15-minute crypto bot: handoff
 
 Paste or upload this file at the start of a new chat to continue the work.
-It is the complete context as of 2026-09-04. The code is the source of truth;
+It is the complete context as of 2026-11-09. The code is the source of truth;
 this document says what exists, what was learned, what was decided, and what
 comes next.
 
 ## 1. Goal and current phase
 
 Cameron (cameronlewis49@gmail.com, Windows, PowerShell) wants an automated
-trader for Kalshi's 15-minute BTC and DOGE up/down markets, starting from a
-$200 bankroll with a stated aim of $1,000. The agreed approach is research
+trader for Kalshi's 15-minute up/down markets on crypto (BTC, ETH, SOL, DOGE,
+XRP) and commodities (gold, silver, oil), starting from a $200 bankroll with a
+stated aim of $1,000. A side aim is to exploit cross-asset co-movement (metals
+together, crypto majors together, oil against metals) if it proves predictive. The agreed approach is research
 first: record data, test hypotheses against pre-registered thresholds, and
 only build a live trader if a test passes out of sample. "Stop, no edge
 found" is an explicit acceptable outcome.
@@ -18,7 +20,9 @@ Phases:
 
 1. Done: config, RSA-PSS signing, HTTP client, CLI.
 2. Done: market-data recorder (books, trades, settlements, spot).
-3. Tooling done, awaiting data: research reports (`analyze`, `whale`).
+3. Tooling done, awaiting data: research reports (`analyze`, `whale`,
+   `crossasset`). Universe widened on 2026-11-09 to ETH, SOL, XRP, gold,
+   silver (oil pending ticker/feed confirmation); Pyth feed added.
 4. Not started: risk engine, decision log / feature store, strategy interface.
 5. Not started: demo run with paper orders.
 6. Not started: production at minimum size.
@@ -54,6 +58,11 @@ kalshi_bot/
   recorder.py  polling loop: markets, books, trades, settlements, spot
   spot.py      Coinbase REST spot poll (every tick)
   spot_ws.py   Coinbase WebSocket ticker feed (background thread)
+  pyth.py      Pyth Hermes: feed lookup, REST latest, SSE stream (settlement
+               source for metals/oil; cross-check for crypto)
+  universe.py  Asset list, spot source preference per series, directed
+               cross-asset Hypothesis list; universe.yaml override
+  crossasset.py co-movement, lead-lag, predictor and divergence tests
   fees.py      Kalshi fee model: 7% x price x (1 - price) per contract,
                rounded up to the cent per order (verify against schedule)
   analysis.py  research report (pandas)
@@ -74,7 +83,11 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | markets --series X [--raw] | no | list markets; --raw prints API JSON |
 | orderbook TICKER [--raw] | no | resting book |
 | candles TICKER | no | OHLC candles |
-| record | no | the recorder (defaults to production data) |
+| record [--universe f] [--no-pyth] | no | the recorder (defaults to production data, whole universe) |
+| series [--category C] [--grep S] | no | discover series tickers |
+| universe-check [--rules] | no | live market + settlement source per universe series |
+| pyth-feeds --query Q / pyth-check | no | find Pyth symbols; resolve and price the universe's |
+| crossasset [--universe f] | no | cross-asset report |
 | record-stats / record-dump | no | what has been captured; latest raw rows |
 | spot-ws --seconds N | no | test the WebSocket feed alone |
 | analyze | no | research report over the database |
@@ -98,7 +111,11 @@ repo; `.gitignore` covers `*.pem`, `.env`, and `state/`.
 - Auth headers: `KALSHI-ACCESS-KEY`, `KALSHI-ACCESS-TIMESTAMP` (ms),
   `KALSHI-ACCESS-SIGNATURE` = base64(RSA-PSS-SHA256(ts + METHOD + full path
   without query)). Path includes `/trade-api/v2`.
-- Series: `KXBTC15M`, `KXDOGE15M`. Ticker example
+- Series: crypto `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXDOGE15M`, `KXXRP15M`;
+  commodities `KXGOLD15M`, `KXSILVER15M`, oil reportedly `KXWTI15M` and a
+  Brent series (tickers unverified; third-party sources only). Metals and oil
+  settle on Pyth 1-minute candle closes, not CF Benchmarks; they trade on a
+  weekday schedule. Ticker example
   `KXBTC15M-26SEP041215-15` (close time in Eastern). One market per series
   is open at a time, for exactly its 15-minute window (`open_time` to
   `close_time`).
@@ -139,8 +156,10 @@ All timestamps unix seconds; prices dollars; counts contracts.
 - `trades`: trade_id, ticker, ts (exchange time), yes_price, no_price, count,
   taker_side, raw (JSON, includes taker_book_side).
 - `spot`: ts (local), source (`coinbase` = 5 s REST, `coinbase_ws` =
-  sub-second WebSocket, rate-limited to 5 rows/s/symbol), symbol, price,
-  exchange_ts.
+  sub-second WebSocket, `pyth` = Hermes SSE stream; both streams rate-limited
+  to 5 rows/s/symbol), symbol (`BTC-USD` style for Coinbase, `Metal.XAU/USD`
+  style for Pyth), price, exchange_ts. `analysis.spot_for_series` merges
+  sources per the universe's preference order.
 - `meta`: schema_version. Older files migrate in place on open.
 
 ## 6. Research plan (docs/research-brief.md, pre-registered)
@@ -158,6 +177,11 @@ Primary tests, both on pooled BTC + DOGE with a series term:
    trade only when it beats the ask by fees plus a margin. Not yet coded;
    `analyze` already reports the spot-vs-strike signal, calibration, Brier
    scores, lead-lag, and a fee-inclusive backtest grid as groundwork.
+
+3. Cross-asset (brief section 8): co-movement, lead-lag, predictor test
+   controlling for the follower's own price, divergence backtest. Bar: an
+   informative predictor AND held-out divergence net >= +1 cent/contract with
+   CI excluding zero, 200+ held-out windows.
 
 Dropped: perp funding/basis (no information on a 15-minute horizon), news or
 search tools, random-entry nulls, unclustered confidence intervals.
@@ -203,9 +227,15 @@ alerts with a dead-man heartbeat, paper mode default, minimal dashboard.
 
 ## 9. Immediate next steps
 
-1. Wait for roughly a day of data, then run `kalshi-bot record-stats`,
-   `kalshi-bot analyze`, and `kalshi-bot whale`; interpret against the
-   brief's thresholds.
+0. Cameron, on his laptop: `git pull`, `pip install -e ".[dev]"`, then
+   `kalshi-bot universe-check --rules`, `kalshi-bot series --category Commodities`,
+   `kalshi-bot pyth-feeds --query WTI` (and BRENT), `kalshi-bot pyth-check`.
+   Paste results. Fix tickers / Pyth symbols in `universe.yaml`, enable oil,
+   restart the recorder. The recorder has been running on BTC+DOGE only since
+   September; new series start accumulating from the restart.
+1. After a week of multi-series data, run `kalshi-bot record-stats`,
+   `kalshi-bot analyze`, `kalshi-bot whale`, and `kalshi-bot crossasset`;
+   interpret against the brief's thresholds.
 2. Code the fair-value model and backtest (section 3 of the brief) so both
    hypotheses are tested on the same data.
 3. Only if a test passes: phase 4 (risk engine, decision log / feature

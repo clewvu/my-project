@@ -1,0 +1,17 @@
+# Copy to universe.yaml to override the built-in universe. Only the fields you
+# give are changed; everything else keeps its default. Series not listed here
+# keep their defaults too.
+assets:
+  - series: KXWTI15M
+    enabled: true
+    pyth_symbol: "Commodities.WTI1M"      # confirm with: kalshi-bot pyth-feeds --query WTI
+  - series: KXBRENT15M
+    enabled: true
+    pyth_symbol: "Commodities.BRENT1M"    # confirm with: kalshi-bot pyth-feeds --query BRENT
+  - series: KXXRP15M
+    enabled: false
+
+hypotheses:
+  - {name: eth_leads_btc,     leader: KXETH15M,   follower: KXBTC15M,    sign: 1}
+  - {name: gold_leads_silver, leader: KXGOLD15M,  follower: KXSILVER15M, sign: 1}
+  - {name: brent_vs_gold,     leader: KXBRENT15M, follower: KXGOLD15M,   sign: -1}

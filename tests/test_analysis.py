@@ -18,7 +18,7 @@ def build_db(path, n_markets=30, seed=1):
     t0 = 1_700_000_000.0
     for i in range(n_markets):
         series = "KXBTC15M" if i % 2 == 0 else "KXDOGE15M"
-        symbol = analysis.SPOT_SYMBOLS[series]
+        symbol = analysis.load_universe().by_series(series).coinbase_symbol
         strike = 80_000.0 if series == "KXBTC15M" else 0.25
         open_ts = t0 + i * 900
         close_ts = open_ts + 900
@@ -142,22 +142,37 @@ def test_report_with_nothing_settled(tmp_path):
     assert "keep recording" in text and "== brier" not in text
 
 
-def test_prefer_websocket_spot():
+def test_spot_for_series_prefers_best_source_and_fills_outside_span():
     spot = pd.DataFrame(
         {
-            "ts": [1.0, 5.0, 10.0, 6.0, 7.0, 15.0, 1.0],
-            "source": ["coinbase"] * 3 + ["coinbase_ws"] * 2 + ["coinbase", "coinbase"],
-            "symbol": ["BTC-USD"] * 6 + ["DOGE-USD"],
-            "price": [1, 2, 3, 4, 5, 6, 7],
+            "ts": [1.0, 5.0, 10.0, 6.0, 7.0, 15.0, 6.5, 1.0],
+            "source": ["coinbase"] * 3 + ["coinbase_ws"] * 2 + ["coinbase", "coinbase", "pyth"],
+            "symbol": ["BTC-USD"] * 7 + ["Crypto.BTC/USD"],
+            "price": [1, 2, 3, 4, 5, 6, 9, 42],
         }
     )
-    out = analysis.prefer_websocket_spot(spot)
-    btc = out[out["symbol"] == "BTC-USD"]
-    # REST rows inside the websocket span (ts 6..7) are dropped: none here, but ts=5 and 10 kept
-    assert sorted(btc["ts"].tolist()) == [1.0, 5.0, 6.0, 7.0, 10.0, 15.0]
-    assert out[out["symbol"] == "DOGE-USD"]["price"].tolist() == [7]
-    inside = pd.DataFrame(
-        {"ts": [6.5], "source": ["coinbase"], "symbol": ["BTC-USD"], "price": [9]}
+    pref = [("coinbase_ws", "BTC-USD"), ("pyth", "Crypto.BTC/USD"), ("coinbase", "BTC-USD")]
+    out = analysis.spot_for_series(spot, pref)
+    # ws rows (6, 7) kept; pyth fills t=1; REST rows inside covered spans (1.0, 6.5) dropped
+    assert out["ts"].tolist() == [1.0, 5.0, 6.0, 7.0, 10.0, 15.0]
+    assert out["price"].tolist() == [42, 2, 4, 5, 3, 6]
+    assert analysis.spot_for_series(spot, [("nope", "X")]).empty
+
+
+def test_attach_spot_uses_universe_preference():
+    from kalshi_bot.universe import Asset, Universe
+
+    uni = Universe([Asset("KXGOLD15M", "GOLD", "metal", "Metal.XAU/USD")])
+    frame = pd.DataFrame({"ts": [10.0, 20.0], "series_ticker": ["KXGOLD15M"] * 2})
+    spot = pd.DataFrame(
+        {
+            "ts": [9.0, 19.0],
+            "source": ["pyth"] * 2,
+            "symbol": ["Metal.XAU/USD"] * 2,
+            "price": [4000.0, 4001.0],
+        }
     )
-    out2 = analysis.prefer_websocket_spot(pd.concat([spot, inside]))
-    assert 9 not in out2["price"].tolist()
+    out = analysis.attach_spot(frame, spot, uni)
+    assert out["spot"].tolist() == [4000.0, 4001.0]
+    out2 = analysis.attach_spot(frame, spot.assign(source="coinbase"), uni)
+    assert out2["spot"].isna().all()

@@ -13,10 +13,12 @@ from datetime import UTC, datetime
 from . import __version__
 from .client import KalshiClient, KalshiError
 from .config import BASE_URLS, Settings
+from .pyth import PythClient, PythStream
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
 from .spot import SpotFeed
 from .spot_ws import FEEDS, SpotWebSocket
 from .storage import MarketDataStore, SchemaMismatch
+from .universe import load_universe
 
 DEFAULT_DB = "state/market_data.sqlite"
 
@@ -188,24 +190,133 @@ def cmd_cancel_all(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_record(settings: Settings, args: argparse.Namespace) -> int:
     """Record orderbooks, trades, settlements and spot prices to SQLite (Ctrl-C to stop)."""
-    symbols = args.spot_symbol or DEFAULT_SPOT_SYMBOLS
-    spot = None if args.no_spot else SpotFeed(symbols)
+    uni = load_universe(args.universe)
+    series = args.series or uni.series
+    symbols = args.spot_symbol or uni.coinbase_symbols
+    spot = None if args.no_spot or not symbols else SpotFeed(symbols)
     with _client(settings, need_auth=False) as client, MarketDataStore(args.db) as store:
-        spot_ws = None if args.no_spot_ws else SpotWebSocket(store, symbols, feed=args.spot_feed)
+        spot_ws = None
+        if not args.no_spot_ws and symbols:
+            spot_ws = SpotWebSocket(store, symbols, feed=args.spot_feed)
+        pyth = None
+        if not args.no_pyth and uni.pyth_symbols:
+            pyth = PythStream(store, uni.pyth_symbols)
         rec = Recorder(
             client,
             store,
-            series=args.series or DEFAULT_SERIES,
+            series=series,
             interval=args.interval,
             book_depth=args.depth,
             spot=spot,
             spot_ws=spot_ws,
+            pyth=pyth,
         )
         try:
             rec.run(max_ticks=args.ticks)
         finally:
             if spot is not None:
                 spot.close()
+    return 0
+
+
+def cmd_series(settings: Settings, args: argparse.Namespace) -> int:
+    """List Kalshi series (optionally by category or substring) to discover tickers."""
+    with _client(settings, need_auth=False) as client:
+        rows = client.get_series(category=args.category)
+    needle = (args.grep or "").upper()
+    rows = [
+        r
+        for r in rows
+        if needle in str(r.get("ticker", "")).upper() or needle in str(r.get("title", "")).upper()
+    ]
+    rows.sort(key=lambda r: str(r.get("ticker", "")))
+    print(f"{'ticker':22} {'category':14} {'frequency':12} title")
+    for r in rows:
+        print(
+            f"{str(r.get('ticker', '')):22} {str(r.get('category', '')):14} "
+            f"{str(r.get('frequency', '')):12} {r.get('title', '')}"
+        )
+    print(f"({len(rows)} series)")
+    return 0
+
+
+def cmd_universe_check(settings: Settings, args: argparse.Namespace) -> int:
+    """Verify every series in the universe has live markets and show how each settles."""
+    uni = load_universe(args.universe)
+    with _client(settings, need_auth=False) as client:
+        for a in uni.assets:
+            flag = "" if a.enabled else " (disabled)"
+            try:
+                markets = client.get_markets(series_ticker=a.series, status="open", max_pages=1)
+            except KalshiError as exc:
+                print(f"{a.series:14} {a.name:7}{flag}  ERROR {exc}")
+                continue
+            live = [m for m in markets if m.status.lower() not in ("closed", "settled")]
+            if not live:
+                print(f"{a.series:14} {a.name:7}{flag}  no open markets ({len(markets)} returned)")
+                continue
+            m = sorted(live, key=lambda x: x.close_time or datetime.max.replace(tzinfo=UTC))[0]
+            rules = str(m.raw.get("rules_primary", ""))
+            source = (
+                "CF Benchmarks"
+                if "CF Benchmarks" in rules
+                else ("Pyth" if "Pyth" in rules else "unknown")
+            )
+            strike = f"{m.strike:,.4f}" if m.strike is not None else "-"
+            print(
+                f"{a.series:14} {a.name:7}{flag}  {m.ticker}  closes {_fmt_time(m.close_time)}  "
+                f"strike={strike}  yes={_px(m.yes_bid)}/{_px(m.yes_ask)}  settles on {source}"
+            )
+            if args.rules:
+                print(f"    {rules[:300]}")
+    return 0
+
+
+def cmd_pyth_feeds(_: Settings, args: argparse.Namespace) -> int:
+    """Search Pyth price feeds, e.g. --query XAU or --query WTI, to find symbols."""
+    client = PythClient()
+    try:
+        feeds = client.search_feeds(args.query, asset_type=args.asset_type)
+    finally:
+        client.close()
+    print(f"{'symbol':28} {'type':12} {'id':66} description")
+    for f in feeds:
+        print(f"{f.symbol:28} {f.asset_type:12} {f.id:66} {f.description}")
+    print(f"({len(feeds)} feeds)")
+    return 0
+
+
+def cmd_pyth_check(_: Settings, args: argparse.Namespace) -> int:
+    """Resolve the universe's Pyth symbols and print their latest prices."""
+    uni = load_universe(args.universe)
+    client = PythClient()
+    try:
+        feeds = client.resolve(uni.pyth_symbols)
+        ticks = client.latest(feeds) if feeds else []
+    finally:
+        client.close()
+    for sym in uni.pyth_symbols:
+        f = feeds.get(sym)
+        t = next((t for t in ticks if t.symbol == sym), None)
+        if f is None:
+            base = sym.split(".")[-1].split("/")[0]
+            print(f"{sym:24} UNRESOLVED (try: kalshi-bot pyth-feeds --query {base})")
+        elif t is None:
+            print(f"{sym:24} id={f.id[:12]}...  no price returned")
+        else:
+            age = time.time() - (t.exchange_ts or t.local_ts)
+            print(f"{sym:24} {t.price:>14,.4f}  published {age:.1f}s ago")
+    return 0 if len(feeds) == len(uni.pyth_symbols) else 1
+
+
+def cmd_crossasset(_: Settings, args: argparse.Namespace) -> int:
+    """Cross-asset co-movement, lead-lag, and predictor tests across the universe."""
+    try:
+        from . import crossasset
+    except ImportError:
+        sys.exit('crossasset needs pandas: pip install -e ".[research]"')
+    data = crossasset.load(args.db, universe=load_universe(args.universe))
+    print(crossasset.report(data))
     return 0
 
 
@@ -358,8 +469,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--series",
         action="append",
-        help=f"series ticker; repeatable (default: {' '.join(DEFAULT_SERIES)})",
+        help=f"series ticker; repeatable (default: universe = {' '.join(DEFAULT_SERIES)})",
     )
+    s.add_argument("--universe", default=None, help="path to a universe.yaml override")
+    s.add_argument("--no-pyth", action="store_true", help="skip the Pyth price stream")
     s.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
     s.add_argument("--depth", type=int, default=10, help="orderbook levels to store")
     s.add_argument("--db", default=DEFAULT_DB)
@@ -380,6 +493,30 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"spot symbol; repeatable (default: {' '.join(DEFAULT_SPOT_SYMBOLS)})",
     )
     s.set_defaults(func=cmd_record)
+
+    s = sub.add_parser("series", help=cmd_series.__doc__)
+    s.add_argument("--category", default=None, help="e.g. Crypto, Commodities")
+    s.add_argument("--grep", default="15M", help="substring filter on ticker/title (default 15M)")
+    s.set_defaults(func=cmd_series, default_env="prod")
+
+    s = sub.add_parser("universe-check", help=cmd_universe_check.__doc__)
+    s.add_argument("--universe", default=None)
+    s.add_argument("--rules", action="store_true", help="print each market's settlement rule")
+    s.set_defaults(func=cmd_universe_check, default_env="prod")
+
+    s = sub.add_parser("pyth-feeds", help=cmd_pyth_feeds.__doc__)
+    s.add_argument("--query", required=True)
+    s.add_argument("--asset-type", default=None, help="crypto | metal | commodities | fx | equity")
+    s.set_defaults(func=cmd_pyth_feeds)
+
+    s = sub.add_parser("pyth-check", help=cmd_pyth_check.__doc__)
+    s.add_argument("--universe", default=None)
+    s.set_defaults(func=cmd_pyth_check)
+
+    s = sub.add_parser("crossasset", help=cmd_crossasset.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--universe", default=None)
+    s.set_defaults(func=cmd_crossasset)
 
     s = sub.add_parser("spot-ws", help=cmd_spot_ws.__doc__)
     s.add_argument("--seconds", type=int, default=15)
@@ -431,6 +568,11 @@ def main(argv: list[str] | None = None) -> int:
         "analyze",
         "spot-ws",
         "whale",
+        "series",
+        "universe-check",
+        "pyth-feeds",
+        "pyth-check",
+        "crossasset",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:
