@@ -113,6 +113,24 @@ class FairValueParams:
     min_price: float = 0.05  # never buy lottery tickets below this
     taker_rate: float = 0.07
     max_spot_age: float = 10.0
+    # Calibration map learned offline by `kalshi-bot learn`:
+    #   logit(p_cal) = cal_a + cal_b * logit(p_model). Identity by default.
+    cal_a: float = 0.0
+    cal_b: float = 1.0
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> FairValueParams:
+        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        return cls(**known)
+
+
+def calibrate(p: float, a: float, b: float) -> float:
+    p = min(1 - 1e-6, max(1e-6, p))
+    z = a + b * math.log(p / (1 - p))
+    return 1 / (1 + math.exp(-z))
 
 
 class FairValueStrategy:
@@ -158,8 +176,18 @@ class FairValueStrategy:
             return Decision("skip", "one-sided or empty book", None, feats)
         tau = max(1.0, secs - SETTLEMENT_AVERAGE_S / 2)
         z = math.log(spot / market.strike) / (sigma * math.sqrt(tau))
-        p_up = norm_cdf(z)
-        feats.update({"tau": tau, "z": z, "fair_p": p_up})
+        p_model = norm_cdf(z)
+        p_up = calibrate(p_model, p.cal_a, p.cal_b)
+        feats.update(
+            {
+                "tau": tau,
+                "z": z,
+                "fair_p_model": p_model,
+                "fair_p": p_up,
+                "cal_a": p.cal_a,
+                "cal_b": p.cal_b,
+            }
+        )
         candidates = []
         for side, ask, fair in (("yes", yes_ask, p_up), ("no", no_ask, 1 - p_up)):
             if not p.min_price <= ask <= p.max_price:

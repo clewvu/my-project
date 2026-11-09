@@ -30,6 +30,10 @@ Phases:
 5. Current: paper trading. Live is gated (prod env, dry_run false, key,
    `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`) and NOT yet run.
 6. Not started: production at minimum size. Only after paper results are read.
+7. Done 2026-11-09: gated learning loop (learn.py, `kalshi-bot learn`):
+   decision log with counterfactual results, calibration fit, held-out
+   paired evaluation, promotion gate, config history with rollback. Live
+   adaptation limited to downward size scaling and a drift halt (risk.py).
 
 The recorder is currently running on Cameron's laptop against production
 public endpoints. It started collecting clean data (schema v3) around
@@ -94,6 +98,7 @@ CLI (`kalshi-bot --env prod|demo <command>`):
 | crossasset [--universe f] | no | cross-asset report |
 | trade [--live --acknowledge ...] | live only | fair-value trading loop, paper by default |
 | trade-status / risk-reset | no | paper or live P&L, decisions, risk state; clear a halt |
+| learn [--promote|--history|--rollback|--activate id] | no | gated retraining on the decision log |
 | record-stats / record-dump | no | what has been captured; latest raw rows |
 | spot-ws --seconds N | no | test the WebSocket feed alone |
 | analyze | no | research report over the database |

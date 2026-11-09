@@ -66,6 +66,7 @@ kalshi_bot/
   risk.py     RiskEngine: hard limits, persisted state, kill switch
   strategy.py FairValueStrategy + SpotHistory (realized vol)
   trader.py   trading loop: paper fills or live orders, settlement scoring
+  learn.py    scheduled calibration + held-out evaluation + promotion gate
   fees.py     Kalshi fee model
   analysis.py research report over the recorded data (needs pandas)
   whale.py    whale-follow hypothesis test with clustered bootstrap (needs pandas)
@@ -193,6 +194,38 @@ refuses to start unless all of these hold: `KALSHI_ENV=prod`,
 `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`. It then prints the balance
 and limits and waits 10 seconds. Run paper first, for at least a day, and read
 `trade-status` before considering it.
+
+## Learning (gated, not online)
+
+The system improves between runs, never per trade. Every decision the trader
+makes, including skips and risk rejections, is logged with its full feature
+vector and later joined to the market's settlement result, so skipped windows
+are counterfactuals. On that log:
+
+```bash
+kalshi-bot learn            # calibrate, evaluate candidates on held-out data, propose
+kalshi-bot learn --promote  # activate the proposed config (trader picks it up on restart)
+kalshi-bot learn --history  # list saved configs; * marks the active one
+kalshi-bot learn --rollback # revert to the previous config
+kalshi-bot learn --live     # same, on the live decision log
+```
+
+`learn` fits a calibration map on the first 70% of decisions in time order
+(`logit(p) = a + b * logit(p_model)`; a well-calibrated model has a=0, b=1),
+then replays a grid of candidate configs (raw or calibrated, several margins)
+over the held-out 30% using the logged asks and exact fees. Each candidate is
+compared to the incumbent on the same decisions, with a bootstrap CI on the
+paired difference. A candidate is proposed only if that CI excludes zero, its
+own held-out net is positive, and the held-out sample has at least 100
+decisions. Promotion is explicit, logged, and reversible. Run it daily or
+weekly; more often just chases noise.
+
+Two things do adapt live, both only downward: position size shrinks to half
+when the last 20 settled trades are net negative and to a quarter when they
+are worse than a quarter of the daily cap; and a drift monitor halts trading
+when realised wins over the last 30 trades fall more than two standard
+deviations below what the model's own probabilities predicted. Both are in
+`risk.py`; entry logic never changes while the trader is running.
 
 ## Research (phase 3)
 

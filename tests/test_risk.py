@@ -78,3 +78,50 @@ def test_loss_streak_cooloff(tmp_path):
     eng.record_settlement(-1, now=1e9)
     assert "cooling off" in eng.check(intent(), [], now=1e9 + 1).reason
     assert eng.check(intent(), [], now=1e9 + 101).allowed
+
+
+def test_size_scale_only_shrinks(tmp_path):
+    eng, _ = engine(
+        tmp_path,
+        daily_loss_cap=20.0,
+        adapt_window=10,
+        drift_window=100,
+        consecutive_loss_limit=1000,
+    )
+    assert eng.size_scale() == 1.0
+    for _ in range(6):
+        eng.record_settlement(+1.0, now=1e9, expected_win_p=0.6)
+    assert eng.size_scale() == 1.0
+    for _ in range(7):
+        eng.record_settlement(-1.0, now=1e9, expected_win_p=0.6)
+    assert eng.size_scale() == 0.5  # last 10: 3 wins, 7 losses = -4, above -cap/4 = -5
+    v = eng.check(intent(count=4), [], now=1e9)
+    assert v.allowed and v.adjusted_count == 2 and "scaled" in v.reason
+    for _ in range(4):
+        eng.record_settlement(-1.5, now=1e9, expected_win_p=0.6)
+    assert eng.size_scale() == 0.25
+    v = eng.check(intent(count=2), [], now=1e9)
+    assert not v.allowed and "scaled to zero" in v.reason
+
+
+def test_drift_halts_when_wins_fall_short(tmp_path):
+    eng, store = engine(
+        tmp_path, daily_loss_cap=1e9, consecutive_loss_limit=1000, drift_window=30, drift_z=2.0
+    )
+    # model says 70% win each time; realised 11/30
+    for i in range(30):
+        pnl = +0.3 if i % 3 == 0 and i < 33 else -0.7
+        eng.record_settlement(pnl, now=1e9 + i, expected_win_p=0.7)
+    assert eng.state.halted and "drift" in eng.state.halt_reason
+    # state survives restart
+    eng2 = RiskEngine(store, RiskLimits(drift_window=30), "paper")
+    assert eng2.state.halted and len(eng2.state.recent) == 30
+    eng2.reset()
+    assert not eng2.state.halted
+
+
+def test_drift_quiet_when_results_match_model(tmp_path):
+    eng, _ = engine(tmp_path, daily_loss_cap=1e9, consecutive_loss_limit=1000, drift_window=30)
+    for i in range(30):
+        eng.record_settlement(+0.4 if i % 10 < 6 else -0.6, now=1e9 + i, expected_win_p=0.6)
+    assert not eng.state.halted

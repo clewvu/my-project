@@ -28,7 +28,7 @@ from .recorder import is_live
 from .risk import OrderIntent, RiskEngine, RiskLimits
 from .spot_ws import SpotWebSocket
 from .storage import MarketDataStore
-from .strategy import FairValueStrategy, SpotHistory
+from .strategy import FairValueParams, FairValueStrategy, SpotHistory
 from .universe import Universe
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,20 @@ class Trader:
         self.strategy = strategy
         self.risk = RiskEngine(store, limits, mode)
         self.mode = mode
+        active = store.active_config(mode)
+        self.config_id: int | None = None
+        if active is not None:
+            # entry logic only changes between runs, via a promoted learned config
+            self.strategy.params = FairValueParams.from_dict(
+                {**self.strategy.params.to_dict(), **active["params"]}
+            )
+            self.config_id = active["id"]
+            log.info(
+                "using learned config id=%s (%s): %s",
+                active["id"],
+                active["source"],
+                active["params"],
+            )
         self.interval = max(1.0, interval)
         self.spot_ws = spot_ws
         self.pyth = pyth
@@ -168,6 +182,7 @@ class Trader:
             "action": decision.action,
             "reason": decision.reason,
             "features": {**decision.features, "spot_key": key, "strategy": self.strategy.name},
+            "config_id": self.config_id,
         }
         if decision.intent is None:
             summary.skips += 1
@@ -305,7 +320,8 @@ class Trader:
                 count=pos["count"],
                 settled_ts=now,
             )
-            self.risk.record_settlement(pnl, now)
+            self.store.set_decision_results(pos["ticker"], market.result)
+            self.risk.record_settlement(pnl, now, expected_win_p=self._expected_p(pos))
             summary.settled += 1
             log.info(
                 "%s settled %s: %s x%g @%.3f -> %+.2f (day %+.2f)",
@@ -317,6 +333,13 @@ class Trader:
                 pnl,
                 self.risk.state.day_pnl,
             )
+
+    def _expected_p(self, pos: dict) -> float | None:
+        """The model's win probability for this position at entry, from the decision log."""
+        for d in self.store.decisions(self.mode, 500):
+            if d["ticker"] == pos["ticker"] and d["action"] == "order" and d["fair_p"]:
+                return d["fair_p"] if pos["side"] == "yes" else 1 - d["fair_p"]
+        return None
 
     def _live_fill_count(self, order_id: str, requested: float) -> float:
         try:

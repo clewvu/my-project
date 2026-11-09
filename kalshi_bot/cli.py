@@ -556,6 +556,31 @@ def cmd_risk_reset(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_learn(_: Settings, args: argparse.Namespace) -> int:
+    """Scheduled retraining: calibrate, evaluate candidates on held-out data, gate promotion."""
+    try:
+        from . import learn
+    except ImportError:
+        sys.exit('learn needs pandas: pip install -e ".[research]"')
+    mode = "live" if args.live else "paper"
+    with MarketDataStore(args.db) as store:
+        if args.rollback:
+            print(learn.rollback(store, mode))
+            return 0
+        if args.activate is not None:
+            store.activate_config(mode, args.activate)
+            print(f"activated config id={args.activate}; restart the trader to use it")
+            return 0
+        if args.history:
+            for c in store.config_history(mode):
+                flag = "*" if c["active"] else " "
+                when = _fmt_time(datetime.fromtimestamp(c["created_ts"], tz=UTC))
+                print(f"{flag} id={c['id']} {when} {c['source']:9} {json.dumps(c['params'])}")
+            return 0
+        print(learn.run(store, mode, promote=args.promote))
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -672,6 +697,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--kill-file", default="state/KILL")
     s.set_defaults(func=cmd_trade, default_env="prod")
 
+    s = sub.add_parser("learn", help=cmd_learn.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--live", action="store_true", help="learn from live decisions (default paper)")
+    s.add_argument("--promote", action="store_true", help="activate the winning candidate")
+    s.add_argument("--activate", type=int, default=None, help="activate a saved config by id")
+    s.add_argument("--rollback", action="store_true", help="revert to the previous config")
+    s.add_argument("--history", action="store_true", help="list saved configs")
+    s.set_defaults(func=cmd_learn)
+
     s = sub.add_parser("trade-status", help=cmd_trade_status.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)
     s.add_argument("--live", action="store_true")
@@ -740,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
         "crossasset",
         "trade-status",
         "risk-reset",
+        "learn",
     ):
         logging.getLogger(__name__).info("env=%s dry_run=%s", settings.env, settings.dry_run)
     try:

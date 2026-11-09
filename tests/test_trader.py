@@ -142,3 +142,38 @@ def test_errors_do_not_crash_tick(tmp_path):
     trader, store, feed = make_trader(Broken(), tmp_path)
     s = trader.tick(CLOSE - 600)
     assert s.errors == 1 and s.orders == 0
+
+
+def test_trader_uses_active_config_and_tags_decisions(tmp_path):
+    client = FakeClient(mid=0.5)
+    store = MarketDataStore(tmp_path / "c.sqlite")
+    cid = store.save_config("paper", {"margin": 0.5, "cal_b": 0.5}, source="learn", activate=True)
+    feed = FakeFeed()
+    trader = Trader(
+        client,
+        store,
+        UNI,
+        FairValueStrategy(FairValueParams(margin=0.02)),
+        RiskLimits(),
+        mode="paper",
+        spot_ws=feed,
+    )
+    assert trader.strategy.params.margin == 0.5 and trader.strategy.params.cal_b == 0.5
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    s = trader.tick(now)
+    assert s.orders == 0 and s.skips == 1  # margin 0.5 is unreachable
+    d = store.decisions("paper")[0]
+    assert d["config_id"] == cid and "below margin" in d["reason"]
+
+
+def test_settlement_fills_decision_results(tmp_path):
+    client = FakeClient(mid=0.5)
+    trader, store, feed = make_trader(client, tmp_path)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    trader.tick(now)
+    client.result = "no"
+    trader.tick(CLOSE + 60)
+    assert all(d["result"] == "no" for d in store.decisions("paper"))
+    assert trader.risk.state.recent and trader.risk.state.recent[-1][1] > 0.5

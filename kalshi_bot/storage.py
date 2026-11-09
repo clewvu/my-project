@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .models import Market, Orderbook, Trade
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -114,7 +115,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     edge            REAL,
     action          TEXT NOT NULL,
     reason          TEXT,
-    features        TEXT
+    features        TEXT,
+    result          TEXT,
+    config_id       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
 
@@ -137,10 +140,24 @@ CREATE TABLE IF NOT EXISTS positions (
     settled_ts      REAL
 );
 CREATE INDEX IF NOT EXISTS idx_positions_mode_status ON positions(mode, status);
+
+CREATE TABLE IF NOT EXISTS strategy_configs (
+    id              INTEGER PRIMARY KEY,
+    mode            TEXT NOT NULL,
+    created_ts      REAL NOT NULL,
+    params          TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    report          TEXT,
+    active          INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # Applied in order to bring an older database up to SCHEMA_VERSION.
 MIGRATIONS: dict[int, list[str]] = {
+    5: [
+        "ALTER TABLE decisions ADD COLUMN result TEXT",
+        "ALTER TABLE decisions ADD COLUMN config_id INTEGER",
+    ],
     4: [],  # new tables only; created by SCHEMA
     3: [
         "ALTER TABLE markets ADD COLUMN expiration_value REAL",
@@ -195,9 +212,14 @@ class MarketDataStore:
                         f"{self.path} has schema version {version}, newer than this code "
                         f"({SCHEMA_VERSION}). Update kalshi-bot."
                     )
+                self._conn.executescript(SCHEMA)  # creates any missing tables first
                 for target in range(version + 1, SCHEMA_VERSION + 1):
                     for statement in MIGRATIONS.get(target, []):
-                        self._conn.execute(statement)
+                        try:
+                            self._conn.execute(statement)
+                        except sqlite3.OperationalError as exc:
+                            if "duplicate column" not in str(exc):
+                                raise
             self._conn.executescript(SCHEMA)
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -435,10 +457,13 @@ class MarketDataStore:
             "action",
             "reason",
             "features",
+            "result",
+            "config_id",
         ]
         values = [row.get(c) for c in cols]
-        if isinstance(values[-1], dict | list):
-            values[-1] = _json(values[-1])
+        fi = cols.index("features")
+        if isinstance(values[fi], dict | list):
+            values[fi] = _json(values[fi])
         with self._lock, self._conn:
             self._conn.execute(
                 f"INSERT INTO decisions ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
@@ -485,6 +510,100 @@ class MarketDataStore:
             self._conn.execute(
                 f"UPDATE positions SET {sets} WHERE id = ?", [*fields.values(), position_id]
             )
+
+    def backfill_decision_results(self) -> int:
+        """Copy settlement results onto decisions whose market has since settled."""
+        with self._lock, self._conn:
+            before = self._conn.total_changes
+            self._conn.execute(
+                """
+                UPDATE decisions SET result = (
+                    SELECT m.result FROM markets m WHERE m.ticker = decisions.ticker
+                )
+                WHERE result IS NULL AND ticker IN (
+                    SELECT ticker FROM markets WHERE result IN ('yes', 'no')
+                )
+                """
+            )
+            return self._conn.total_changes - before
+
+    def set_decision_results(self, ticker: str, result: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE decisions SET result = ? WHERE ticker = ? AND result IS NULL",
+                (result, ticker),
+            )
+
+    def all_decisions(self, mode: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM decisions WHERE mode = ? ORDER BY ts", (mode,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------ strategy configs
+
+    def active_config(self, mode: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM strategy_configs WHERE mode = ? AND active = 1 "
+                "ORDER BY created_ts DESC LIMIT 1",
+                (mode,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["params"] = json.loads(out["params"])
+        return out
+
+    def config_history(self, mode: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM strategy_configs WHERE mode = ? ORDER BY created_ts", (mode,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["params"] = json.loads(d["params"])
+            out.append(d)
+        return out
+
+    def save_config(
+        self,
+        mode: str,
+        params: dict[str, Any],
+        source: str,
+        report: str = "",
+        activate: bool = False,
+        now: float | None = None,
+    ) -> int:
+        now = time.time() if now is None else now
+        with self._lock, self._conn:
+            if activate:
+                self._conn.execute("UPDATE strategy_configs SET active = 0 WHERE mode = ?", (mode,))
+            cur = self._conn.execute(
+                "INSERT INTO strategy_configs (mode, created_ts, params, source, report, active) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (mode, now, _json(params), source, report, 1 if activate else 0),
+            )
+            return int(cur.lastrowid)
+
+    def activate_config(self, mode: str, config_id: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("UPDATE strategy_configs SET active = 0 WHERE mode = ?", (mode,))
+            self._conn.execute(
+                "UPDATE strategy_configs SET active = 1 WHERE id = ? AND mode = ?",
+                (config_id, mode),
+            )
+
+    def recent_settled(self, mode: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM positions WHERE mode = ? AND status = 'settled' "
+                "ORDER BY settled_ts DESC LIMIT ?",
+                (mode, limit),
+            ).fetchall()
+        return [dict(r) for r in rows][::-1]
 
     def decisions(self, mode: str, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
