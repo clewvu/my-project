@@ -20,6 +20,7 @@ from .client import KalshiClient, KalshiError
 from .commodities import ProxyFeed
 from .config import BASE_URLS, Settings
 from .events import EventBlackout
+from .models import Balance
 from .pyth import PythClient, PythStream
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
 from .risk import RiskEngine, RiskLimits
@@ -101,8 +102,15 @@ def cmd_status(settings: Settings, _: argparse.Namespace) -> int:
             f"exchange:   trading_active={status.get('trading_active')} "
             f"exchange_active={status.get('exchange_active')}"
         )
-        bal = client.get_balance()
+        raw_balance = client._request("GET", "/portfolio/balance")
+        bal = Balance.from_dict(raw_balance)
         print(f"balance:    ${bal.balance:,.2f}")
+        if getattr(args, "raw", False):
+            print("raw balance response:")
+            print(json.dumps(raw_balance, indent=2, default=str))
+            raw_orders = client._request("GET", "/portfolio/orders", params={"limit": 20})
+            print("raw orders response (first 20):")
+            print(json.dumps(raw_orders, indent=2, default=str)[:3000])
         positions = [p for p in client.get_positions() if p.position != 0]
         print(f"positions:  {len(positions)}")
         for p in positions:
@@ -956,7 +964,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("check", help=cmd_check.__doc__).set_defaults(func=cmd_check)
-    sub.add_parser("status", help=cmd_status.__doc__).set_defaults(func=cmd_status)
+    s = sub.add_parser("status", help=cmd_status.__doc__)
+    s.add_argument("--raw", action="store_true", help="print raw balance and orders JSON")
+    s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("markets", help=cmd_markets.__doc__)
     s.add_argument("--series", default="KXBTC15M", help="series ticker, e.g. KXBTC15M")
