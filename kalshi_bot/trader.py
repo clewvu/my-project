@@ -238,7 +238,8 @@ class Trader:
             summary.orders += 1
             row["action"] = "order"
         else:
-            row["action"], row["reason"] = "failed", "order not placed"
+            row["action"] = "failed"
+            row["reason"] = f"order not placed: {getattr(self, 'last_order_error', '')}"
             summary.errors += 1
         self.store.insert_decision(row)
 
@@ -273,6 +274,7 @@ class Trader:
                 )
             except (KalshiError, ValueError) as exc:
                 log.error("%s: live order failed: %s", market.ticker, exc)
+                self.last_order_error = str(exc)[:300]
                 return None
             if isinstance(result, DryRunOrder):
                 log.error("live mode but client returned a dry-run order; refusing")

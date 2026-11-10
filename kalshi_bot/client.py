@@ -366,6 +366,20 @@ class KalshiClient:
         )
         return [Order.from_dict(o) for o in data.get("orders", [])]
 
+    def get_settlements(self, *, limit: int = 200, max_pages: int = 10) -> list[dict[str, Any]]:
+        """Settled positions as the exchange records them (raw dicts; fields vary)."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            data = self._request(
+                "GET", "/portfolio/settlements", params={"limit": limit, "cursor": cursor}
+            )
+            out.extend(data.get("settlements", []))
+            cursor = data.get("cursor") or None
+            if not cursor:
+                break
+        return out
+
     def get_order(self, order_id: str) -> Order:
         data = self._request("GET", f"/portfolio/orders/{order_id}")
         return Order.from_dict(data.get("order", data))

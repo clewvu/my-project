@@ -562,6 +562,45 @@ def cmd_trade_status(_: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _dollars(d: dict, name: str) -> float:
+    v = d.get(f"{name}_dollars")
+    if v not in (None, ""):
+        return float(v)
+    v = d.get(name)
+    return float(v) / 100 if v not in (None, "") else 0.0
+
+
+def cmd_reconcile(settings: Settings, args: argparse.Namespace) -> int:
+    """Exchange-side truth: balance, settlements, recent fills, compared with the local log."""
+    with _client(settings, need_auth=True) as client, MarketDataStore(args.db) as store:
+        bal = client.get_balance()
+        settlements = client.get_settlements()
+        fills = client.get_fills(limit=200)
+        local = store.pnl_summary("live")
+    print(f"exchange balance:      ${bal.balance:,.2f}")
+    revenue = sum(_dollars(s, "revenue") for s in settlements)
+    cost = sum(_dollars(s, "yes_total_cost") + _dollars(s, "no_total_cost") for s in settlements)
+    fees = sum(_dollars(s, "fee") for s in settlements)
+    print(
+        f"exchange settlements:  {len(settlements)} markets, cost ${cost:,.2f}, "
+        f"revenue ${revenue:,.2f}, fees ${fees:,.2f}, net ${revenue - cost - fees:+,.2f}"
+    )
+    print(
+        f"local log (live):      {local['settled']} settled, pnl ${local['pnl']:+,.2f}, "
+        f"fees ${local['fees']:,.2f}, staked ${local['staked']:,.2f}"
+    )
+    print(f"exchange fills seen:   {len(fills)} (most recent {args.limit} below)")
+    for f in fills[: args.limit]:
+        print(
+            f"  {_fmt_time(f.created_time)} {f.ticker:30} {f.action:4} {f.side:3} x{f.count:<6g} "
+            f"@{_px(f.price)} {'taker' if f.is_taker else 'maker'}"
+        )
+    if args.raw and settlements:
+        print("\nraw settlement example:")
+        print(json.dumps(settlements[0], indent=2, default=str))
+    return 0
+
+
 def cmd_risk_reset(_: Settings, args: argparse.Namespace) -> int:
     """Clear a risk halt / cool-off after a manual review."""
     mode = "live" if args.live else "paper"
@@ -890,6 +929,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--live", action="store_true")
     s.add_argument("--limit", type=int, default=15)
     s.set_defaults(func=cmd_trade_status)
+
+    s = sub.add_parser("reconcile", help=cmd_reconcile.__doc__)
+    s.add_argument("--db", default=DEFAULT_DB)
+    s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--raw", action="store_true")
+    s.set_defaults(func=cmd_reconcile)
 
     s = sub.add_parser("risk-reset", help=cmd_risk_reset.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)
