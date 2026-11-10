@@ -1,0 +1,3 @@
+# Arguments for the live trader started by deploy\run-live.ps1 (one or more lines).
+# Edit, then close the "Kalshi LIVE" window and run start-live.cmd to apply.
+go --live --acknowledge I-ACCEPT-LIVE-TRADING-RISK --dollars 5 --max-contracts 100 --max-open 2 --daily-loss-cap 50 --margin 0.04

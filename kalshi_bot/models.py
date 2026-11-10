@@ -321,7 +321,7 @@ class Order:
             order_id=d.get("order_id") or "",
             client_order_id=d.get("client_order_id"),
             ticker=d.get("ticker") or "",
-            side=d.get("side") or "",
+            side=d.get("side") or d.get("outcome_side") or "",
             action=d.get("action") or "",
             type=d.get("type") or "",
             status=d.get("status") or "",

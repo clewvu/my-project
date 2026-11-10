@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 
 from .client import DryRunOrder, KalshiClient, KalshiError
+from .commodities import RAW_SOURCE, ProxyFeed
 from .fees import order_fee
 from .models import Market
 from .pyth import PythStream
@@ -29,9 +30,12 @@ from .risk import OrderIntent, RiskEngine, RiskLimits
 from .spot_ws import SpotWebSocket
 from .storage import MarketDataStore
 from .strategy import FairValueParams, FairValueStrategy, SpotHistory
-from .universe import Universe
+from .universe import COINBASE_WS, PYTH, SWISSQUOTE, Asset, Universe
 
 log = logging.getLogger(__name__)
+
+PROXY_WARMUP_S = 300.0  # proxy quotes needed before the vol estimate is trusted
+ORDER_RETRY_S = 60.0  # after a failed order, leave that market alone this long
 
 
 @dataclass
@@ -57,6 +61,8 @@ class Trader:
         interval: float = 5.0,
         spot_ws: SpotWebSocket | None = None,
         pyth: PythStream | None = None,
+        proxy: ProxyFeed | None = None,
+        proxy_margin: float = 0.02,
     ) -> None:
         if mode == "live" and (client.dry_run or not client.allow_live):
             raise ValueError("live mode needs a client with dry_run=False and allow_live=True")
@@ -83,7 +89,12 @@ class Trader:
         self.interval = max(1.0, interval)
         self.spot_ws = spot_ws
         self.pyth = pyth
+        self.proxy = proxy
+        self.proxy_margin = proxy_margin
         self.history = SpotHistory()
+        self._order_error: str | None = None
+        self._order_backoff: dict[str, float] = {}
+        self._unpriced_logged = False
         self._book_ts: dict[str, float] = {}
         self._stop = threading.Event()
         self._seed_history()
@@ -95,6 +106,8 @@ class Trader:
         now = time.time()
         for asset in self.universe.enabled:
             for source, symbol in asset.spot_preference:
+                # proxy history is kept raw (vol only needs returns); the level is rebased
+                source = RAW_SOURCE if source == SWISSQUOTE else source
                 rows = self.store.recent_spot(source, symbol, since=now - 3600)
                 if rows:
                     self.history.seed(self._hist_key(source, symbol), rows)
@@ -105,23 +118,77 @@ class Trader:
         return f"{source}:{symbol}"
 
     def _ingest_feeds(self) -> None:
-        for feed, source in ((self.spot_ws, "coinbase_ws"), (self.pyth, "pyth")):
+        for feed, source in (
+            (self.spot_ws, COINBASE_WS),
+            (self.pyth, PYTH),
+            (self.proxy, RAW_SOURCE),
+        ):
             if feed is None:
                 continue
             for symbol, tick in list(feed.buffer.latest.items()):
                 self.history.push(self._hist_key(source, symbol), tick.local_ts, tick.price)
 
-    def spot_for(self, series: str) -> tuple[float | None, float | None, float | None, str]:
-        """(price, ts, sigma, key) from the best available source for a series."""
+    def _has_feed(self, asset: Asset) -> bool:
+        """True if a running feed could price this asset."""
+        for source, symbol in asset.spot_preference:
+            if source == COINBASE_WS and self.spot_ws is not None:
+                return True
+            if source == PYTH and self.pyth is not None:
+                return True
+            if source == SWISSQUOTE and self.proxy is not None and symbol in self.proxy.symbols:
+                return True
+        return False
+
+    def tradable_assets(self) -> list[Asset]:
+        assets = [a for a in self.universe.enabled if self._has_feed(a)]
+        if not self._unpriced_logged:
+            self._unpriced_logged = True
+            missing = [a.series for a in self.universe.enabled if a not in assets]
+            if missing:
+                log.warning(
+                    "no live price feed for %s (their Pyth feeds need PYTH_API_KEY in .env); "
+                    "not traded",
+                    ", ".join(missing),
+                )
+        return assets
+
+    def spot_for(
+        self, series: str, market: Market | None = None, now: float | None = None
+    ) -> tuple[float | None, float | None, float | None, str]:
+        """(price, ts, sigma, key) from the best available source for a series.
+
+        When nothing usable is found the key slot carries the reason instead.
+        """
+        note = ""
         for source, symbol in self.universe.spot_preference(series):
-            key = self._hist_key(source, symbol)
+            proxy = source == SWISSQUOTE
+            key = self._hist_key(RAW_SOURCE if proxy else source, symbol)
             latest = self.history.latest(key)
             if latest is None:
                 continue
             ts, price = latest
+            if proxy:
+                if self.proxy is None or market is None or market.strike is None:
+                    continue
+                if market.open_time is None or market.close_time is None:
+                    continue
+                ratio = self.proxy.rebaser.observe(
+                    symbol,
+                    market.open_time.timestamp(),
+                    market.close_time.timestamp(),
+                    market.strike,
+                    time.time() if now is None else now,
+                )
+                if ratio is None:
+                    note = "proxy spot not anchored to this window's open"
+                    continue
+                if self.history.span(key) < PROXY_WARMUP_S:
+                    note = "proxy spot history still warming up"
+                    continue
+                price *= ratio
             sigma = self.history.realized_vol(key, self.strategy.params.vol_window)
-            return price, ts, sigma, key
-        return None, None, None, ""
+            return price, ts, sigma, f"{source}:{symbol}" if proxy else key
+        return None, None, None, note
 
     # ------------------------------------------------------------ tick
 
@@ -131,7 +198,7 @@ class Trader:
         summary = TickSummary()
         self._settle(now, summary)
         open_positions = self.store.positions(self.mode, "open")
-        for asset in self.universe.enabled:
+        for asset in self.tradable_assets():
             try:
                 markets = self.client.get_markets(
                     series_ticker=asset.series, status="open", max_pages=1
@@ -163,8 +230,23 @@ class Trader:
             log.warning("%s: orderbook failed: %s", market.ticker, exc)
             return
         book_ts = time.time()
-        spot, spot_ts, sigma, key = self.spot_for(series)
-        decision = self.strategy.decide(market, book, spot, spot_ts, sigma, now)
+        spot, spot_ts, sigma, key = self.spot_for(series, market, now)
+        asset = self.universe.by_series(series)
+        is_crypto = asset is None or asset.asset_class == "crypto"
+        is_proxy = key.startswith(SWISSQUOTE + ":")
+        decision = self.strategy.decide(
+            market,
+            book,
+            spot,
+            spot_ts,
+            sigma,
+            now,
+            # crypto settles on a one-minute average, Pyth series on one candle close
+            settlement_average_s=60.0 if is_crypto else 0.0,
+            extra_margin=self.proxy_margin if is_proxy else 0.0,
+        )
+        if spot is None and key:
+            decision.reason, key = key, ""
         secs = market.close_time.timestamp() - now if market.close_time else None
         row = {
             "ts": now,
@@ -221,6 +303,13 @@ class Trader:
                 verdict.reason,
             )
             return
+        retry_at = self._order_backoff.get(market.ticker, 0.0)
+        if now < retry_at:
+            row["action"] = "rejected"
+            row["reason"] = f"order failed recently; retry in {retry_at - now:.0f}s"
+            summary.rejected += 1
+            self.store.insert_decision(row)
+            return
         count = verdict.adjusted_count or it.count
         position = self._execute(market, series, it.side, count, it.price, now)
         if position is not None:
@@ -228,7 +317,9 @@ class Trader:
             summary.orders += 1
             row["action"] = "order"
         else:
-            row["action"], row["reason"] = "failed", "order not placed"
+            row["action"] = "failed"
+            row["reason"] = f"order not placed: {self._order_error or 'unknown error'}"[:300]
+            self._order_backoff[market.ticker] = now + ORDER_RETRY_S
             summary.errors += 1
         self.store.insert_decision(row)
 
@@ -251,9 +342,11 @@ class Trader:
                     expiration_ts=int(now + 15),
                 )
             except (KalshiError, ValueError) as exc:
+                self._order_error = f"{type(exc).__name__}: {exc}"
                 log.error("%s: live order failed: %s", market.ticker, exc)
                 return None
             if isinstance(result, DryRunOrder):
+                self._order_error = "client returned a dry-run order"
                 log.error("live mode but client returned a dry-run order; refusing")
                 return None
             order_id = result.order_id
@@ -358,13 +451,13 @@ class Trader:
         if install_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 signal.signal(sig, lambda *_: self.stop())
-        for feed in (self.spot_ws, self.pyth):
+        for feed in (self.spot_ws, self.pyth, self.proxy):
             if feed is not None:
                 feed.start()
         log.info(
             "trader %s mode, %s, limits %s",
             self.mode.upper(),
-            ",".join(self.universe.series),
+            ",".join(a.series for a in self.tradable_assets()),
             json.dumps(self.risk.limits.__dict__),
         )
         if self.risk.state.halted:
@@ -394,7 +487,7 @@ class Trader:
             if max_ticks is not None and ticks >= max_ticks:
                 break
             self._stop.wait(max(0.0, self.interval - (time.time() - started)))
-        for feed in (self.spot_ws, self.pyth):
+        for feed in (self.spot_ws, self.pyth, self.proxy):
             if feed is not None:
                 feed.stop()
         log.info("trader stopped after %d ticks", ticks)

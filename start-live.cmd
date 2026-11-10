@@ -1,5 +1,7 @@
 @echo off
 cd /d "%~dp0"
-echo LIVE mode: real orders on production. Ctrl-C to stop.
-.venv\Scripts\kalshi-bot.exe go --live --acknowledge I-ACCEPT-LIVE-TRADING-RISK --count 1 --max-contracts 1 --max-open 2 --daily-loss-cap 10 --margin 0.04
+echo LIVE mode: real orders on production. Settings: deploy\live-args.txt
+echo Restarts itself if it exits. Ctrl-C or stop-live.cmd to stop.
+if exist state\KILL del state\KILL
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy\run-live.ps1"
 pause

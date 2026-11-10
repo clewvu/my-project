@@ -55,6 +55,11 @@ class SpotHistory:
         d = self._data.get(symbol)
         return d[-1] if d else None
 
+    def span(self, symbol: str) -> float:
+        """Seconds of history held for a symbol."""
+        d = self._data.get(symbol)
+        return d[-1][0] - d[0][0] if d else 0.0
+
     def realized_vol(
         self, symbol: str, window: float = 1800.0, grid: float = 10.0, now: float | None = None
     ) -> float | None:
@@ -107,6 +112,7 @@ class Decision:
 class FairValueParams:
     margin: float = 0.03  # required edge beyond fees, in probability points
     count: int = 2  # contracts per order before risk sizing
+    dollars: float = 0.0  # if > 0: stake per order; contracts = floor(dollars / ask)
     vol_window: float = 1800.0
     min_sigma: float = 1e-6
     max_price: float = 0.90  # never pay more than this
@@ -147,8 +153,15 @@ class FairValueStrategy:
         spot_ts: float | None,
         sigma: float | None,
         now: float,
+        *,
+        settlement_average_s: float = SETTLEMENT_AVERAGE_S,
+        extra_margin: float = 0.0,
     ) -> Decision:
+        """``settlement_average_s`` is 60 for crypto (one-minute average) and 0 for
+        series that settle on a single candle close; ``extra_margin`` is added to the
+        required edge when spot is a proxy rather than the settlement feed."""
         p = self.params
+        margin = p.margin + extra_margin
         secs = (
             market.seconds_to_close()
             if market.close_time is None
@@ -174,7 +187,7 @@ class FairValueStrategy:
             return Decision("skip", "no volatility estimate yet", None, feats)
         if yes_ask is None or no_ask is None:
             return Decision("skip", "one-sided or empty book", None, feats)
-        tau = max(1.0, secs - SETTLEMENT_AVERAGE_S / 2)
+        tau = max(1.0, secs - settlement_average_s / 2)
         z = math.log(spot / market.strike) / (sigma * math.sqrt(tau))
         p_model = norm_cdf(z)
         p_up = calibrate(p_model, p.cal_a, p.cal_b)
@@ -198,6 +211,7 @@ class FairValueStrategy:
             return Decision("skip", "asks outside allowed price band", None, feats)
         edge, side, ask = max(candidates)
         feats.update({"best_side": side, "best_edge": edge})
-        if edge < p.margin:
-            return Decision("skip", f"edge {edge:+.3f} below margin {p.margin}", None, feats)
-        return Decision("order", f"edge {edge:+.3f}", Intent(side, p.count, ask, edge), feats)
+        if edge < margin:
+            return Decision("skip", f"edge {edge:+.3f} below margin {margin:g}", None, feats)
+        count = max(1, int(p.dollars / ask + 1e-9)) if p.dollars > 0 else p.count
+        return Decision("order", f"edge {edge:+.3f}", Intent(side, count, ask, edge), feats)

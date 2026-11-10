@@ -6,14 +6,18 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import sys
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+
 from . import __version__
 from .client import KalshiClient, KalshiError
+from .commodities import ProxyFeed
 from .config import BASE_URLS, Settings
 from .pyth import PythClient, PythStream
 from .recorder import DEFAULT_SERIES, DEFAULT_SPOT_SYMBOLS, Recorder
@@ -23,7 +27,7 @@ from .spot_ws import FEEDS, SpotWebSocket
 from .storage import MarketDataStore, SchemaMismatch
 from .strategy import FairValueParams, FairValueStrategy
 from .trader import Trader
-from .universe import load_universe
+from .universe import Universe, load_universe
 
 DEFAULT_DB = "state/market_data.sqlite"
 
@@ -304,7 +308,21 @@ def cmd_pyth_check(_: Settings, args: argparse.Namespace) -> int:
     client = PythClient()
     try:
         feeds = client.resolve(uni.pyth_symbols)
-        ticks = client.latest(feeds) if feeds else []
+        try:
+            ticks = client.latest(feeds) if feeds else []
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                hint = (
+                    "PYTH_API_KEY is set but Hermes refused it"
+                    if client.api_key
+                    else "Hermes price updates need a Pyth API key; set PYTH_API_KEY in .env"
+                )
+                print(f"error: Pyth Hermes -> HTTP {exc.response.status_code}: {hint}")
+                print(
+                    "(feed lookup still works; the recorder disables the Pyth stream without a key)"
+                )
+                return 1
+            raise
     finally:
         client.close()
     for sym in uni.pyth_symbols:
@@ -477,14 +495,14 @@ def cmd_trade(settings: Settings, args: argparse.Namespace) -> int:
         FairValueParams(
             margin=args.margin,
             count=args.count,
+            dollars=args.dollars,
             vol_window=args.vol_window,
             max_price=args.max_price,
             min_price=args.min_price,
         )
     )
     with client, MarketDataStore(args.db) as store:
-        spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
-        pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols else None
+        spot_ws, pyth, proxy = _price_feeds(store, uni)
         trader = Trader(
             client,
             store,
@@ -495,6 +513,8 @@ def cmd_trade(settings: Settings, args: argparse.Namespace) -> int:
             interval=args.interval,
             spot_ws=spot_ws,
             pyth=pyth,
+            proxy=proxy,
+            proxy_margin=args.proxy_margin,
         )
         if args.live:
             bal = client.get_balance()
@@ -671,6 +691,19 @@ def cmd_setup(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _price_feeds(
+    store: MarketDataStore, uni: Universe
+) -> tuple[SpotWebSocket | None, PythStream | None, ProxyFeed | None]:
+    """The live spot feeds the trader reads: Coinbase, Pyth (with a key), Swissquote (without)."""
+    spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
+    # Hermes answers 401 without a key, so only start the stream when one is set.
+    has_pyth_key = bool(os.getenv("PYTH_API_KEY", "").strip())
+    pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols and has_pyth_key else None
+    # Keyless fallback for the precious metals (Swissquote, rebased per window).
+    proxy = ProxyFeed(store, uni.proxy_symbols) if uni.proxy_symbols and not has_pyth_key else None
+    return spot_ws, pyth, proxy
+
+
 def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
     """Run recorder and trader together in one window. Paper unless --live."""
     uni = load_universe(args.universe)
@@ -691,6 +724,7 @@ def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
         FairValueParams(
             margin=args.margin,
             count=args.count,
+            dollars=args.dollars,
             vol_window=args.vol_window,
             max_price=args.max_price,
             min_price=args.min_price,
@@ -699,9 +733,7 @@ def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
     trade_client = KalshiClient.from_settings(settings, allow_live=args.live)
     record_client = KalshiClient(settings.base_url, None, min_request_interval=0.15)
     with trade_client, record_client, MarketDataStore(args.db) as store:
-        spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
-        pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols else None
-        recorder = Recorder(record_client, store, series=uni.series, interval=5.0)
+        spot_ws, pyth, proxy = _price_feeds(store, uni)
         trader = Trader(
             trade_client,
             store,
@@ -712,6 +744,15 @@ def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
             interval=args.interval,
             spot_ws=spot_ws,
             pyth=pyth,
+            proxy=proxy,
+            proxy_margin=args.proxy_margin,
+        )
+        # record what can be priced; the rest would only slow the tick down
+        recorder = Recorder(
+            record_client,
+            store,
+            series=[a.series for a in trader.tradable_assets()],
+            interval=5.0,
         )
         if args.live:
             bal = trade_client.get_balance()
@@ -738,9 +779,21 @@ def _strategy_and_risk_args(s: argparse.ArgumentParser) -> None:
     g = s.add_argument_group("strategy")
     g.add_argument("--margin", type=float, default=0.03, help="edge beyond fees required")
     g.add_argument("--count", type=int, default=2, help="contracts per order before sizing")
+    g.add_argument(
+        "--dollars",
+        type=float,
+        default=0.0,
+        help="stake per order in dollars (contracts = floor(dollars / ask)); overrides --count",
+    )
     g.add_argument("--vol-window", type=float, default=1800.0)
     g.add_argument("--max-price", type=float, default=0.90)
     g.add_argument("--min-price", type=float, default=0.05)
+    g.add_argument(
+        "--proxy-margin",
+        type=float,
+        default=0.02,
+        help="extra edge required when spot is the rebased Swissquote proxy, not Pyth",
+    )
     r = s.add_argument_group("risk")
     r.add_argument("--bankroll", type=float, default=200.0)
     r.add_argument("--daily-loss-cap", type=float, default=20.0)

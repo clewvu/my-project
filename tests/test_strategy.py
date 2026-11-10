@@ -61,3 +61,26 @@ def test_strategy_skips_when_fair_matches_market_or_data_bad():
     m2, book2 = market(mid=0.95)  # yes ask 0.96 > max_price; no ask 0.06 ok but fair is ~0
     d = strat.decide(m2, book2, spot=100.5, spot_ts=1400.0, sigma=1e-4, now=1400.0)
     assert d.action == "skip"
+
+
+def test_dollar_sizing_buys_as_many_contracts_as_the_stake_covers():
+    from kalshi_bot.models import Market, Orderbook
+
+    market = Market.from_dict(
+        {"ticker": "KXBTC15M-1", "status": "active", "floor_strike": 100.0, "close_time": 1900.0}
+    )
+
+    def book(yes_bid, no_bid):
+        return Orderbook.from_dict(
+            "KXBTC15M-1",
+            {"orderbook_fp": {"yes_dollars": [[yes_bid, "100"]], "no_dollars": [[no_bid, "100"]]}},
+        )
+
+    strat = FairValueStrategy(FairValueParams(margin=0.02, dollars=5.0))
+    # spot far above strike: fair ~1, YES ask = 1 - 0.60 = 0.40 -> floor(5 / 0.40) = 12
+    d = strat.decide(market, book("0.380", "0.600"), 101.0, 1000.0, 1e-4, 1000.0)
+    assert d.intent.side == "yes" and d.intent.count == 12
+    assert d.intent.count * d.intent.price <= 5.0
+    # YES ask 0.85 -> 5 contracts ($4.25)
+    d = strat.decide(market, book("0.830", "0.150"), 101.0, 1000.0, 1e-4, 1000.0)
+    assert d.intent.count == 5
