@@ -626,6 +626,75 @@ def cmd_reconcile(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_order(settings: Settings, args: argparse.Namespace) -> int:
+    """Place ONE small live limit order by hand, print the raw exchange response, then cancel.
+
+    Diagnostic for order-format problems. Requires the same gates as live trading.
+    """
+    problems = []
+    if settings.env != "prod":
+        problems.append("KALSHI_ENV must be prod")
+    if settings.dry_run:
+        problems.append("KALSHI_DRY_RUN must be false")
+    if not settings.has_credentials:
+        problems.append("API key not configured")
+    if args.acknowledge != LIVE_ACK:
+        problems.append(f"pass --acknowledge {LIVE_ACK}")
+    if problems:
+        sys.exit("refusing: " + "; ".join(problems))
+    with KalshiClient.from_settings(settings, allow_live=True) as client:
+        bal = client.get_balance()
+        print(f"balance before: ${bal.balance:,.2f}")
+        m = client.get_market(args.ticker)
+        book = client.get_orderbook(args.ticker, depth=3)
+        print(
+            f"{m.ticker} closes {_fmt_time(m.close_time)}  yes bid/ask "
+            f"{_px(book.best_yes_bid)}/{_px(book.best_yes_ask)}  "
+            f"no bid/ask {_px(book.best_no_bid)}/{_px(book.best_no_ask)}"
+        )
+        price = args.price
+        if price is None:
+            # one tick below the best bid on our side: rests, cannot fill, safe to cancel
+            bid = book.best_yes_bid if args.side == "yes" else book.best_no_bid
+            if bid is None:
+                sys.exit("empty book on that side; pass --price")
+            price = round(max(0.01, bid - 0.02), 4)
+        print(
+            f"placing: buy {args.side} x{args.count} @ {price:.4f} (cost ${args.count * price:.2f})"
+        )
+        try:
+            order = client.create_order(
+                args.ticker,
+                side=args.side,
+                action="buy",
+                count=args.count,
+                price=price,
+                expiration_ts=int(time.time() + 30),
+            )
+        except KalshiError as exc:
+            print(f"REFUSED: {exc}")
+            return 1
+        print(
+            f"accepted: order_id={order.order_id} status={order.status} "
+            f"count={order.count} remaining={order.remaining_count}"
+        )
+        time.sleep(args.hold)
+        try:
+            fresh = client.get_order(order.order_id)
+            print(f"after {args.hold}s: status={fresh.status} remaining={fresh.remaining_count}")
+        except KalshiError as exc:
+            print(f"get_order failed: {exc}")
+        if not args.keep:
+            try:
+                client.cancel_order(order.order_id, ticker=args.ticker)
+                print("cancelled")
+            except KalshiError as exc:
+                print(f"cancel failed (may already be filled/expired): {exc}")
+        bal = client.get_balance()
+        print(f"balance after:  ${bal.balance:,.2f}")
+    return 0
+
+
 def cmd_risk_reset(_: Settings, args: argparse.Namespace) -> int:
     """Clear a risk halt / cool-off after a manual review."""
     mode = "live" if args.live else "paper"
@@ -1006,6 +1075,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=40)
     s.add_argument("--raw", action="store_true")
     s.set_defaults(func=cmd_reconcile)
+
+    s = sub.add_parser("order", help=cmd_order.__doc__)
+    s.add_argument("--ticker", required=True)
+    s.add_argument("--side", choices=["yes", "no"], default="yes")
+    s.add_argument("--count", type=int, default=1)
+    s.add_argument("--price", type=float, default=None, help="dollars; default: 2c under the bid")
+    s.add_argument("--hold", type=float, default=5.0, help="seconds to leave it resting")
+    s.add_argument("--keep", action="store_true", help="do not cancel afterwards")
+    s.add_argument("--acknowledge", default="")
+    s.set_defaults(func=cmd_order, default_env="prod")
 
     s = sub.add_parser("risk-reset", help=cmd_risk_reset.__doc__)
     s.add_argument("--db", default=DEFAULT_DB)
