@@ -71,7 +71,7 @@ class FakeClient:
 def test_tick_records_everything_and_survives_errors():
     client, store = FakeClient(), MarketDataStore()
     client.fail_orderbook_for.add("DOGE-1")
-    rec = Recorder(client, store, interval=1)
+    rec = Recorder(client, store, series=["KXBTC15M", "KXDOGE15M"], interval=1)
     res = rec.tick(now=1000.0)
     assert res.markets == 2 and res.snapshots == 2 and res.new_trades == 2
     assert len(res.errors) == 1 and "DOGE-1" in res.errors[0]

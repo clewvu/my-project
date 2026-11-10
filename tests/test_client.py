@@ -114,7 +114,7 @@ def test_dry_run_never_sends_orders(signer):
     client, rec = make_client(signer, [], dry_run=True)
     result = client.create_order("KXBTC15M-X", side="yes", action="buy", count=2, price=0.45)
     assert isinstance(result, DryRunOrder)
-    assert result["yes_price_dollars"] == "0.4500" and "no_price_dollars" not in result
+    assert result["side"] == "bid" and result["price"] == "0.4500" and result["count"] == "2.00"
     assert result["client_order_id"]
     assert client.cancel_order("abc") is None
     assert rec.requests == []
@@ -127,37 +127,50 @@ def test_live_order_body_and_response(signer):
             (
                 201,
                 {
-                    "order": {
-                        "order_id": "o1",
-                        "ticker": "T",
-                        "status": "resting",
-                        "side": "no",
-                        "action": "buy",
-                        "type": "limit",
-                        "no_price": 60,
-                        "count": 3,
-                        "remaining_count": 3,
-                    }
+                    "order_id": "o1",
+                    "client_order_id": "cid",
+                    "fill_count": "3.00",
+                    "remaining_count": "0.00",
+                    "average_fill_price": "0.9090",
+                    "ts_ms": 1794266751000,
                 },
             )
         ],
         dry_run=False,
     )
     order = client.create_order(
-        "T", side="no", action="buy", count=3, price=0.091, client_order_id="cid"
+        "T",
+        side="no",
+        action="buy",
+        count=3,
+        price=0.091,
+        client_order_id="cid",
+        expiration_ts=1794266766,
     )
-    assert order.order_id == "o1" and order.no_price == 0.60
+    assert order.order_id == "o1" and order.no_price == 0.091 and order.side == "no"
+    assert order.status == "executed" and order.count == 3 and order.remaining_count == 0
+    assert rec.requests[0].url.path == "/trade-api/v2/portfolio/events/orders"
     sent = json.loads(rec.requests[0].content)
+    # buying NO at 0.091 is an ask on the YES book at 1 - 0.091
     assert sent == {
         "ticker": "T",
         "client_order_id": "cid",
-        "side": "no",
-        "action": "buy",
-        "count": 3,
-        "type": "limit",
-        "no_price_dollars": "0.0910",
+        "side": "ask",
+        "count": "3.00",
+        "price": "0.9090",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+        "expiration_time": 1794266766,
     }
     assert rec.requests[0].headers[HEADER_KEY] == "test-key-id"
+
+
+def test_buy_yes_is_a_bid_at_the_same_price(signer):
+    client, _ = make_client(signer, [], dry_run=True)
+    result = client.create_order("T", side="yes", action="buy", count=1, price=0.37)
+    assert result["side"] == "bid" and result["price"] == "0.3700"
+    result = client.create_order("T", side="no", action="sell", count=1, price=0.37)
+    assert result["side"] == "bid" and result["price"] == "0.6300"
 
 
 def test_prod_orders_blocked_without_allow_live(signer):
@@ -201,8 +214,8 @@ def test_cancel_all(signer):
                 200,
                 {
                     "orders": [
-                        {"order_id": "a", "status": "resting"},
-                        {"order_id": "b", "status": "resting"},
+                        {"order_id": "a", "status": "resting", "ticker": "T"},
+                        {"order_id": "b", "status": "resting", "ticker": "T"},
                     ]
                 },
             ),
@@ -213,7 +226,8 @@ def test_cancel_all(signer):
     )
     assert client.cancel_all_orders() == ["a", "b"]
     assert [r.method for r in rec.requests] == ["GET", "DELETE", "DELETE"]
-    assert rec.requests[1].url.path == "/trade-api/v2/portfolio/orders/a"
+    assert rec.requests[1].url.path == "/trade-api/v2/portfolio/events/orders/a"
+    assert rec.requests[1].url.params["market_ticker"] == "T"
 
 
 def test_positions_accepts_both_keys(signer):

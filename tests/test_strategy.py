@@ -98,3 +98,39 @@ def test_spread_filter_and_kelly_sizing():
     )
     d = strat.decide(m, book, 100.5, 1400.0, 1e-4, 1400.0)
     assert d.action == "order" and d.intent.count == 6 and d.features["kelly_count"] == 6
+
+
+def test_dollar_sizing_buys_as_many_contracts_as_the_stake_covers():
+    from kalshi_bot.models import Market, Orderbook
+
+    market = Market.from_dict(
+        {"ticker": "KXBTC15M-1", "status": "active", "floor_strike": 100.0, "close_time": 1900.0}
+    )
+
+    def book(yes_bid, no_bid):
+        return Orderbook.from_dict(
+            "KXBTC15M-1",
+            {"orderbook_fp": {"yes_dollars": [[yes_bid, "100"]], "no_dollars": [[no_bid, "100"]]}},
+        )
+
+    strat = FairValueStrategy(FairValueParams(margin=0.02, dollars=5.0, exec_mode="taker"))
+    # spot far above strike: fair ~1, YES ask = 1 - 0.60 = 0.40 -> floor(5 / 0.40) = 12
+    d = strat.decide(market, book("0.380", "0.600"), 101.0, 1000.0, 1e-4, 1000.0)
+    assert d.intent.side == "yes" and d.intent.count == 12
+    assert d.intent.count * d.intent.price <= 5.0
+    # YES ask 0.85 -> 5 contracts ($4.25)
+    d = strat.decide(market, book("0.830", "0.150"), 101.0, 1000.0, 1e-4, 1000.0)
+    assert d.intent.count == 5
+
+
+def test_favourites_only_and_sigma_scale():
+    strat = FairValueStrategy(FairValueParams(margin=0.02, exec_mode="taker", favourites_only=True))
+    m, book = market(strike=100.0, close=2000.0, mid=0.3)  # yes ask 0.31 (underdog), no ask 0.71
+    d = strat.decide(m, book, spot=100.5, spot_ts=1400.0, sigma=1e-4, now=1400.0)
+    assert d.action == "skip" and "favourites only" in d.reason
+    sharp = FairValueStrategy(FairValueParams(exec_mode="taker", sigma_scale=0.5))
+    soft = FairValueStrategy(FairValueParams(exec_mode="taker", sigma_scale=2.0))
+    m, book = market(mid=0.5)
+    p_sharp = sharp.decide(m, book, 100.05, 1400.0, 1e-3, 1400.0).features["fair_p"]
+    p_soft = soft.decide(m, book, 100.05, 1400.0, 1e-3, 1400.0).features["fair_p"]
+    assert p_sharp > p_soft > 0.5

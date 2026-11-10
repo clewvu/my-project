@@ -67,6 +67,7 @@ def load_dataset(store: MarketDataStore, mode: str) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     feats = df["features"].map(lambda s: json.loads(s) if isinstance(s, str) else {})
     df["fair_p_model"] = feats.map(lambda f: f.get("fair_p_model", f.get("fair_p")))
+    df["z"] = feats.map(lambda f: f.get("z"))
     df["secs_to_close"] = df["secs_to_close"].astype(float)
     df = df[df["result"].isin(["yes", "no"])]
     df = df.dropna(subset=["fair_p_model", "yes_ask", "no_ask"])
@@ -108,15 +109,28 @@ def fit_calibration(p_model: np.ndarray, y: np.ndarray, ridge: float = 1e-3) -> 
     return a, b
 
 
+def _norm_cdf(x: np.ndarray) -> np.ndarray:
+    from math import erf, sqrt
+
+    return np.array([0.5 * (1 + erf(v / sqrt(2))) for v in x])
+
+
 def replay(df: pd.DataFrame, params: FairValueParams) -> pd.Series:
     """Net P&L per decision (0 where the rule does not trade) for one contract."""
-    p_up = np.array([calibrate(p, params.cal_a, params.cal_b) for p in df["fair_p_model"]])
+    p_model = df["fair_p_model"].to_numpy(dtype=float)
+    if params.sigma_scale != 1.0 and "z" in df.columns:
+        z = pd.to_numeric(df["z"], errors="coerce").to_numpy(dtype=float)
+        rescaled = _norm_cdf(np.nan_to_num(z, nan=0.0) / params.sigma_scale)
+        p_model = np.where(np.isnan(z), p_model, rescaled)
+    p_up = np.array([calibrate(p, params.cal_a, params.cal_b) for p in p_model])
     out = np.zeros(len(df))
     for side, ask, fair in (
         ("yes", df["yes_ask"].to_numpy(), p_up),
         ("no", df["no_ask"].to_numpy(), 1 - p_up),
     ):
         ok = (ask >= params.min_price) & (ask <= params.max_price)
+        if params.favourites_only:
+            ok = ok & (ask >= 0.5)
         fee = np.array([fee_per_contract(a, params.taker_rate) for a in ask])
         edge = fair - ask - fee
         trade = ok & (edge >= params.margin)
@@ -152,23 +166,19 @@ def evaluate(
     a, b = fit_calibration(train["fair_p_model"].to_numpy(), train["y"].to_numpy())
     base_pnl = replay(test, incumbent).to_numpy()
     candidates: list[tuple[str, FairValueParams]] = [("incumbent", incumbent)]
+    base = incumbent.to_dict()
+    variants = (
+        ("raw", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": False, "sigma_scale": 1.0}),
+        ("calibrated", {"cal_a": a, "cal_b": b, "favourites_only": False, "sigma_scale": 1.0}),
+        ("favourites", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 1.0}),
+        ("fav+sharp0.7", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 0.7}),
+        ("fav+soft1.3", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 1.3}),
+    )
     for m in margins:
-        candidates.append(
-            (
-                f"raw margin={m}",
-                FairValueParams.from_dict(
-                    {**incumbent.to_dict(), "margin": m, "cal_a": 0.0, "cal_b": 1.0}
-                ),
+        for label, extra in variants:
+            candidates.append(
+                (f"{label} margin={m}", FairValueParams.from_dict({**base, "margin": m, **extra}))
             )
-        )
-        candidates.append(
-            (
-                f"calibrated margin={m}",
-                FairValueParams.from_dict(
-                    {**incumbent.to_dict(), "margin": m, "cal_a": a, "cal_b": b}
-                ),
-            )
-        )
     results = []
     for label, params in candidates:
         pnl = replay(test, params).to_numpy()

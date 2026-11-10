@@ -55,6 +55,11 @@ class SpotHistory:
         d = self._data.get(symbol)
         return d[-1] if d else None
 
+    def span(self, symbol: str) -> float:
+        """Seconds of history held for a symbol."""
+        d = self._data.get(symbol)
+        return d[-1][0] - d[0][0] if d else 0.0
+
     def realized_vol(
         self, symbol: str, window: float = 1800.0, grid: float = 10.0, now: float | None = None
     ) -> float | None:
@@ -125,6 +130,7 @@ class Decision:
 class FairValueParams:
     margin: float = 0.03  # required edge beyond fees, in probability points
     count: int = 2  # contracts per order before risk sizing
+    dollars: float = 0.0  # if > 0: stake per order; contracts = floor(dollars / ask)
     vol_window: float = 1800.0
     min_sigma: float = 1e-6
     max_price: float = 0.90  # never pay more than this
@@ -147,6 +153,11 @@ class FairValueParams:
     kelly_fraction: float = 0.0
     bankroll: float = 200.0
     max_kelly_count: int = 10
+    # Model shaping, both learnable by `kalshi-bot learn`:
+    #   favourites_only: never buy a side priced under 0.50 (the data showed the model
+    #   overestimates cheap sides); sigma_scale: multiply realized vol (< 1 sharpens).
+    favourites_only: bool = False
+    sigma_scale: float = 1.0
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -178,8 +189,15 @@ class FairValueStrategy:
         sigma: float | None,
         now: float,
         force_taker: bool = False,
+        *,
+        settlement_average_s: float = SETTLEMENT_AVERAGE_S,
+        extra_margin: float = 0.0,
     ) -> Decision:
+        """``settlement_average_s`` is 60 for crypto (one-minute average) and 0 for
+        series that settle on a single candle close; ``extra_margin`` is added to the
+        required edge when spot is a proxy rather than the settlement feed."""
         p = self.params
+        margin = p.margin + extra_margin
         secs = (
             market.seconds_to_close()
             if market.close_time is None
@@ -205,8 +223,9 @@ class FairValueStrategy:
             return Decision("skip", "no volatility estimate yet", None, feats)
         if yes_ask is None or no_ask is None:
             return Decision("skip", "one-sided or empty book", None, feats)
-        tau = max(1.0, secs - SETTLEMENT_AVERAGE_S / 2)
-        z = math.log(spot / market.strike) / (sigma * math.sqrt(tau))
+        tau = max(1.0, secs - settlement_average_s / 2)
+        sigma_eff = sigma * p.sigma_scale
+        z = math.log(spot / market.strike) / (sigma_eff * math.sqrt(tau))
         p_model = norm_cdf(z)
         p_up = calibrate(p_model, p.cal_a, p.cal_b)
         feats.update(
@@ -249,14 +268,19 @@ class FairValueStrategy:
             return Decision("skip", "prices outside allowed band", None, feats)
         edge, side, price, fee, fair = max(candidates)
         feats.update({"best_side": side, "best_edge": edge, "exec_mode": mode, "post_price": price})
-        if edge < p.margin:
-            return Decision("skip", f"edge {edge:+.3f} below margin {p.margin}", None, feats)
-        count = p.count
-        if p.kelly_fraction > 0:
+        if edge < margin:
+            return Decision("skip", f"edge {edge:+.3f} below margin {margin:g}", None, feats)
+        if p.favourites_only and price < 0.5:
+            return Decision("skip", f"underdog at {price:.2f}; favourites only", None, feats)
+        if p.dollars > 0:
+            count = max(1, int(p.dollars / price + 1e-9))
+        elif p.kelly_fraction > 0:
             count = kelly_count(fair, price, fee, p.kelly_fraction, p.bankroll, p.max_kelly_count)
             feats["kelly_count"] = count
             if count < 1:
                 return Decision("skip", f"edge {edge:+.3f} too small for one contract", None, feats)
+        else:
+            count = p.count
         return Decision(
             "order", f"{mode} edge {edge:+.3f}", Intent(side, count, price, edge, mode, fair), feats
         )

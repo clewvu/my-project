@@ -30,6 +30,21 @@ Phases:
 5. Current: paper trading. Live is gated (prod env, dry_run false, key,
    `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`) and NOT yet run.
 6. Not started: production at minimum size. Only after paper results are read.
+9. 2026-11-10 evening: live run on the laptop LOST money. Learn report on
+   2,546 live decisions: held-out replay of the rule won 14.5% of 214 trades,
+   net -$27/contract-lot; model systematically overestimates cheap sides
+   (0.25 model vs 0.16 realised) and underestimates favourites. A local
+   Claude session had separately added: V2 order endpoint (Kalshi retired
+   /portfolio/orders, HTTP 410), PYTH_API_KEY support (Hermes updates now
+   need a key), Swissquote proxy + per-window rebasing for metals,
+   --dollars sizing, a logon scheduled task "KalshiLive" with a restarting
+   supervisor, and live-args of 100 contracts / $50 cap. Exchange fills
+   showed 80-270 contract taker orders on copper, gold, silver, palladium,
+   Brent (some manual). Merged on 2026-11-10: kept V2 endpoint, Pyth key,
+   proxy module (trading off by default, --allow-proxy), --dollars,
+   supervisor; added favourites_only, sigma_scale (both in learn grid),
+   events.yaml blackout, allow-proxy gate; start-live no longer deletes
+   KILL. Cameron's settings: $5/order, $50 daily cap, autostart on.
 8. Done 2026-11-10: maker/taker/hybrid execution with resting-order lifecycle
    (paper fills simulated from public prints), spread filter, fractional
    Kelly sizing, tapered price grid. start-live.cmd runs hybrid, 2 s loop,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -92,13 +93,20 @@ class PythClient:
         *,
         timeout: float = 10.0,
         transport: httpx.BaseTransport | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        # Hermes price updates need a Pyth API key (Bearer token) since late 2026;
+        # feed search is still public. Read PYTH_API_KEY from the environment/.env.
+        self.api_key = (api_key if api_key is not None else os.getenv("PYTH_API_KEY", "")).strip()
+        headers = {"User-Agent": "kalshi-bot/0.1"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         self._http = httpx.Client(
             base_url=self.base_url,
             timeout=timeout,
             transport=transport,
-            headers={"User-Agent": "kalshi-bot/0.1"},
+            headers=headers,
         )
 
     def close(self) -> None:
@@ -116,7 +124,8 @@ class PythClient:
         """Map Pyth symbols like ``Metal.XAU/USD`` to feeds, by exact symbol match."""
         found: dict[str, Feed] = {}
         for symbol in symbols:
-            base = symbol.split(".", 1)[-1].split("/", 1)[0]
+            # Metal.Index.SILVER/USD -> SILVER, Crypto.BTC/USD -> BTC
+            base = symbol.split("/", 1)[0].rsplit(".", 1)[-1]
             try:
                 feeds = self.search_feeds(base)
             except httpx.HTTPError as exc:
@@ -210,6 +219,17 @@ class PythStream:
                         raise RuntimeError("no Pyth feeds resolved")
                 self._consume()
                 backoff = 1.0
+            except httpx.HTTPStatusError as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                if exc.response.status_code in (401, 403):
+                    # No point retrying: the endpoint wants a key we do not have.
+                    log.warning(
+                        "pyth: Hermes rejected the request (%s). Price updates need a Pyth API "
+                        "key; set PYTH_API_KEY in .env. Pyth stream disabled for this run.",
+                        exc.response.status_code if not self.client.api_key else "key refused",
+                    )
+                    return
+                log.warning("pyth stream error: %s (retry in %.0fs)", self.last_error, backoff)
             except Exception as exc:  # noqa: BLE001 - reconnect on anything
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 log.warning("pyth stream error: %s (retry in %.0fs)", self.last_error, backoff)

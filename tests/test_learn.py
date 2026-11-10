@@ -100,7 +100,7 @@ def test_evaluate_detects_shrinkage_and_is_conservative(tmp_path):
     results, (a, b), n_test = learn.evaluate(df, FairValueParams(margin=0.03))
     assert results[0].label == "incumbent" and n_test == 240
     assert 0.3 < b < 0.75  # overconfidence detected on the training part
-    assert len(results) == 1 + 2 * len(learn.MARGINS)
+    assert len(results) == 1 + 5 * len(learn.MARGINS)
     assert all(r.n_test == 240 for r in results)
     # the incumbent's paired difference with itself is exactly zero
     assert results[0].diff_vs_incumbent == 0.0
@@ -175,3 +175,23 @@ def test_empty_run(tmp_path):
     assert "nothing to learn" in learn.run(store, "paper")
     assert "no active" in learn.rollback(store, "paper")
     assert math.isnan(float("nan"))
+
+
+def test_replay_favourites_and_sigma_scale():
+    df = pd.DataFrame(
+        {
+            "fair_p_model": [0.9, 0.9],
+            "z": [1.2816, 1.2816],
+            "yes_ask": [0.4, 0.6],
+            "no_ask": [0.62, 0.42],
+            "result": ["yes", "yes"],
+        }
+    )
+    base = learn.replay(df, FairValueParams(margin=0.02)).to_numpy()
+    assert (base > 0).all()  # buys YES both rows
+    fav = learn.replay(df, FairValueParams(margin=0.02, favourites_only=True)).to_numpy()
+    assert fav[0] == 0.0 and fav[1] > 0  # 0.40 underdog skipped
+    sharp = learn.replay(df, FairValueParams(margin=0.02, sigma_scale=0.5)).to_numpy()
+    soft = learn.replay(df, FairValueParams(margin=0.02, sigma_scale=10.0)).to_numpy()
+    assert (sharp > 0).all()  # Phi(2.56) ~ 0.995: both rows trade
+    assert soft[0] > 0 and soft[1] == 0.0  # Phi(0.128) ~ 0.55: only the 0.40 ask clears
