@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from .fees import fee_per_contract
-from .models import Market, Orderbook
+from .models import Market, Orderbook, price_tick
 
 SETTLEMENT_AVERAGE_S = 60.0  # settlement is the mean over the final minute
 
@@ -91,8 +91,26 @@ class SpotHistory:
 class Intent:
     side: str
     count: int
-    price: float  # the ask we will pay
+    price: float  # limit price we post or pay
     edge: float  # fair prob of our side minus price minus fee
+    exec_mode: str = "taker"  # taker | maker
+    fair: float = 0.0  # fair prob of our side at decision time
+
+
+def kelly_count(
+    fair: float, price: float, fee: float, fraction: float, bankroll: float, cap: int
+) -> int:
+    """Contracts from a fraction of the Kelly stake for a binary bet at ``price``.
+
+    Full Kelly fraction of bankroll for a bet paying 1 at probability ``fair``:
+    f* = (fair - cost) / (1 - cost) with cost = price + fee. Clamped to [0, cap].
+    """
+    cost = price + fee
+    if cost >= 1 or fair <= cost or fraction <= 0:
+        return 0
+    f_star = (fair - cost) / (1 - cost)
+    dollars = fraction * f_star * bankroll
+    return max(0, min(cap, int((dollars + 1e-9) // cost)))
 
 
 @dataclass
@@ -117,6 +135,18 @@ class FairValueParams:
     #   logit(p_cal) = cal_a + cal_b * logit(p_model). Identity by default.
     cal_a: float = 0.0
     cal_b: float = 1.0
+    # Execution: "taker" crosses the spread at the ask; "maker" rests one tick inside
+    # the spread (or joins the bid) and pays no fee; "hybrid" posts as maker and falls
+    # back to taking if the resting order expires unfilled while the edge persists.
+    exec_mode: str = "maker"
+    maker_rate: float = 0.0
+    rest_seconds: float = 20.0
+    max_spread: float = 0.04  # skip books wider than this (dollars)
+    # Sizing: 0 = fixed `count`; otherwise fraction of Kelly on the fee-adjusted edge,
+    # converted to contracts against `bankroll`. Risk limits still cap the result.
+    kelly_fraction: float = 0.0
+    bankroll: float = 200.0
+    max_kelly_count: int = 10
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -147,6 +177,7 @@ class FairValueStrategy:
         spot_ts: float | None,
         sigma: float | None,
         now: float,
+        force_taker: bool = False,
     ) -> Decision:
         p = self.params
         secs = (
@@ -188,16 +219,44 @@ class FairValueStrategy:
                 "cal_b": p.cal_b,
             }
         )
+        spread = round(yes_ask - (book.best_yes_bid or 0.0), 4) if book.best_yes_bid else None
+        feats["spread"] = spread
+        if spread is not None and spread > p.max_spread:
+            return Decision("skip", f"spread {spread:.3f} wider than {p.max_spread}", None, feats)
+        mode = "taker" if p.exec_mode == "taker" or force_taker else "maker"
         candidates = []
-        for side, ask, fair in (("yes", yes_ask, p_up), ("no", no_ask, 1 - p_up)):
-            if not p.min_price <= ask <= p.max_price:
+        for side, ask, bid, fair in (
+            ("yes", yes_ask, book.best_yes_bid, p_up),
+            ("no", no_ask, book.best_no_bid, 1 - p_up),
+        ):
+            if mode == "maker":
+                # improve the best bid by one tick; if that would cross, join the bid
+                tick = price_tick(bid if bid is not None else ask)
+                base = bid if bid is not None else round(ask - tick, 4)
+                # improve the bid by one tick if that still sits below the ask, else join it
+                price = round(base + tick, 4) if ask - base > tick + 1e-9 else base
+                if price is None or price <= 0:
+                    continue
+                fee = fee_per_contract(price, p.maker_rate)
+            else:
+                price = ask
+                fee = fee_per_contract(price, p.taker_rate)
+            if not p.min_price <= price <= p.max_price:
                 continue
-            edge = fair - ask - fee_per_contract(ask, p.taker_rate)
-            candidates.append((edge, side, ask))
+            edge = fair - price - fee
+            candidates.append((edge, side, price, fee, fair))
         if not candidates:
-            return Decision("skip", "asks outside allowed price band", None, feats)
-        edge, side, ask = max(candidates)
-        feats.update({"best_side": side, "best_edge": edge})
+            return Decision("skip", "prices outside allowed band", None, feats)
+        edge, side, price, fee, fair = max(candidates)
+        feats.update({"best_side": side, "best_edge": edge, "exec_mode": mode, "post_price": price})
         if edge < p.margin:
             return Decision("skip", f"edge {edge:+.3f} below margin {p.margin}", None, feats)
-        return Decision("order", f"edge {edge:+.3f}", Intent(side, p.count, ask, edge), feats)
+        count = p.count
+        if p.kelly_fraction > 0:
+            count = kelly_count(fair, price, fee, p.kelly_fraction, p.bankroll, p.max_kelly_count)
+            feats["kelly_count"] = count
+            if count < 1:
+                return Decision("skip", f"edge {edge:+.3f} too small for one contract", None, feats)
+        return Decision(
+            "order", f"{mode} edge {edge:+.3f}", Intent(side, count, price, edge, mode, fair), feats
+        )

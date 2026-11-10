@@ -20,7 +20,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 PRICE_DECIMALS = 4
-TICK = 0.001
+TICK = 0.001  # finest tick (used below $0.10 and above $0.90)
+
+
+def price_tick(price: float) -> float:
+    """Kalshi's tapered grid: 0.001 in the tails, 0.01 between $0.10 and $0.90."""
+    return TICK if price < 0.10 or price > 0.90 else 0.01
 
 
 def _parse_time(value: Any) -> datetime | None:

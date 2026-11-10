@@ -85,6 +85,7 @@ class Trader:
         self.pyth = pyth
         self.history = SpotHistory()
         self._book_ts: dict[str, float] = {}
+        self._take_next: set[str] = set()  # hybrid: tickers whose maker order expired unfilled
         self._stop = threading.Event()
         self._seed_history()
 
@@ -129,8 +130,11 @@ class Trader:
         now = time.time() if now is None else now
         self._ingest_feeds()
         summary = TickSummary()
+        self._manage_resting(now, summary)
         self._settle(now, summary)
-        open_positions = self.store.positions(self.mode, "open")
+        open_positions = self.store.positions(self.mode, "open") + self.store.positions(
+            self.mode, "resting"
+        )
         for asset in self.universe.enabled:
             try:
                 markets = self.client.get_markets(
@@ -164,7 +168,12 @@ class Trader:
             return
         book_ts = time.time()
         spot, spot_ts, sigma, key = self.spot_for(series)
-        decision = self.strategy.decide(market, book, spot, spot_ts, sigma, now)
+        force_taker = (
+            self.strategy.params.exec_mode == "hybrid" and market.ticker in self._take_next
+        )
+        decision = self.strategy.decide(
+            market, book, spot, spot_ts, sigma, now, force_taker=force_taker
+        )
         secs = market.close_time.timestamp() - now if market.close_time else None
         row = {
             "ts": now,
@@ -222,7 +231,8 @@ class Trader:
             )
             return
         count = verdict.adjusted_count or it.count
-        position = self._execute(market, series, it.side, count, it.price, now)
+        position = self._execute(market, series, it.side, count, it.price, now, it.exec_mode)
+        self._take_next.discard(market.ticker)
         if position is not None:
             open_positions.append(position)
             summary.orders += 1
@@ -235,10 +245,21 @@ class Trader:
     # ------------------------------------------------------------ execution
 
     def _execute(
-        self, market: Market, series: str, side: str, count: int, price: float, now: float
+        self,
+        market: Market,
+        series: str,
+        side: str,
+        count: int,
+        price: float,
+        now: float,
+        exec_mode: str = "taker",
     ) -> dict | None:
+        """Place the order. Taker orders are assumed filled at once (paper) or checked at
+        settlement (live). Maker orders rest and are resolved by ``_manage_resting``."""
+        params = self.strategy.params
         client_order_id = str(uuid.uuid4())
         order_id = None
+        rest = params.rest_seconds if exec_mode == "maker" else 15.0
         if self.mode == "live":
             try:
                 result = self.client.create_order(
@@ -248,7 +269,7 @@ class Trader:
                     count=count,
                     price=price,
                     client_order_id=client_order_id,
-                    expiration_ts=int(now + 15),
+                    expiration_ts=int(now + rest),
                 )
             except (KalshiError, ValueError) as exc:
                 log.error("%s: live order failed: %s", market.ticker, exc)
@@ -257,7 +278,8 @@ class Trader:
                 log.error("live mode but client returned a dry-run order; refusing")
                 return None
             order_id = result.order_id
-        fee = order_fee(price, count, self.strategy.params.taker_rate)
+        rate = params.maker_rate if exec_mode == "maker" else params.taker_rate
+        fee = order_fee(price, count, rate)
         row = {
             "mode": self.mode,
             "ticker": market.ticker,
@@ -270,12 +292,13 @@ class Trader:
             "close_ts": market.close_time.timestamp() if market.close_time else None,
             "order_id": order_id,
             "client_order_id": client_order_id,
-            "status": "open",
+            "status": "resting" if exec_mode == "maker" else "open",
         }
         row["id"] = self.store.open_position(row)
         log.info(
-            "%s %s %s x%d @%.3f fee %.2f%s",
+            "%s %s %s %s x%d @%.3f fee %.2f%s",
             self.mode.upper(),
+            exec_mode.upper(),
             market.ticker,
             side,
             count,
@@ -284,6 +307,48 @@ class Trader:
             f" order={order_id}" if order_id else "",
         )
         return row
+
+    # ------------------------------------------------------------ resting (maker) orders
+
+    def _manage_resting(self, now: float, summary: TickSummary) -> None:
+        """Resolve maker orders: filled -> open, expired unfilled -> unfilled (+ hybrid flag)."""
+        params = self.strategy.params
+        for pos in self.store.positions(self.mode, "resting"):
+            expired = now >= pos["opened_ts"] + params.rest_seconds
+            filled = self._filled_count(pos, now)
+            if filled > 0:
+                fee = order_fee(pos["price"], filled, params.maker_rate)
+                self.store.update_position(pos["id"], status="open", count=filled, fee=fee)
+                log.info("%s maker filled x%g @%.3f", pos["ticker"], filled, pos["price"])
+                continue
+            if expired:
+                if self.mode == "live" and pos["order_id"]:
+                    try:
+                        self.client.cancel_order(pos["order_id"])
+                    except KalshiError as exc:
+                        log.debug("cancel %s: %s", pos["order_id"], exc)
+                self.store.update_position(pos["id"], status="unfilled", pnl=0.0, settled_ts=now)
+                if params.exec_mode == "hybrid":
+                    self._take_next.add(pos["ticker"])
+                log.info("%s maker order expired unfilled", pos["ticker"])
+
+    def _filled_count(self, pos: dict, now: float) -> float:
+        if self.mode == "live" and pos["order_id"]:
+            try:
+                order = self.client.get_order(pos["order_id"])
+            except KalshiError as exc:
+                log.warning("get_order %s failed: %s", pos["order_id"], exc)
+                return 0.0
+            filled = max(0.0, order.count - order.remaining_count)
+            if order.status in ("executed", "filled") and filled == 0:
+                filled = order.count
+            return filled
+        # paper: our resting bid is filled if a later public print trades at or through it
+        for t in self.store.trades_after(pos["ticker"], pos["opened_ts"]):
+            px = t["yes_price"] if pos["side"] == "yes" else t["no_price"]
+            if px is not None and px <= pos["price"]:
+                return float(pos["count"])
+        return 0.0
 
     # ------------------------------------------------------------ settlement
 

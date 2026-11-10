@@ -442,6 +442,22 @@ def cmd_whale(_: Settings, args: argparse.Namespace) -> int:
 LIVE_ACK = "I-ACCEPT-LIVE-TRADING-RISK"
 
 
+def _params(args: argparse.Namespace) -> FairValueParams:
+    return FairValueParams(
+        margin=args.margin,
+        count=args.count,
+        vol_window=args.vol_window,
+        max_price=args.max_price,
+        min_price=args.min_price,
+        exec_mode=args.exec_mode,
+        rest_seconds=args.rest_seconds,
+        max_spread=args.max_spread,
+        kelly_fraction=args.kelly,
+        bankroll=args.bankroll,
+        max_kelly_count=args.max_contracts,
+    )
+
+
 def _limits(args: argparse.Namespace) -> RiskLimits:
     return RiskLimits(
         bankroll=args.bankroll,
@@ -473,15 +489,7 @@ def cmd_trade(settings: Settings, args: argparse.Namespace) -> int:
         if problems:
             sys.exit("refusing live mode:\n  " + "\n  ".join(problems))
     client = KalshiClient.from_settings(settings, allow_live=args.live)
-    strategy = FairValueStrategy(
-        FairValueParams(
-            margin=args.margin,
-            count=args.count,
-            vol_window=args.vol_window,
-            max_price=args.max_price,
-            min_price=args.min_price,
-        )
-    )
+    strategy = FairValueStrategy(_params(args))
     with client, MarketDataStore(args.db) as store:
         spot_ws = SpotWebSocket(store, uni.coinbase_symbols) if uni.coinbase_symbols else None
         pyth = PythStream(store, uni.pyth_symbols) if uni.pyth_symbols else None
@@ -687,15 +695,7 @@ def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
             problems.append(f"pass --acknowledge {LIVE_ACK}")
         if problems:
             sys.exit("refusing live mode:\n  " + "\n  ".join(problems))
-    strategy = FairValueStrategy(
-        FairValueParams(
-            margin=args.margin,
-            count=args.count,
-            vol_window=args.vol_window,
-            max_price=args.max_price,
-            min_price=args.min_price,
-        )
-    )
+    strategy = FairValueStrategy(_params(args))
     trade_client = KalshiClient.from_settings(settings, allow_live=args.live)
     record_client = KalshiClient(settings.base_url, None, min_request_interval=0.15)
     with trade_client, record_client, MarketDataStore(args.db) as store:
@@ -741,6 +741,18 @@ def _strategy_and_risk_args(s: argparse.ArgumentParser) -> None:
     g.add_argument("--vol-window", type=float, default=1800.0)
     g.add_argument("--max-price", type=float, default=0.90)
     g.add_argument("--min-price", type=float, default=0.05)
+    g.add_argument(
+        "--exec",
+        dest="exec_mode",
+        choices=["maker", "taker", "hybrid"],
+        default="maker",
+        help="maker rests inside the spread fee-free (default)",
+    )
+    g.add_argument("--rest-seconds", type=float, default=20.0, help="maker order lifetime")
+    g.add_argument("--max-spread", type=float, default=0.04, help="skip books wider than this")
+    g.add_argument(
+        "--kelly", type=float, default=0.0, help="fraction of Kelly for sizing (0 = fixed --count)"
+    )
     r = s.add_argument_group("risk")
     r.add_argument("--bankroll", type=float, default=200.0)
     r.add_argument("--daily-loss-cap", type=float, default=20.0)

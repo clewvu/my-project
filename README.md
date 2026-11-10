@@ -195,6 +195,15 @@ the last 30 minutes; buy the side whose fair probability beats the ask by
 more than the taker fee plus `--margin` (default 3 points). Tune with
 `--margin`, `--count`, `--max-price`, `--min-price`, `--vol-window`.
 
+Execution (`--exec`): `maker` (default) rests one tick inside the spread and
+pays no fee, waiting up to `--rest-seconds`; `taker` crosses at the ask and
+pays 7% x price x (1 - price); `hybrid` posts as maker and takes only if the
+resting order expires while the edge persists. In paper mode a resting order
+counts as filled when a later public print trades at or through its price.
+Books wider than `--max-spread` are skipped. Sizing: `--kelly 0.25` stakes a
+quarter of the Kelly fraction of `--bankroll` on the fee-adjusted edge; 0 uses
+a fixed `--count`. Risk limits still cap every order.
+
 Risk limits are hard cutoffs, persisted in SQLite so a restart cannot reset
 them: `--daily-loss-cap` (halts until `risk-reset`), `--max-contracts`,
 `--max-open`, `--max-fraction` of `--bankroll`, `--loss-streak` cool-off,

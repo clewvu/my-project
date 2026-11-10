@@ -366,6 +366,10 @@ class KalshiClient:
         )
         return [Order.from_dict(o) for o in data.get("orders", [])]
 
+    def get_order(self, order_id: str) -> Order:
+        data = self._request("GET", f"/portfolio/orders/{order_id}")
+        return Order.from_dict(data.get("order", data))
+
     def get_fills(
         self,
         *,

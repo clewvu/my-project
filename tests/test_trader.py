@@ -70,7 +70,7 @@ def make_trader(client, tmp_path, **limits):
         client,
         store,
         UNI,
-        FairValueStrategy(FairValueParams(margin=0.02, count=2)),
+        FairValueStrategy(FairValueParams(margin=0.02, count=2, exec_mode="taker")),
         RiskLimits(**limits),
         mode="paper",
         spot_ws=feed,
@@ -153,7 +153,7 @@ def test_trader_uses_active_config_and_tags_decisions(tmp_path):
         client,
         store,
         UNI,
-        FairValueStrategy(FairValueParams(margin=0.02)),
+        FairValueStrategy(FairValueParams(margin=0.02, exec_mode="taker")),
         RiskLimits(),
         mode="paper",
         spot_ws=feed,
@@ -177,3 +177,77 @@ def test_settlement_fills_decision_results(tmp_path):
     trader.tick(CLOSE + 60)
     assert all(d["result"] == "no" for d in store.decisions("paper"))
     assert trader.risk.state.recent and trader.risk.state.recent[-1][1] > 0.5
+
+
+def make_maker_trader(client, tmp_path, exec_mode="maker", **limits):
+    store = MarketDataStore(tmp_path / "m.sqlite")
+    feed = FakeFeed()
+    params = FairValueParams(margin=0.02, count=2, exec_mode=exec_mode, rest_seconds=20)
+    trader = Trader(
+        client,
+        store,
+        UNI,
+        FairValueStrategy(params),
+        RiskLimits(**limits),
+        mode="paper",
+        spot_ws=feed,
+    )
+    return trader, store, feed
+
+
+def test_paper_maker_fill_from_prints(tmp_path):
+    from kalshi_bot.models import Trade
+
+    client = FakeClient(mid=0.5)
+    trader, store, feed = make_maker_trader(client, tmp_path)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    s = trader.tick(now)
+    assert s.orders == 1
+    pos = store.positions("paper", "resting")[0]
+    assert pos["price"] == 0.50 and pos["fee"] == 0.0
+    # nothing printed yet: still resting, and no duplicate order
+    s = trader.tick(now + 5)
+    assert s.orders == 0 and store.positions("paper", "resting")
+    # a print at our bid fills us
+    store.insert_trades(
+        "KXBTC15M-1",
+        [
+            Trade.from_dict(
+                {
+                    "trade_id": "t1",
+                    "ticker": "KXBTC15M-1",
+                    "created_time": now + 7,
+                    "yes_price_dollars": "0.5000",
+                    "no_price_dollars": "0.5000",
+                    "count_fp": "5",
+                }
+            )
+        ],
+    )
+    trader.tick(now + 10)
+    opened = store.positions("paper", "open")
+    assert len(opened) == 1 and opened[0]["count"] == 2 and opened[0]["fee"] == 0.0
+    client.result = "yes"
+    trader.tick(CLOSE + 60)
+    settled = store.positions("paper", "settled")[0]
+    assert abs(settled["pnl"] - 2 * 0.5) < 1e-9  # no fee on the maker side
+
+
+def test_paper_maker_expires_then_hybrid_takes(tmp_path):
+    client = FakeClient(mid=0.5)
+    trader, store, feed = make_maker_trader(client, tmp_path, exec_mode="hybrid")
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    trader.tick(now)
+    assert store.positions("paper", "resting")
+    trader.tick(now + 25)  # expired, no prints
+    assert store.positions("paper", "unfilled") and not store.positions("paper", "resting")
+    assert "KXBTC15M-1" in trader._take_next
+    feed.buffer.latest["BTC-USD"] = Tick("BTC-USD", 100.3, now + 25, now + 25)
+    trader.history.push(trader._hist_key("coinbase_ws", "BTC-USD"), now + 25, 100.3)
+    s = trader.tick(now + 26)
+    assert s.orders == 1
+    pos = store.positions("paper", "open")[0]
+    assert pos["price"] == 0.51 and pos["fee"] > 0  # took the ask, paid the fee
+    assert "KXBTC15M-1" not in trader._take_next

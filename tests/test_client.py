@@ -268,3 +268,27 @@ def test_get_trades_follows_cursor_on_full_pages(signer):
     trades = client.get_trades("X", limit=2)
     assert [t.trade_id for t in trades] == ["0", "1", "9"]
     assert len(rec.requests) == 2 and rec.requests[1].url.params["cursor"] == "c1"
+
+
+def test_get_order(signer):
+    client, rec = make_client(
+        signer,
+        [
+            (
+                200,
+                {
+                    "order": {
+                        "order_id": "o9",
+                        "status": "executed",
+                        "count_fp": "3",
+                        "remaining_count_fp": "0",
+                        "side": "yes",
+                        "yes_price_dollars": "0.5",
+                    }
+                },
+            )
+        ],
+    )
+    o = client.get_order("o9")
+    assert o.order_id == "o9" and o.count == 3 and o.remaining_count == 0
+    assert rec.requests[0].url.path == "/trade-api/v2/portfolio/orders/o9"

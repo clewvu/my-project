@@ -639,6 +639,16 @@ class MarketDataStore:
             "decisions": {r[0]: r[1] for r in dec},
         }
 
+    def trades_after(self, ticker: str, since: float) -> list[dict[str, Any]]:
+        """Public prints for a market after ``since`` (used to simulate paper maker fills)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, yes_price, no_price, count, taker_side FROM trades "
+                "WHERE ticker = ? AND ts > ? ORDER BY ts",
+                (ticker, since),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def recent_spot(self, source: str, symbol: str, since: float) -> list[tuple[float, float]]:
         with self._lock:
             rows = self._conn.execute(

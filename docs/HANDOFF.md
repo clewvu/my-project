@@ -30,6 +30,11 @@ Phases:
 5. Current: paper trading. Live is gated (prod env, dry_run false, key,
    `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`) and NOT yet run.
 6. Not started: production at minimum size. Only after paper results are read.
+8. Done 2026-11-10: maker/taker/hybrid execution with resting-order lifecycle
+   (paper fills simulated from public prints), spread filter, fractional
+   Kelly sizing, tapered price grid. start-live.cmd runs hybrid, 2 s loop,
+   quarter Kelly, max 6 contracts, 4 open, $15 daily cap, 60 s no-entry,
+   max price 0.95.
 7. Done 2026-11-09: gated learning loop (learn.py, `kalshi-bot learn`):
    decision log with counterfactual results, calibration fit, held-out
    paired evaluation, promotion gate, config history with rollback. Live
