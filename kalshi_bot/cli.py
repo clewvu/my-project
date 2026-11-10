@@ -94,7 +94,7 @@ def cmd_check(settings: Settings, _: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(settings: Settings, _: argparse.Namespace) -> int:
+def cmd_status(settings: Settings, args: argparse.Namespace) -> int:
     """Exchange status, balance and open positions."""
     with _client(settings, need_auth=True) as client:
         status = client.exchange_status()
