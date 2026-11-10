@@ -24,7 +24,7 @@ from .client import DryRunOrder, KalshiClient, KalshiError
 from .commodities import RAW_SOURCE, ProxyFeed
 from .events import EventBlackout
 from .fees import order_fee
-from .models import Market
+from .models import Balance, Market
 from .pyth import PythStream
 from .recorder import is_live
 from .risk import OrderIntent, RiskEngine, RiskLimits
@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 PROXY_WARMUP_S = 300.0  # proxy quotes needed before the vol estimate is trusted
 ORDER_RETRY_S = 60.0  # after a failed order, leave that market alone this long
+BALANCE_TTL_S = 30.0  # how long a balance reading is reused for the affordability check
 
 
 @dataclass
@@ -100,6 +101,9 @@ class Trader:
         self._order_error: str | None = None
         self._order_backoff: dict[str, float] = {}
         self._unpriced_logged = False
+        self._balance: Balance | None = None
+        self._balance_at = 0.0
+        self._unaffordable_logged: set[str] = set()
         self._book_ts: dict[str, float] = {}
         self._take_next: set[str] = set()  # hybrid: tickers whose maker order expired unfilled
         self._stop = threading.Event()
@@ -333,6 +337,17 @@ class Trader:
             self.store.insert_decision(row)
             return
         count = verdict.adjusted_count or it.count
+        short = self._cannot_afford(market, count, it.price, it.exec_mode)
+        if short:
+            row["action"], row["reason"] = "rejected", short
+            summary.rejected += 1
+            self.store.insert_decision(row)
+            if market.ticker not in self._unaffordable_logged:
+                self._unaffordable_logged.add(market.ticker)
+                log.warning(
+                    "%s %s x%d @%.3f NOT SENT: %s", market.ticker, it.side, count, it.price, short
+                )
+            return
         position = self._execute(market, series, it.side, count, it.price, now, it.exec_mode)
         self._take_next.discard(market.ticker)
         if position is not None:
@@ -347,6 +362,36 @@ class Trader:
         self.store.insert_decision(row)
 
     # ------------------------------------------------------------ execution
+
+    def _cannot_afford(self, market: Market, count: int, price: float, exec_mode: str) -> str:
+        """Reason a live order would be refused for lack of spendable cash, else ''.
+
+        Compares the order's cost (price x count + fee) with the balance bucket
+        the market draws on. The balance is cached for ``BALANCE_TTL_S``. If the
+        balance cannot be read the order is allowed through: the exchange decides.
+        """
+        if self.mode != "live":
+            return ""
+        mono = time.monotonic()
+        if self._balance is None or mono - self._balance_at > BALANCE_TTL_S:
+            try:
+                self._balance = self.client.get_balance()
+                self._balance_at = mono
+            except KalshiError as exc:
+                log.warning("balance check failed, sending order anyway: %s", exc)
+                return ""
+        params = self.strategy.params
+        rate = params.maker_rate if exec_mode == "maker" else params.taker_rate
+        cost = count * price + order_fee(price, count, rate)
+        index = market.exchange_index
+        have = self._balance.spendable(index)
+        if have + 1e-9 >= cost:
+            return ""
+        where = f"exchange bucket {index}" if index is not None else "the account"
+        return (
+            f"insufficient spendable balance: order needs ${cost:.2f}, ${have:.2f} available "
+            f"in {where} (account total ${self._balance.balance:.2f})"
+        )
 
     def _execute(
         self,
@@ -385,6 +430,7 @@ class Trader:
                 log.error("live mode but client returned a dry-run order; refusing")
                 return None
             order_id = result.order_id
+            self._balance = None  # cash moved; re-read before the next order
         rate = params.maker_rate if exec_mode == "maker" else params.taker_rate
         fee = order_fee(price, count, rate)
         row = {

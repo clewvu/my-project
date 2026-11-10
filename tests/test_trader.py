@@ -1,5 +1,5 @@
 from kalshi_bot.client import KalshiAPIError
-from kalshi_bot.models import Market, Orderbook
+from kalshi_bot.models import Balance, Market, Orderbook
 from kalshi_bot.risk import RiskLimits
 from kalshi_bot.spot_ws import Tick
 from kalshi_bot.storage import MarketDataStore
@@ -251,3 +251,92 @@ def test_paper_maker_expires_then_hybrid_takes(tmp_path):
     pos = store.positions("paper", "open")[0]
     assert pos["price"] == 0.51 and pos["fee"] > 0  # took the ask, paid the fee
     assert "KXBTC15M-1" not in trader._take_next
+
+
+class LiveClient(FakeClient):
+    dry_run = False
+    allow_live = True
+
+    def __init__(self, bucket):
+        super().__init__(mid=0.5)
+        self.bucket = bucket
+        self.orders = []
+        self.balance_reads = 0
+
+    def get_markets(self, *, series_ticker, status, max_pages):
+        m = super().get_markets(series_ticker=series_ticker, status=status, max_pages=max_pages)[0]
+        return [Market.from_dict({**m.raw, "exchange_index": 2})]
+
+    def get_balance(self):
+        self.balance_reads += 1
+        return Balance.from_dict(
+            {
+                "balance_dollars": "111.2104",
+                "balance_breakdown": [
+                    {"balance": "110.6977", "exchange_index": 0},
+                    {"balance": f"{self.bucket:.4f}", "exchange_index": 2},
+                ],
+            }
+        )
+
+    def create_order(self, ticker, **kwargs):
+        self.orders.append((ticker, kwargs))
+        return type("O", (), {"order_id": "oid-1"})()
+
+
+def make_live_trader(client, tmp_path):
+    store = MarketDataStore(tmp_path / "live.sqlite")
+    feed = FakeFeed()
+    trader = Trader(
+        client,
+        store,
+        UNI,
+        FairValueStrategy(FairValueParams(margin=0.02, count=2, exec_mode="taker")),
+        RiskLimits(),
+        mode="live",
+        spot_ws=feed,
+    )
+    return trader, store, feed
+
+
+def test_live_order_skipped_when_exchange_bucket_cannot_cover_it(tmp_path, caplog):
+    # account total is $111.21 but only $0.50 sits in the bucket this market draws on
+    client = LiveClient(bucket=0.5027)
+    trader, store, feed = make_live_trader(client, tmp_path)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)  # buy YES x2 @ 0.51: $1.02 + fee
+    with caplog.at_level("WARNING"):
+        s = trader.tick(now)
+        s2 = trader.tick(now + 2)
+    assert client.orders == []  # nothing sent to the exchange
+    assert s.orders == 0 and s.rejected == 1 and s.errors == 0 and s2.rejected == 1
+    d = store.decisions("live")[0]
+    assert d["action"] == "rejected"
+    assert "insufficient spendable balance" in d["reason"]
+    assert "$0.50 available in exchange bucket 2" in d["reason"]
+    assert "account total $111.21" in d["reason"]
+    assert store.positions("live", "open") == []
+    assert client.balance_reads == 1  # cached between ticks
+    assert sum("NOT SENT" in r.message for r in caplog.records) == 1  # logged once per market
+
+
+def test_live_order_sent_when_exchange_bucket_covers_it(tmp_path):
+    client = LiveClient(bucket=50.0)
+    trader, store, feed = make_live_trader(client, tmp_path)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    s = trader.tick(now)
+    assert s.orders == 1 and len(client.orders) == 1
+    assert store.decisions("live")[0]["action"] == "order"
+
+
+def test_live_order_sent_when_balance_cannot_be_read(tmp_path):
+    class NoBalance(LiveClient):
+        def get_balance(self):
+            raise KalshiAPIError(503, "GET", "/portfolio/balance", "unavailable")
+
+    client = NoBalance(bucket=0.0)
+    trader, _, feed = make_live_trader(client, tmp_path)
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    assert trader.tick(now).orders == 1 and len(client.orders) == 1

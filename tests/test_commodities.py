@@ -4,7 +4,7 @@ import httpx
 
 from kalshi_bot.client import KalshiAPIError
 from kalshi_bot.commodities import RAW_SOURCE, REBASED_SOURCE, ProxyFeed, Rebaser, parse_quote
-from kalshi_bot.models import Market, Orderbook
+from kalshi_bot.models import Balance, Market, Orderbook
 from kalshi_bot.risk import RiskLimits
 from kalshi_bot.spot_ws import Tick
 from kalshi_bot.storage import MarketDataStore
@@ -194,6 +194,9 @@ def test_failed_order_records_why_and_backs_off(tmp_path):
         dry_run = False
         allow_live = True
         orders = 0
+
+        def get_balance(self):  # looks affordable locally; the exchange still refuses
+            return Balance.from_dict({"balance_dollars": "500.0000"})
 
         def create_order(self, ticker, **kw):
             LiveClient.orders += 1

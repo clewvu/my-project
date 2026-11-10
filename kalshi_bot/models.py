@@ -140,6 +140,15 @@ class Market:
         )
 
     @property
+    def exchange_index(self) -> int | None:
+        """Which balance bucket orders in this market draw on (see ``Balance``)."""
+        value = self.raw.get("exchange_index")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
     def yes_mid(self) -> float | None:
         if self.yes_bid is None or self.yes_ask is None:
             return None
@@ -255,15 +264,42 @@ class Orderbook:
 
 @dataclass(frozen=True)
 class Balance:
-    balance: float  # dollars available
+    """Account cash.
+
+    ``balance`` is the account total. Kalshi also returns ``balance_breakdown``,
+    the same cash split by ``exchange_index``; a market carries its own
+    ``exchange_index`` and an order there can only draw on that bucket. Observed
+    2026-11-10: total $111.21 with $0.50 in bucket 2 (where the 15-minute markets
+    trade) and every order costing more than that refused ``insufficient_balance``.
+    """
+
+    balance: float  # dollars, account total
     portfolio_value: float | None = None
+    breakdown: dict[int, float] = field(default_factory=dict)  # exchange_index -> dollars
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Balance:
+        breakdown: dict[int, float] = {}
+        for item in d.get("balance_breakdown") or []:
+            try:
+                breakdown[int(item["exchange_index"])] = float(item["balance"])
+            except (KeyError, TypeError, ValueError):
+                continue
         return cls(
             balance=_money(d, "balance") or 0.0,
             portfolio_value=_money(d, "portfolio_value"),
+            breakdown=breakdown,
         )
+
+    def spendable(self, exchange_index: int | None = None) -> float:
+        """Dollars an order on ``exchange_index`` can draw on.
+
+        Falls back to the account total when the response has no breakdown or
+        the market's exchange index is unknown.
+        """
+        if exchange_index is None or not self.breakdown:
+            return self.balance
+        return self.breakdown.get(exchange_index, 0.0)
 
 
 @dataclass(frozen=True)
