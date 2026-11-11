@@ -158,6 +158,8 @@ class FairValueParams:
     #   overestimates cheap sides); sigma_scale: multiply realized vol (< 1 sharpens).
     favourites_only: bool = False
     sigma_scale: float = 1.0
+    # Strategy-level time filter (the risk engine's no-entry window still applies on top).
+    min_secs_to_close: float = 0.0
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
@@ -217,6 +219,8 @@ class FairValueStrategy:
         }
         if market.strike is None or spot is None or spot_ts is None:
             return Decision("skip", "missing strike or spot", None, feats)
+        if secs is not None and secs < p.min_secs_to_close:
+            return Decision("skip", f"{secs:.0f}s to close < {p.min_secs_to_close:g}", None, feats)
         if now - spot_ts > p.max_spot_age:
             return Decision("skip", f"spot stale {now - spot_ts:.1f}s", None, feats)
         if sigma is None or sigma < p.min_sigma:

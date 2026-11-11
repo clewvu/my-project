@@ -485,6 +485,7 @@ def _params(args: argparse.Namespace) -> FairValueParams:
         dollars=args.dollars,
         favourites_only=args.favourites_only,
         sigma_scale=args.sigma_scale,
+        min_secs_to_close=args.min_secs,
     )
 
 
@@ -536,6 +537,7 @@ def cmd_trade(settings: Settings, args: argparse.Namespace) -> int:
             proxy_margin=args.proxy_margin,
             allow_proxy=args.allow_proxy,
             blackout=EventBlackout.load(args.events),
+            require_edge=not args.no_edge_gate,
         )
         if args.live:
             bal = client.get_balance()
@@ -560,6 +562,11 @@ def cmd_trade_status(_: Settings, args: argparse.Namespace) -> int:
         decisions = store.decisions(mode, args.limit)
     st = risk.state
     print(f"mode:       {mode}")
+    if mode == "live":
+        with MarketDataStore(args.db) as store2:
+            gate = store2.get_meta("learn:live:edge_ok")
+            why = store2.get_meta("learn:live:edge_ok:reason") or "no learn run yet"
+        print(f"edge gate:  {'OPEN' if gate == '1' else 'CLOSED'}  ({why})")
     print(
         f"risk:       {'HALTED: ' + st.halt_reason if st.halted else 'ok'}  "
         f"day_pnl={st.day_pnl:+.2f}  loss_streak={st.consecutive_losses}"
@@ -868,6 +875,7 @@ def cmd_go(settings: Settings, args: argparse.Namespace) -> int:
             proxy_margin=args.proxy_margin,
             allow_proxy=args.allow_proxy,
             blackout=EventBlackout.load(args.events),
+            require_edge=not args.no_edge_gate,
         )
         # record what can be priced; the rest would only slow the tick down
         recorder = Recorder(
@@ -934,6 +942,12 @@ def _strategy_and_risk_args(s: argparse.ArgumentParser) -> None:
         help="trade metals priced off the rebased Swissquote proxy (off: record only)",
     )
     g.add_argument("--events", default="events.yaml", help="scheduled-event blackout file")
+    g.add_argument(
+        "--no-edge-gate",
+        action="store_true",
+        help="send live orders even when the last `learn` run found no held-out edge",
+    )
+    g.add_argument("--min-secs", type=float, default=0.0, help="strategy-level no-entry window")
     g.add_argument(
         "--proxy-margin",
         type=float,

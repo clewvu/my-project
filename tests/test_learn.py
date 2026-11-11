@@ -100,7 +100,7 @@ def test_evaluate_detects_shrinkage_and_is_conservative(tmp_path):
     results, (a, b), n_test = learn.evaluate(df, FairValueParams(margin=0.03))
     assert results[0].label == "incumbent" and n_test == 240
     assert 0.3 < b < 0.75  # overconfidence detected on the training part
-    assert len(results) == 1 + 5 * len(learn.MARGINS)
+    assert len(results) == 1 + 7 * len(learn.MARGINS)
     assert all(r.n_test == 240 for r in results)
     # the incumbent's paired difference with itself is exactly zero
     assert results[0].diff_vs_incumbent == 0.0
@@ -195,3 +195,20 @@ def test_replay_favourites_and_sigma_scale():
     soft = learn.replay(df, FairValueParams(margin=0.02, sigma_scale=10.0)).to_numpy()
     assert (sharp > 0).all()  # Phi(2.56) ~ 0.995: both rows trade
     assert soft[0] > 0 and soft[1] == 0.0  # Phi(0.128) ~ 0.55: only the 0.40 ask clears
+
+
+def test_edge_verdict_and_gate_flag(tmp_path):
+    inc = _res("incumbent", trades=40, net=3.0, lo=0.0, hi=0.0)
+    inc.trade_lo, inc.trade_hi = 0.01, 0.12
+    assert learn.edge_verdict(inc)[0] is True
+    inc.trade_lo = -0.01
+    assert "not distinguishable" in learn.edge_verdict(inc)[1]
+    inc.net_total = -1.0
+    assert "not positive" in learn.edge_verdict(inc)[1]
+    inc.trades = 10
+    assert "held-out trades" in learn.edge_verdict(inc)[1]
+    assert learn.edge_verdict(None) == (False, "no evaluation yet")
+    store = build(tmp_path / "g.sqlite", n=400)
+    learn.run(store, "paper")
+    assert store.get_meta("learn:paper:edge_ok") in ("0", "1")
+    assert store.get_meta("learn:paper:edge_ok:reason")

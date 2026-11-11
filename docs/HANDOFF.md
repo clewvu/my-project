@@ -30,6 +30,15 @@ Phases:
 5. Current: paper trading. Live is gated (prod env, dry_run false, key,
    `--live --acknowledge I-ACCEPT-LIVE-TRADING-RISK`) and NOT yet run.
 6. Not started: production at minimum size. Only after paper results are read.
+10. 2026-11-11: EDGE GATE. Live orders are sent only while the last `learn
+   --live` run found the ACTIVE config profitable on held-out data (>=30
+   held-out trades, positive net, per-trade CI excluding zero); otherwise the
+   trader logs decisions as "shadow" and sends nothing. Default on for live;
+   `--no-edge-gate` disables. Learn grid now also tests favourites-only with
+   max_price 0.97/0.99 (late-window favourites) and strategy min_secs_to_close.
+   Also: Cameron's $101 deposit on 11-10 had not cleared, which caused
+   "insufficient_balance" on every order above ~$0.90; a local Claude session
+   was asked to add a spendable-balance pre-check.
 9. 2026-11-10 evening: live run on the laptop LOST money. Learn report on
    2,546 live decisions: held-out replay of the rule won 14.5% of 214 trades,
    net -$27/contract-lot; model systematically overestimates cheap sides

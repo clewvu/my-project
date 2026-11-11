@@ -57,6 +57,8 @@ class EvalResult:
     diff_vs_incumbent: float
     diff_lo: float
     diff_hi: float
+    trade_lo: float = float("nan")  # 95% CI of net per trade (bootstrap over traded decisions)
+    trade_hi: float = float("nan")
 
 
 def load_dataset(store: MarketDataStore, mode: str) -> pd.DataFrame:
@@ -131,6 +133,9 @@ def replay(df: pd.DataFrame, params: FairValueParams) -> pd.Series:
         ok = (ask >= params.min_price) & (ask <= params.max_price)
         if params.favourites_only:
             ok = ok & (ask >= 0.5)
+        if params.min_secs_to_close > 0 and "secs_to_close" in df.columns:
+            secs = pd.to_numeric(df["secs_to_close"], errors="coerce").to_numpy(dtype=float)
+            ok = ok & (np.nan_to_num(secs, nan=0.0) >= params.min_secs_to_close)
         fee = np.array([fee_per_contract(a, params.taker_rate) for a in ask])
         edge = fair - ask - fee
         trade = ok & (edge >= params.margin)
@@ -173,6 +178,27 @@ def evaluate(
         ("favourites", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 1.0}),
         ("fav+sharp0.7", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 0.7}),
         ("fav+soft1.3", {"cal_a": 0.0, "cal_b": 1.0, "favourites_only": True, "sigma_scale": 1.3}),
+        # late-window favourites: the calibration table is tightest above 0.90
+        (
+            "fav late<=0.99",
+            {
+                "cal_a": 0.0,
+                "cal_b": 1.0,
+                "favourites_only": True,
+                "sigma_scale": 1.0,
+                "max_price": 0.99,
+            },
+        ),
+        (
+            "fav late<=0.97",
+            {
+                "cal_a": 0.0,
+                "cal_b": 1.0,
+                "favourites_only": True,
+                "sigma_scale": 1.0,
+                "max_price": 0.97,
+            },
+        ),
     )
     for m in margins:
         for label, extra in variants:
@@ -185,6 +211,7 @@ def evaluate(
         traded = pnl != 0
         diff = pnl - base_pnl
         lo, hi = _bootstrap_diff(diff)
+        t_lo, t_hi = _bootstrap_diff(pnl[traded]) if traded.sum() >= 5 else (np.nan, np.nan)
         results.append(
             EvalResult(
                 label=label,
@@ -198,9 +225,38 @@ def evaluate(
                 diff_vs_incumbent=float(diff.mean()),
                 diff_lo=lo,
                 diff_hi=hi,
+                trade_lo=t_lo,
+                trade_hi=t_hi,
             )
         )
     return results, (a, b), len(test)
+
+
+EDGE_KEY = "learn:{mode}:edge_ok"
+EDGE_MIN_TRADES = 30
+
+
+def edge_verdict(incumbent: EvalResult | None) -> tuple[bool, str]:
+    """Does the ACTIVE config have demonstrated edge on held-out data?
+
+    True only if it traded at least ``EDGE_MIN_TRADES`` held-out decisions, its
+    net is positive, and the 95% CI of net per trade excludes zero.
+    """
+    if incumbent is None:
+        return False, "no evaluation yet"
+    if incumbent.trades < EDGE_MIN_TRADES:
+        return False, f"only {incumbent.trades} held-out trades (< {EDGE_MIN_TRADES})"
+    if incumbent.net_total <= 0:
+        return False, f"held-out net {incumbent.net_total:+.2f} is not positive"
+    if math.isnan(incumbent.trade_lo) or incumbent.trade_lo <= 0:
+        return False, (
+            f"net per trade {incumbent.net_per_trade:+.4f} not distinguishable from zero "
+            f"(CI low {incumbent.trade_lo:+.4f})"
+        )
+    return True, (
+        f"held-out net {incumbent.net_total:+.2f} over {incumbent.trades} trades, "
+        f"per-trade CI [{incumbent.trade_lo:+.4f}, {incumbent.trade_hi:+.4f}]"
+    )
 
 
 def choose(results: list[EvalResult], min_test: int = MIN_TEST) -> tuple[EvalResult | None, str]:
@@ -269,6 +325,19 @@ def run(store: MarketDataStore, mode: str, promote: bool = False) -> str:
     best, reason = choose(results)
     out.append("\n== promotion gate")
     out.append(reason)
+    ok, why = edge_verdict(results[0] if results else None)
+    key = EDGE_KEY.format(mode=mode)
+    store.set_meta(
+        {key: "1" if ok else "0", key + ":reason": why, key + ":ts": f"{time.time():.0f}"}
+    )
+    out.append("\n== edge gate (does the ACTIVE config get to send real orders?)")
+    out.append(("OPEN: " if ok else "CLOSED: ") + why)
+    if not ok:
+        out.append(
+            "The trader keeps deciding and logging but sends no live orders until a daily "
+            "`learn` run shows the active config profitable on held-out data. Promote a "
+            "winning candidate, then re-run `learn` to re-evaluate it."
+        )
     report = "\n".join(out)
     if best is not None:
         cid = store.save_config(mode, best.params, source="learn", report=report, activate=promote)

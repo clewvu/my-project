@@ -66,6 +66,7 @@ class Trader:
         proxy_margin: float = 0.02,
         allow_proxy: bool = False,
         blackout: EventBlackout | None = None,
+        require_edge: bool = False,
     ) -> None:
         if mode == "live" and (client.dry_run or not client.allow_live):
             raise ValueError("live mode needs a client with dry_run=False and allow_live=True")
@@ -96,6 +97,8 @@ class Trader:
         self.proxy_margin = proxy_margin
         self.allow_proxy = allow_proxy
         self.blackout = blackout
+        self.require_edge = require_edge and mode == "live"
+        self._edge_logged: str | None = None
         self.history = SpotHistory()
         self._order_error: str | None = None
         self._order_backoff: dict[str, float] = {}
@@ -333,6 +336,15 @@ class Trader:
             self.store.insert_decision(row)
             return
         count = verdict.adjusted_count or it.count
+        if self.require_edge and not self._edge_open():
+            row["action"], row["reason"] = (
+                "shadow",
+                "edge gate closed: "
+                + (self.store.get_meta("learn:live:edge_ok:reason") or "no learn run yet"),
+            )
+            summary.skips += 1
+            self.store.insert_decision(row)
+            return
         position = self._execute(market, series, it.side, count, it.price, now, it.exec_mode)
         self._take_next.discard(market.ticker)
         if position is not None:
@@ -345,6 +357,19 @@ class Trader:
             self._order_backoff[market.ticker] = now + ORDER_RETRY_S
             summary.errors += 1
         self.store.insert_decision(row)
+
+    def _edge_open(self) -> bool:
+        """Live orders are allowed only while the last `learn` run found held-out edge."""
+        flag = self.store.get_meta("learn:live:edge_ok") == "1"
+        state = "open" if flag else "closed"
+        if state != self._edge_logged:
+            self._edge_logged = state
+            log.warning(
+                "edge gate %s: %s",
+                state.upper(),
+                self.store.get_meta("learn:live:edge_ok:reason") or "no learn run yet",
+            )
+        return flag
 
     # ------------------------------------------------------------ execution
 

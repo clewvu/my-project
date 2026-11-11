@@ -251,3 +251,30 @@ def test_paper_maker_expires_then_hybrid_takes(tmp_path):
     pos = store.positions("paper", "open")[0]
     assert pos["price"] == 0.51 and pos["fee"] > 0  # took the ask, paid the fee
     assert "KXBTC15M-1" not in trader._take_next
+
+
+def test_edge_gate_shadows_live_orders(tmp_path):
+    client = FakeClient(mid=0.5)
+    store = MarketDataStore(tmp_path / "g.sqlite")
+    feed = FakeFeed()
+    params = FairValueParams(margin=0.02, count=2, exec_mode="taker")
+    trader = Trader(
+        client,
+        store,
+        UNI,
+        FairValueStrategy(params),
+        RiskLimits(),
+        mode="paper",
+        spot_ws=feed,
+        require_edge=True,
+    )
+    trader.require_edge = True  # paper never gates; force the live behaviour for the test
+    now = CLOSE - 600
+    seed_vol(feed, trader, now, spot=100.3)
+    s = trader.tick(now)
+    assert s.orders == 0
+    d = store.decisions("paper")[0]
+    assert d["action"] == "shadow" and "edge gate closed" in d["reason"]
+    store.set_meta({"learn:live:edge_ok": "1", "learn:live:edge_ok:reason": "test"})
+    s = trader.tick(now + 2)
+    assert s.orders == 1
