@@ -100,6 +100,27 @@ def test_trade_production_shape():
 def test_balance_and_position():
     assert Balance.from_dict({"balance": 20000}).balance == 200.0
     assert Balance.from_dict({"balance_dollars": "200.5000"}).balance == 200.5
+
+
+def test_balance_breakdown_gives_spendable_per_exchange():
+    bal = Balance.from_dict(
+        {
+            "balance": 11121,
+            "balance_dollars": "111.2104",
+            "balance_breakdown": [
+                {"balance": "110.6977", "exchange_index": 0},
+                {"balance": "0.5027", "exchange_index": 2},
+            ],
+        }
+    )
+    assert bal.balance == 111.2104
+    assert bal.spendable(2) == 0.5027
+    assert bal.spendable(0) == 110.6977
+    assert bal.spendable(7) == 0.0  # bucket not listed: nothing to spend there
+    assert bal.spendable(None) == 111.2104  # market index unknown: account total
+    assert Balance.from_dict({"balance": 20000}).spendable(2) == 200.0  # no breakdown
+    assert Market.from_dict({"ticker": "KXBTC15M-1", "exchange_index": 2}).exchange_index == 2
+    assert Market.from_dict({"ticker": "KXBTC15M-1"}).exchange_index is None
     p = Position.from_dict({"ticker": "X", "position_fp": "-3.5", "total_traded_dollars": "1.5"})
     assert p.side == "no" and p.position == -3.5 and p.total_cost == 1.5
     assert Position.from_dict({"ticker": "X", "position": 0}).side is None
